@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { authorizeAnyOutletPermission } from "@/lib/server-auth";
+import { authorizeAnyOutletPermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await authorizeAnyOutletPermission(request, outletId, ["orders.create", "orders.read"]);
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -14,3 +14,5 @@ export async function GET(request: NextRequest) {
   }), prisma.outlet.findFirst({ where: { id: outletId, tenantId: access.tenantId }, select: { serviceChargeBps: true } })]);
   return NextResponse.json({ tables: tables.map(({ orders, ...table }) => ({ ...table, occupied: orders.length > 0 })), serviceChargeBps: outlet?.serviceChargeBps ?? 0 });
 }
+
+export const GET = withTenantScope(GETHandler);

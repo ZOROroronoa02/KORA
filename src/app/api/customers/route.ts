@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
@@ -10,7 +10,7 @@ function normalizePhone(value: string) {
   return /^\+?[0-9]{8,15}$/.test(phone) ? phone : "";
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "customers.view");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
   })));
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   let body: Record<string, unknown>;
   try { body = await readJsonObject(request); }
   catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: error instanceof RequestInputError ? error.statusCode : 400 }); }
@@ -54,3 +54,6 @@ export async function POST(request: NextRequest) {
   });
   return NextResponse.json({ id: customer.id, name: customer.name, phone: `••••••${customer.phone.slice(-4)}` }, { status: 201 });
 }
+
+export const GET = withTenantScope(GETHandler);
+export const POST = withTenantScope(POSTHandler);

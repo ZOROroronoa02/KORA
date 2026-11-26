@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { StockMovementType } from "@prisma/client";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
 export const runtime = "nodejs";
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "inventory.view");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(safeJson(materials));
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -50,3 +50,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Could not update ingredient stock." }, { status: 500 });
   }
 }
+
+export const GET = withTenantScope(GETHandler);
+export const POST = withTenantScope(POSTHandler);

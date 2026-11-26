@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getUserFromRequest } from "@/lib/server-auth";
+import { getUserFromRequest, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const user = await getUserFromRequest(request);
   if (!user) return NextResponse.json({ error: "Unauthenticated" }, { status: 401 });
   const [assignments, platformAssignments] = await Promise.all([
@@ -31,3 +31,5 @@ export async function GET(request: NextRequest) {
   });
   return NextResponse.json({ user, outlets, isPlatformAdmin });
 }
+
+export const GET = withTenantScope(GETHandler);

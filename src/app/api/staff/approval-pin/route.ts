@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hash, compare } from "bcryptjs";
-import { authorizeAnyOutletPermission } from "@/lib/server-auth";
+import { authorizeAnyOutletPermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
 export const runtime = "nodejs";
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -28,3 +28,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Could not update approval PIN." }, { status: 500 });
   }
 }
+
+export const POST = withTenantScope(POSTHandler);

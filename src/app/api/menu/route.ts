@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
@@ -7,7 +7,7 @@ import { readJsonObject, RequestInputError } from "@/lib/http";
 export const runtime = "nodejs";
 const jsonSafe = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   if (!outletId) return NextResponse.json({ error: "outletId is required" }, { status: 400 });
   const access = await requirePermission(request, outletId, "menu.view");
@@ -16,7 +16,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(jsonSafe(categories));
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   let body: Record<string, unknown>;
   try { body = await readJsonObject(request); }
   catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: error instanceof RequestInputError ? error.statusCode : 400 }); }
@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
   return NextResponse.json(jsonSafe(item), { status: 201 });
 }
 
-export async function PATCH(request: NextRequest) {
+async function PATCHHandler(request: NextRequest) {
   let body: Record<string, unknown>;
   try { body = await readJsonObject(request); }
   catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: error instanceof RequestInputError ? error.statusCode : 400 }); }
@@ -70,3 +70,7 @@ export async function PATCH(request: NextRequest) {
   void publishOutletEvent(access.tenantId, outletId, "menu:updated", { menuItemId, action: "changed" });
   return NextResponse.json(jsonSafe(saved));
 }
+
+export const GET = withTenantScope(GETHandler);
+export const POST = withTenantScope(POSTHandler);
+export const PATCH = withTenantScope(PATCHHandler);

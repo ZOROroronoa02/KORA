@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { defaultOutletSettings } from "@/lib/role-seed";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "settings.manage");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -15,7 +15,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json({ settings: row?.settings ?? defaultOutletSettings });
 }
 
-export async function PATCH(request: NextRequest) {
+async function PATCHHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -53,3 +53,6 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json({ error: "Could not update outlet settings." }, { status: 500 });
   }
 }
+
+export const GET = withTenantScope(GETHandler);
+export const PATCH = withTenantScope(PATCHHandler);

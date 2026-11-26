@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission, invalidateOutletPermissionCache } from "@/lib/server-auth";
+import { requirePermission, invalidateOutletPermissionCache, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "staff.manage");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -28,7 +28,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json({ staff: [...byUser.values()].map((item) => ({ ...item, permissions: [...item.permissions].sort() })) });
 }
 
-export async function PATCH(request: NextRequest) {
+async function PATCHHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -61,3 +61,6 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json({ error: "Could not assign outlet roles." }, { status: 500 });
   }
 }
+
+export const GET = withTenantScope(GETHandler);
+export const PATCH = withTenantScope(PATCHHandler);

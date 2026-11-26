@@ -11,6 +11,7 @@ const testIp = `2001:db8:${randomUUID().slice(0, 4)}:${randomUUID().slice(4, 8)}
 test('API security integration: outlet customer isolation and concurrent bill splits', { skip: !enabled, timeout: 60000 }, async () => {
   const prisma = new PrismaClient();
   let tenantId;
+  let foreignTenantId;
   const readJson = async (response) => {
     const text = await response.text();
     let body;
@@ -33,6 +34,17 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     await prisma.userOutletRole.create({ data: { userId: registered.user.id, outletId: registered.outlet.id, roleId: cashierRole.id } });
     const outletB = await prisma.outlet.create({ data: { tenantId, name: 'Outlet B', code: 'T-' + suffix } });
     await prisma.userOutletRole.create({ data: { userId: registered.user.id, outletId: outletB.id, roleId: ownerRole.id } });
+
+    const foreignTenant = await prisma.tenant.create({ data: { name: 'Foreign Tenant ' + suffix, slug: 'foreign-' + suffix } });
+    foreignTenantId = foreignTenant.id;
+    const foreignOutlet = await prisma.outlet.create({ data: { tenantId: foreignTenant.id, name: 'Foreign Outlet', code: 'F-' + suffix } });
+    const crossTenantRead = await fetch(api + '/api/customers?outletId=' + foreignOutlet.id, { headers: ownerHeaders });
+    assert.equal(crossTenantRead.status, 403, 'a valid user from another tenant cannot read a foreign outlet');
+    const crossTenantWrite = await fetch(api + '/api/customers', {
+      method: 'POST', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: foreignOutlet.id, phone: '+919' + suffix.padEnd(9, '0'), name: 'Cross-Tenant Attempt' }),
+    });
+    assert.equal(crossTenantWrite.status, 403, 'a valid user from another tenant cannot write to a foreign outlet');
 
     const phone = '+91' + randomUUID().replace(/\D/g, '').slice(0, 10);
     const customer = await prisma.customer.create({ data: { tenantId, phone, name: 'Private Outlet B Guest', email: 'private-' + suffix + '@example.test', birthday: new Date('1990-01-01'), consentAt: new Date() } });
@@ -80,6 +92,7 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     assert.equal(splits.length, 2);
     assert.equal(splits.reduce((sum, split) => sum + split.totalPaise, 0n), total);
   } finally {
+    if (foreignTenantId) await prisma.tenant.deleteMany({ where: { id: foreignTenantId } }).catch(() => undefined);
     if (tenantId) await prisma.tenant.deleteMany({ where: { id: tenantId } }).catch(() => undefined);
     await prisma.$disconnect();
   }

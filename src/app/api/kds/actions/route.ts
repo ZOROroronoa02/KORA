@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { KOTStatus, OrderStatus, Prisma } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 import { aggregateKdsTicketState, nextKdsItemState, validateHoldReason, type KdsItemState } from "@/lib/domain/kds";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
@@ -17,7 +17,7 @@ const legacyStatus = (state: KdsItemState) => state === "QUEUED" ? KOTStatus.QUE
 const ticketStatus = (states: readonly KdsItemState[]) => aggregateKdsTicketState(states) as KOTStatus;
 class KdsConflict extends Error { constructor(message: string) { super(message); this.name = "KdsConflict"; } }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   let replayContext: { outletId: string; userId: string; clientMutationId: string; requestHash: string } | undefined;
   try {
     const body = await readJsonObject(request, 16 * 1024);
@@ -140,3 +140,5 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Could not update kitchen ticket." }, { status: 500 });
   }
 }
+
+export const POST = withTenantScope(POSTHandler);

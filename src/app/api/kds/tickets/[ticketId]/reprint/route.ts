@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { buildEscPosKot } from "@/lib/domain/escpos-kot";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest, context: { params: Promise<{ ticketId: string }> }) {
+async function GETHandler(request: NextRequest, context: { params: Promise<{ ticketId: string }> }) {
   const { ticketId } = await context.params;
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "kot.reprint");
@@ -23,3 +23,5 @@ export async function GET(request: NextRequest, context: { params: Promise<{ tic
   });
   return new Response(bytes, { headers: { "content-type": "application/vnd.kora.escpos", "content-disposition": `attachment; filename="KOT-${ticket.kotNumber}.bin"`, "cache-control": "no-store", "x-content-type-options": "nosniff" } });
 }
+
+export const GET = withTenantScope(GETHandler);

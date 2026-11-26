@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission, invalidateOutletPermissionCache } from "@/lib/server-auth";
+import { requirePermission, invalidateOutletPermissionCache, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allPermissionKeys, permissionDescriptions } from "@/lib/permissions";
 import { readJsonObject, RequestInputError } from "@/lib/http";
@@ -11,7 +11,7 @@ function responseError(error: unknown) {
   return NextResponse.json({ error: "Could not update role permissions." }, { status: 500 });
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "roles.manage");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -29,7 +29,7 @@ export async function GET(request: NextRequest) {
   });
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -53,7 +53,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function PATCH(request: NextRequest) {
+async function PATCHHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -80,3 +80,7 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json({ ok: true, permissions: nextKeys.sort(), knownPermissionCount: allPermissionKeys.length });
   } catch (error) { return responseError(error); }
 }
+
+export const GET = withTenantScope(GETHandler);
+export const POST = withTenantScope(POSTHandler);
+export const PATCH = withTenantScope(PATCHHandler);

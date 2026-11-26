@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const params = request.nextUrl.searchParams;
   const outletId = params.get("outletId") ?? "";
   const access = await requirePermission(request, outletId, "audit.view");
@@ -23,3 +23,5 @@ export async function GET(request: NextRequest) {
   });
   return NextResponse.json({ entries });
 }
+
+export const GET = withTenantScope(GETHandler);

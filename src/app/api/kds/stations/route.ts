@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { publishOutletEvent } from "@/lib/realtime";
 
 export const runtime = "nodejs";
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request, 8 * 1024);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-export async function PATCH(request: NextRequest) {
+async function PATCHHandler(request: NextRequest) {
   try {
     const body = await readJsonObject(request, 8 * 1024);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
@@ -58,3 +58,6 @@ export async function PATCH(request: NextRequest) {
     return NextResponse.json({ error: "Could not route menu item to kitchen station." }, { status: 500 });
   }
 }
+
+export const POST = withTenantScope(POSTHandler);
+export const PATCH = withTenantScope(PATCHHandler);

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
-import { authorizeAnyOutletPermission, requirePermission, verifyManagerApprovalPin } from "@/lib/server-auth";
+import { authorizeAnyOutletPermission, requirePermission, verifyManagerApprovalPin, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise, calculateSale, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
@@ -35,7 +35,7 @@ async function withSerializableRetry<T>(operation: () => Promise<T>, attempts = 
   }
 }
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   if (!outletId) return NextResponse.json({ error: "outletId is required" }, { status: 400 });
   const access = await authorizeAnyOutletPermission(request, outletId, ["reports.view.sales", "orders.read", "kds.view"]);
@@ -55,7 +55,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(jsonSafe(safeOrders));
 }
 
-export async function POST(request: NextRequest) {
+async function POSTHandler(request: NextRequest) {
   let retryOutletId = "";
   let retryKey = "";
   let maySeeFinancials = false;
@@ -201,3 +201,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Could not create order." }, { status: 500 });
   }
 }
+
+export const GET = withTenantScope(GETHandler);
+export const POST = withTenantScope(POSTHandler);

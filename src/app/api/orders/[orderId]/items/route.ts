@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, PaymentStatus, Prisma } from "@prisma/client";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise, calculateSale, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
@@ -11,7 +11,7 @@ export const runtime = "nodejs";
 class KdsOrderConflict extends Error { constructor(message: string) { super(message); this.name = "KdsOrderConflict"; } }
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
 
-export async function POST(request: NextRequest, context: { params: Promise<{ orderId: string }> }) {
+async function POSTHandler(request: NextRequest, context: { params: Promise<{ orderId: string }> }) {
   let retry: { outletId: string; clientMutationId: string; requestHash: string; userId: string } | undefined;
   try {
     const { orderId } = await context.params;
@@ -141,3 +141,5 @@ export async function POST(request: NextRequest, context: { params: Promise<{ or
     return NextResponse.json({ error: "Could not add items to the order." }, { status: 500 });
   }
 }
+
+export const POST = withTenantScope(POSTHandler);

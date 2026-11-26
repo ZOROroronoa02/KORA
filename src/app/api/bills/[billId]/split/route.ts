@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise } from "@/lib/billing";
 import { readJsonObject, RequestInputError } from "@/lib/http";
@@ -50,7 +50,7 @@ function buildAllocations(bill: BillForSplit, body: Record<string, unknown>): Al
   return allocations;
 }
 
-export async function POST(request: NextRequest, context: { params: Promise<{ billId: string }> }) {
+async function POSTHandler(request: NextRequest, context: { params: Promise<{ billId: string }> }) {
   try {
     const { billId } = await context.params;
     const body = await readJsonObject(request);
@@ -86,3 +86,5 @@ export async function POST(request: NextRequest, context: { params: Promise<{ bi
     return NextResponse.json({ error: "Could not split bill." }, { status: 500 });
   }
 }
+
+export const POST = withTenantScope(POSTHandler);

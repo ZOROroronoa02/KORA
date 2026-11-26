@@ -1,12 +1,12 @@
 import { KOTStatus } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { defaultOutletSettings } from "@/lib/role-seed";
 
 export const runtime = "nodejs";
 
-export async function GET(request: NextRequest) {
+async function GETHandler(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   const stationId = request.nextUrl.searchParams.get("stationId");
   if (!outletId) return NextResponse.json({ error: "outletId is required." }, { status: 400 });
@@ -62,3 +62,5 @@ export async function GET(request: NextRequest) {
     hourly,
   });
 }
+
+export const GET = withTenantScope(GETHandler);

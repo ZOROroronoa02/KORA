@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { KOTStatus, OrderStatus } from "@prisma/client";
-import { requirePermission, verifyManagerApprovalPin } from "@/lib/server-auth";
+import { requirePermission, verifyManagerApprovalPin, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { publishOutletEvent } from "@/lib/realtime";
 import { transitionOrder } from "@/lib/billing";
@@ -9,7 +9,7 @@ import { readJsonObject, RequestInputError } from "@/lib/http";
 export const runtime = "nodejs";
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
 
-export async function PATCH(request: NextRequest, context: { params: Promise<{ orderId: string }> }) {
+async function PATCHHandler(request: NextRequest, context: { params: Promise<{ orderId: string }> }) {
   try {
     const { orderId } = await context.params;
     const body = await readJsonObject(request);
@@ -90,3 +90,5 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ o
     return NextResponse.json({ error: "Could not update order." }, { status: 500 });
   }
 }
+
+export const PATCH = withTenantScope(PATCHHandler);
