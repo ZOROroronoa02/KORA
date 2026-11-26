@@ -53,6 +53,14 @@ enum KOTStatus {
   CANCELLED
 }
 
+enum KOTItemState {
+  QUEUED
+  COOKING
+  READY
+  BUMPED
+  OUT_OF_STOCK
+}
+
 enum ShiftStatus {
   OPEN
   CLOSED
@@ -118,6 +126,7 @@ model Outlet {
   invoicePrefix     String            @default("K")
   invoiceNextNumber Int               @default(1)
   orderNextNumber   Int               @default(1)
+  kotNextNumber     Int               @default(1)
   serviceChargeBps  Int               @default(0)
   createdAt         DateTime          @default(now())
   tenant            Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -125,6 +134,9 @@ model Outlet {
   tables            RestaurantTable[]
   categories        MenuCategory[]
   itemPrices        OutletMenuItem[]
+  stations          Station[]
+  kots              KOT[]
+  kotMutations      KOTMutation[]
   orders            Order[]
   bills             Bill[]
   shifts            Shift[]
@@ -334,11 +346,13 @@ model MenuItem {
 model OutletMenuItem {
   outletId   String
   menuItemId String
+  stationId  String?
   pricePaise BigInt?
   available  Boolean  @default(true)
   updatedAt  DateTime @updatedAt
   outlet     Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
   menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  station    Station? @relation(fields: [stationId], references: [id], onDelete: SetNull)
 
   @@id([outletId, menuItemId])
   @@map("outlet_menu_items")
@@ -457,29 +471,87 @@ model OrderItem {
 }
 
 model KOT {
-  id       String    @id @default(cuid())
-  orderId  String
-  sequence Int
-  status   KOTStatus @default(QUEUED)
-  sentAt   DateTime  @default(now())
-  readyAt  DateTime?
-  order    Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  items    KOTItem[]
+  id                  String        @id @default(cuid())
+  orderId             String
+  outletId            String
+  stationId           String?
+  sequence            Int
+  kotNumber           Int           @default(0)
+  orderType           OrderType     @default(DINE_IN)
+  tableLabel          String?
+  waiterName          String?
+  status              KOTStatus     @default(QUEUED)
+  notes               String?
+  isRush              Boolean       @default(false)
+  sentAt              DateTime      @default(now())
+  createdAt           DateTime      @default(now())
+  updatedAt           DateTime      @updatedAt
+  startedAt           DateTime?
+  readyAt             DateTime?
+  servedAt            DateTime?
+  heldAt              DateTime?
+  holdReason          String?
+  holdDurationSeconds Int           @default(0)
+  undoBumpUntil       DateTime?
+  order               Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  outlet              Outlet        @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  station             Station?      @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  items               KOTItem[]
+  mutations           KOTMutation[]
 
   @@unique([orderId, sequence])
+  @@unique([outletId, kotNumber])
+  @@index([outletId, status, createdAt])
+  @@index([outletId, stationId, status, createdAt])
   @@map("kots")
 }
 
 model KOTItem {
-  id          String    @id @default(cuid())
+  id          String       @id @default(cuid())
   kotId       String
   orderItemId String
   quantity    Int
-  status      KOTStatus @default(QUEUED)
-  kot         KOT       @relation(fields: [kotId], references: [id], onDelete: Cascade)
-  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  status      KOTStatus    @default(QUEUED)
+  state       KOTItemState @default(QUEUED)
+  updatedAt   DateTime     @updatedAt
+  kot         KOT          @relation(fields: [kotId], references: [id], onDelete: Cascade)
+  orderItem   OrderItem    @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
 
   @@map("kot_items")
+}
+
+model Station {
+  id        String           @id @default(cuid())
+  outletId  String
+  name      String
+  active    Boolean          @default(true)
+  sortOrder Int              @default(0)
+  createdAt DateTime         @default(now())
+  outlet    Outlet           @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  menuItems OutletMenuItem[]
+  tickets   KOT[]
+
+  @@unique([outletId, name])
+  @@index([outletId, active, sortOrder])
+  @@map("stations")
+}
+
+model KOTMutation {
+  id               String   @id @default(cuid())
+  outletId         String
+  ticketId         String?
+  userId           String
+  clientMutationId String
+  action           String
+  requestHash      String
+  response         Json?
+  createdAt        DateTime @default(now())
+  outlet           Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  ticket           KOT?     @relation(fields: [ticketId], references: [id], onDelete: SetNull)
+
+  @@unique([outletId, clientMutationId])
+  @@index([outletId, createdAt])
+  @@map("kot_mutations")
 }
 
 model Bill {

@@ -28,9 +28,19 @@ export async function PATCH(request: NextRequest) {
     const voidRequiresApproval = body.voidRequiresApproval === undefined ? before.voidRequiresApproval ?? false : body.voidRequiresApproval;
     const kdsSoundEnabled = body.kdsSoundEnabled === undefined ? before.kdsSoundEnabled ?? true : body.kdsSoundEnabled;
     const sla = body.slaMinutesPerOrderType === undefined ? before.slaMinutesPerOrderType ?? defaultOutletSettings.slaMinutesPerOrderType : body.slaMinutesPerOrderType;
+    const kdsColumnsByStation = body.kdsColumnsByStation === undefined ? before.kdsColumnsByStation ?? defaultOutletSettings.kdsColumnsByStation : body.kdsColumnsByStation;
     if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100 || typeof voidRequiresApproval !== "boolean" || typeof kdsSoundEnabled !== "boolean") return NextResponse.json({ error: "Invalid approval or KDS settings." }, { status: 400 });
     if (!sla || typeof sla !== "object" || Array.isArray(sla) || Object.values(sla as Record<string, unknown>).some((value) => !Number.isInteger(value) || Number(value) < 1 || Number(value) > 240)) return NextResponse.json({ error: "SLA values must be integer minutes from 1 to 240." }, { status: 400 });
-    const settings = { ...before, discountApprovalThresholdPct: threshold, voidRequiresApproval, kdsSoundEnabled, slaMinutesPerOrderType: sla };
+    if (!kdsColumnsByStation || typeof kdsColumnsByStation !== "object" || Array.isArray(kdsColumnsByStation)) return NextResponse.json({ error: "KDS columns must be configured by station." }, { status: 400 });
+    const activeStations = await prisma.station.findMany({ where: { outletId, active: true }, select: { id: true } });
+    const validStationKeys = new Set(["all", ...activeStations.map((station) => station.id)]);
+    const validKdsStates = new Set(["QUEUED", "PREPARING", "READY"]);
+    for (const [stationKey, value] of Object.entries(kdsColumnsByStation as Record<string, unknown>)) {
+      if (!validStationKeys.has(stationKey) || !Array.isArray(value) || value.length < 1 || value.length > 3 || value.some((state) => typeof state !== "string" || !validKdsStates.has(state)) || new Set(value).size !== value.length) {
+        return NextResponse.json({ error: "Each station must have 1–3 unique KDS lanes in a valid order." }, { status: 400 });
+      }
+    }
+    const settings = { ...before, discountApprovalThresholdPct: threshold, voidRequiresApproval, kdsSoundEnabled, slaMinutesPerOrderType: sla, kdsColumnsByStation };
     const updated = await prisma.$transaction(async (tx) => {
       const jsonSettings = settings as Prisma.InputJsonValue;
       const saved = await tx.outletSettings.upsert({ where: { outletId }, update: { settings: jsonSettings }, create: { outletId, settings: jsonSettings } });

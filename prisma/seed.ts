@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { PrismaClient, Plan, OrderType, OrderStatus, KOTStatus, PaymentStatus } from "@prisma/client";
 import { hash } from "bcryptjs";
-import { ensureOutletSettings, ensureTenantSystemRoles } from "../src/lib/role-seed.js";
+import { ensureKdsStations, ensureOutletSettings, ensureTenantSystemRoles } from "../src/lib/role-seed.js";
 
 const prisma = new PrismaClient();
 
@@ -41,6 +41,8 @@ function demoEmail(key: string, ownerEmail: string | undefined) {
 }
 
 async function seedMenu(tenantId: string, outletId: string) {
+  const stations = await prisma.station.findMany({ where: { outletId }, select: { id: true, name: true } });
+  const stationByName = new Map(stations.map((station) => [station.name, station.id]));
   const categoryIds = new Map<string, string>();
   const categories = ["Breakfast", "Starters", "Mains", "Breads", "Drinks"];
   for (const [sortOrder, name] of categories.entries()) {
@@ -53,10 +55,11 @@ async function seedMenu(tenantId: string, outletId: string) {
     const categoryId = categoryIds.get(item.category)!;
     const existing = await prisma.menuItem.findFirst({ where: { tenantId, categoryId, name: item.name } });
     const saved = existing ?? await prisma.menuItem.create({ data: { tenantId, categoryId, name: item.name, basePricePaise: BigInt(item.price), isVeg: item.isVeg, gstBps: 500 } });
+    const stationName = item.category === "Starters" || item.category === "Mains" || item.category === "Breads" ? "Grill" : "General";
     await prisma.outletMenuItem.upsert({
       where: { outletId_menuItemId: { outletId, menuItemId: saved.id } },
-      update: { available: true },
-      create: { outletId, menuItemId: saved.id, available: true },
+      update: { available: true, stationId: stationByName.get(stationName) ?? null },
+      create: { outletId, menuItemId: saved.id, stationId: stationByName.get(stationName) ?? null, available: true },
     });
   }
   return prisma.menuItem.findMany({ where: { tenantId, category: { outletId } }, orderBy: { name: "asc" } });
@@ -70,8 +73,11 @@ async function seedTicket(input: {
   menuItemId: string;
   tableId?: string;
   createdById: string;
+  waiterName: string;
+  stationId: string;
   status: typeof KOTStatus[keyof typeof KOTStatus];
 }) {
+  const itemState = input.status === KOTStatus.READY ? "READY" : input.status === KOTStatus.QUEUED ? "QUEUED" : "COOKING";
   const idempotencyKey = `seed-kot-${input.outletCode}-${input.index}`;
   const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId: input.outletId, idempotencyKey } }, include: { items: true, kots: true } });
   const status = input.status === KOTStatus.READY ? OrderStatus.READY : OrderStatus.PREPARING;
@@ -79,14 +85,16 @@ async function seedTicket(input: {
     await prisma.order.update({ where: { id: existing.id }, data: { status } });
     const kot = existing.kots.find((ticket) => ticket.sequence === 1);
     if (kot) {
-      await prisma.kOT.update({ where: { id: kot.id }, data: { status: input.status, ...(input.status === KOTStatus.READY ? { readyAt: new Date() } : { readyAt: null }) } });
-      await prisma.kOTItem.updateMany({ where: { kotId: kot.id }, data: { status: input.status } });
+      const tableLabel = input.tableId ? await prisma.restaurantTable.findUnique({ where: { id: input.tableId }, select: { label: true } }).then((table) => table?.label ?? null) : null;
+      await prisma.kOT.update({ where: { id: kot.id }, data: { outletId: input.outletId, stationId: input.stationId, orderType: input.tableId ? OrderType.DINE_IN : OrderType.TAKEAWAY, tableLabel, waiterName: input.waiterName, status: input.status, startedAt: itemState === "QUEUED" ? null : existing.createdAt, ...(input.status === KOTStatus.READY ? { readyAt: new Date() } : { readyAt: null }) } });
+      await prisma.kOTItem.updateMany({ where: { kotId: kot.id }, data: { status: input.status, state: itemState } });
     }
     return;
   }
 
   const sequence = await prisma.outlet.update({ where: { id: input.outletId }, data: { orderNextNumber: { increment: 1 } }, select: { orderNextNumber: true } });
   const orderNumber = sequence.orderNextNumber - 1;
+  const kotSequence = await prisma.outlet.update({ where: { id: input.outletId }, data: { kotNextNumber: { increment: 1 } }, select: { kotNextNumber: true } });
   const item = await prisma.menuItem.findUniqueOrThrow({ where: { id: input.menuItemId }, select: { id: true, name: true, basePricePaise: true, gstBps: true } });
   const createdAt = new Date(Date.now() - (input.index * 4 + 2) * 60_000);
   const order = await prisma.order.create({
@@ -112,11 +120,19 @@ async function seedTicket(input: {
   await prisma.kOT.create({
     data: {
       orderId: order.id,
+      outletId: input.outletId,
+      stationId: input.stationId,
       sequence: 1,
+      kotNumber: kotSequence.kotNextNumber - 1,
+      orderType: input.tableId ? OrderType.DINE_IN : OrderType.TAKEAWAY,
+      tableLabel: input.tableId ? await prisma.restaurantTable.findUnique({ where: { id: input.tableId }, select: { label: true } }).then((table) => table?.label ?? null) : null,
+      waiterName: input.waiterName,
       status: input.status,
       sentAt: createdAt,
+      createdAt,
+      startedAt: itemState === "QUEUED" ? null : createdAt,
       readyAt: input.status === KOTStatus.READY ? new Date() : null,
-      items: { create: order.items.map((orderItem) => ({ orderItemId: orderItem.id, quantity: orderItem.quantity, status: input.status })) },
+      items: { create: order.items.map((orderItem) => ({ orderItemId: orderItem.id, quantity: orderItem.quantity, status: input.status, state: itemState })) },
     },
   });
 }
@@ -149,6 +165,7 @@ async function main() {
     const roles = await ensureTenantSystemRoles(tx, tenant.id);
     for (const outlet of outlets) {
       await ensureOutletSettings(tx, outlet.id);
+      await ensureKdsStations(tx, outlet.id);
       await tx.restaurantTable.createMany({ data: Array.from({ length: 10 }, (_, index) => ({ outletId: outlet.id, label: `T-${String(index + 1).padStart(2, "0")}`, capacity: index < 4 ? 2 : 4 })), skipDuplicates: true });
     }
     return roles;
@@ -202,6 +219,8 @@ async function main() {
         menuItemId: menus[outletIndex][index % menus[outletIndex].length].id,
         tableId: index === 0 ? tables[outletIndex][0]?.id : undefined,
         createdById: seededUsers.get(outletIndex === 0 ? "waiter-one" : "waiter-two")!,
+        waiterName: outletIndex === 0 ? "Dev Patel" : "Isha Kapoor",
+        stationId: (await prisma.station.findUniqueOrThrow({ where: { outletId_name: { outletId: outlets[outletIndex].id, name: index === 0 ? "General" : "Grill" } } })).id,
         status: statuses[index],
       });
     }

@@ -2,6 +2,11 @@ export const realtimeEventPermissions: Record<string, readonly string[]> = {
   "order:new": ["orders.read", "kds.view"],
   "order:updated": ["orders.read", "kds.view", "bills.settle"],
   "kot:status": ["orders.read", "kds.view"],
+  "kot:created": ["kds.view"],
+  "kot:item:updated": ["kds.view"],
+  "kot:updated": ["kds.view"],
+  "kot:recalled": ["kds.view"],
+  "kot:86-item": ["kds.view"],
   "menu:updated": ["menu.view"],
   "shift:updated": ["shift.open", "shift.close"],
 };

@@ -9,8 +9,9 @@ import {
 export const defaultOutletSettings = {
   discountApprovalThresholdPct: 10,
   voidRequiresApproval: false,
-  slaMinutesPerOrderType: { DINE_IN: 15, TAKEAWAY: 15, DELIVERY: 20 },
+  slaMinutesPerOrderType: { DINE_IN: 10, TAKEAWAY: 10, DELIVERY: 15, QR: 10, AGGREGATOR: 15 },
   kdsSoundEnabled: true,
+  kdsColumnsByStation: {},
   hiddenReports: {},
 };
 
@@ -53,4 +54,14 @@ export async function ensureOutletSettings(tx: Prisma.TransactionClient, outletI
     update: {},
     create: { outletId, settings: defaultOutletSettings },
   });
+}
+
+export async function ensureKdsStations(tx: Prisma.TransactionClient, outletId: string) {
+  const names = ["General", "Grill", "Chinese", "Desserts"];
+  const stations = await Promise.all(names.map((name, sortOrder) => tx.station.upsert({
+    where: { outletId_name: { outletId, name } },
+    update: { sortOrder, active: true },
+    create: { outletId, name, sortOrder },
+  })));
+  return new Map(stations.map((station) => [station.name, station]));
 }

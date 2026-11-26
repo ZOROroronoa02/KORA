@@ -134,6 +134,8 @@ export async function POST(request: NextRequest) {
       }
       const activeShift = await tx.shift.findFirst({ where: { tenantId: access.tenantId, outletId, userId: access.user.id, status: "OPEN" }, orderBy: { openedAt: "desc" } });
       if (paidPaise > 0 && method === PaymentMethod.CASH && !activeShift) throw new ConflictError("Open a cashier shift before recording cash payment.");
+      const stationRows = await tx.station.findMany({ where: { outletId, active: true }, orderBy: { sortOrder: "asc" }, select: { id: true, name: true } });
+      const defaultStation = stationRows.find((station) => station.name === "General") ?? stationRows[0] ?? null;
       const sequence = await tx.outlet.update({ where: { id: outletId }, data: { orderNextNumber: { increment: 1 } }, select: { orderNextNumber: true, invoiceNextNumber: true, invoicePrefix: true } });
       const invoiceSequence = await tx.outlet.update({ where: { id: outletId }, data: { invoiceNextNumber: { increment: 1 } }, select: { invoiceNextNumber: true } });
       const invoiceNumber = `${sequence.invoicePrefix}-${new Date().getFullYear()}-${String(invoiceSequence.invoiceNextNumber - 1).padStart(6, "0")}`;
@@ -142,7 +144,30 @@ export async function POST(request: NextRequest) {
         deviceId, idempotencyKey, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),
         items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.product.gstBps, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
       }, include: { items: true } });
-      const kot = await tx.kOT.create({ data: { orderId: order.id, sequence: 1, items: { create: order.items.map((i) => ({ orderItemId: i.id, quantity: i.quantity })) } }, include: { items: true } });
+      const tableLabel = tableId ? (await tx.restaurantTable.findUnique({ where: { id: tableId }, select: { label: true } }))?.label ?? null : null;
+      const routedItems = order.items.map((orderItem, index) => ({ orderItem, stationId: items[index].product.outletPrices[0]?.stationId ?? defaultStation?.id ?? null }));
+      const grouped = new Map<string, typeof routedItems>();
+      for (const entry of routedItems) {
+        const key = entry.stationId ?? "";
+        const group = grouped.get(key) ?? [];
+        group.push(entry);
+        grouped.set(key, group);
+      }
+      const kotCount = grouped.size;
+      const kotSequence = await tx.outlet.update({ where: { id: outletId }, data: { kotNextNumber: { increment: kotCount } }, select: { kotNextNumber: true } });
+      const firstKotNumber = kotSequence.kotNextNumber - kotCount;
+      const kots = [];
+      let groupIndex = 0;
+      for (const [stationKey, lines] of grouped) {
+        const kot = await tx.kOT.create({ data: {
+          orderId: order.id, outletId, stationId: stationKey || null, sequence: groupIndex + 1,
+          kotNumber: firstKotNumber + groupIndex, orderType: type, tableLabel, waiterName: access.user.name,
+          notes: typeof body.kitchenNote === "string" ? body.kitchenNote.trim().slice(0, 300) : null,
+          items: { create: lines.map(({ orderItem }) => ({ orderItemId: orderItem.id, quantity: orderItem.quantity, state: "QUEUED" })) },
+        }, include: { items: true } });
+        kots.push(kot);
+        groupIndex++;
+      }
       const bill = await tx.bill.create({ data: {
         tenantId: access.tenantId, outletId, orderId: order.id, invoiceNumber, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxablePaise: BigInt(totals.taxablePaise),
         cgstPaise: BigInt(Math.floor(totals.taxPaise / 2)), sgstPaise: BigInt(totals.taxPaise - Math.floor(totals.taxPaise / 2)), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise), paymentStatus: paidStatus,
@@ -154,9 +179,10 @@ export async function POST(request: NextRequest) {
         create: { customerId, outletId, visits: 1, spendPaise: BigInt(totals.totalPaise) },
       });
       if (discountPaise > 0) await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, approvalUserId, action: "ORDER_DISCOUNT", entityType: "Order", entityId: order.id, after: { discountPaise, discountBps: requestedDiscountBps, thresholdPct } } });
-      return { order, kot, bill };
+      return { order, kots, kot: kots[0], bill };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
-    void publishOutletEvent(access.tenantId, outletId, "order:new", { orderId: saved.order.id, orderNumber: saved.order.orderNumber, kotId: saved.kot.id });
+    void publishOutletEvent(access.tenantId, outletId, "order:new", { orderId: saved.order.id, orderNumber: saved.order.orderNumber, kotId: saved.kot?.id });
+    for (const ticket of saved.kots) void publishOutletEvent(access.tenantId, outletId, "kot:created", { ticketId: ticket.id, kotNumber: ticket.kotNumber, orderId: saved.order.id });
     const result = maySeeFinancials ? saved : { ...saved, order: redactOrder(saved.order), bill: undefined };
     return NextResponse.json({ ...jsonSafe(result), replayed: false }, { status: 201 });
   } catch (error) {

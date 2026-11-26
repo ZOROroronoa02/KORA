@@ -29,6 +29,7 @@ export async function POST(request: Request) {
     const created = await prisma.$transaction(async (tx) => {
       const tenant = await tx.tenant.create({ data: { name: tenantName, slug } });
       const outlet = await tx.outlet.create({ data: { tenantId: tenant.id, name: outletName, code: "MAIN" } });
+      const generalStation = await tx.station.create({ data: { outletId: outlet.id, name: "General", sortOrder: 0 } });
       const user = await tx.user.create({ data: { tenantId: tenant.id, name, email, phone, passwordHash } });
       await ensureOutletSettings(tx, outlet.id);
       const categoryNames = ["Breakfast", "Starters", "Mains", "Breads", "Drinks"];
@@ -48,7 +49,7 @@ export async function POST(request: Request) {
         ] as const;
         for (const [itemName, categoryName, pricePaise, isVeg] of sampleItems) {
           const item = await tx.menuItem.create({ data: { tenantId: tenant.id, categoryId: categoryIds.get(categoryName)!, name: itemName, basePricePaise: BigInt(pricePaise), gstBps: 500, isVeg } });
-          await tx.outletMenuItem.create({ data: { outletId: outlet.id, menuItemId: item.id, available: true } });
+          await tx.outletMenuItem.create({ data: { outletId: outlet.id, menuItemId: item.id, stationId: generalStation.id, available: true } });
         }
       }
       const seededRoles = await ensureTenantSystemRoles(tx, tenant.id);

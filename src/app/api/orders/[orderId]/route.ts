@@ -31,9 +31,10 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ o
         const changed = await tx.order.updateMany({ where: { id: orderId, tenantId: access.tenantId, outletId, status: order.status }, data: { status: orderStatus } });
         if (changed.count !== 1) throw new RangeError("Order changed concurrently; reload before retrying.");
         const activeKotStates = status === KOTStatus.READY ? [KOTStatus.QUEUED, KOTStatus.PREPARING] : [KOTStatus.READY];
-        const kots = await tx.kOT.updateMany({ where: { orderId, status: { in: activeKotStates } }, data: { status, ...(status === KOTStatus.READY ? { readyAt: new Date() } : {}) } });
+        const now = new Date();
+        const kots = await tx.kOT.updateMany({ where: { orderId, status: { in: activeKotStates } }, data: { status, ...(status === KOTStatus.READY ? { readyAt: now } : {}), ...(status === KOTStatus.SERVED ? { servedAt: now } : {}) } });
         if (kots.count === 0) throw new RangeError("No active kitchen ticket can make this transition.");
-        await tx.kOTItem.updateMany({ where: { kot: { orderId, status } }, data: { status } });
+        await tx.kOTItem.updateMany({ where: { kot: { orderId, status } }, data: { status, state: status === KOTStatus.READY ? "READY" : "BUMPED" } });
         await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: status === KOTStatus.READY ? "KOT_READY" : "ORDER_SERVED", entityType: "Order", entityId: orderId, before: { status: order.status }, after: { status: orderStatus } } });
       });
     } else if (action === "transfer-table") {

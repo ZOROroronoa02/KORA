@@ -29,6 +29,7 @@ export const permissionDescriptions = {
   "kds.bump": "Advance kitchen ticket state",
   "kds.recall": "Recall a kitchen ticket",
   "kds.hold": "Hold a kitchen ticket",
+  "kds.86": "Mark a menu item unavailable from the kitchen",
   "inventory.view": "View outlet inventory",
   "inventory.adjust": "Adjust outlet stock",
   "staff.manage": "Manage outlet team members",
@@ -56,7 +57,7 @@ export const roleNames = [
 
 const keys = (...values: PermissionKey[]) => values;
 const reportKeys = allPermissionKeys.filter((key) => key.startsWith("reports.view."));
-const kitchenKeys = keys("kds.view", "kds.bump", "kds.recall", "kds.hold");
+const kitchenKeys = keys("kds.view", "kds.bump", "kds.recall", "kds.hold", "kds.86");
 const inventoryKeys = keys("inventory.view", "inventory.adjust");
 const shiftKeys = keys("shift.open", "shift.close");
 const billOps = keys("bills.create", "bills.settle", "bills.split", "bills.discount.apply", "bills.void", "bills.day_close", "bills.refund");
@@ -68,11 +69,13 @@ export const systemRolePermissions: Record<(typeof roleNames)[number], Permissio
     ...orderOps,
     ...billOps,
     "bills.discount.approve",
+    "kot.print",
     ...shiftKeys,
     "menu.view",
     "menu.edit",
     "menu.price_edit",
     ...kitchenKeys,
+    "kot.reprint",
     ...inventoryKeys,
     "staff.manage",
     "customers.view",

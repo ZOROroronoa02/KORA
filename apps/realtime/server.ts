@@ -73,6 +73,7 @@ io.on("connection", (socket) => {
   const identity = (socket.data as KoraSocketData).identity!;
   for (const permission of identity.permissions) socket.join(realtimePermissionRoom(identity.tenantId, identity.outletId, permission));
   socket.emit("kora:ready", { outletId: identity.outletId });
+  socket.emit("connection:outlet-joined", { outletId: identity.outletId, serverTimestamp: new Date().toISOString() });
 
   const expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(0, identity.expiresAt - Date.now()));
   let checking = false;

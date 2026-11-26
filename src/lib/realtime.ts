@@ -23,7 +23,8 @@ export async function publishOutletEvent(tenantId: string, outletId: string, eve
   try {
     const target = await getEmitter();
     if (!target) return;
-    target.of("/").to(rooms).emit(event, payload);
+    const body = payload && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, unknown> : { data: payload };
+    target.of("/").to(rooms).emit(event, { ...body, serverTimestamp: new Date().toISOString() });
   } catch (error) {
     console.error("KORA realtime publish failed", error instanceof Error ? error.message : "unknown error");
   }
