@@ -18,20 +18,41 @@ if (process.env.NODE_ENV === "production" && (!allowedOrigins.length || allowedO
   try { return new URL(origin).protocol !== "https:"; }
   catch { return true; }
 }))) throw new Error("KORA_REALTIME_ORIGINS must list exact HTTPS web origins in production");
+if (process.env.NODE_ENV === "production" && !process.env.REDIS_URL) {
+  throw new Error("REDIS_URL is required in production for shared realtime fan-out");
+}
 
-const server = createServer((request, response) => {
-  if (request.url === "/health") { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ name: "kora-realtime", status: "ok" })); return; }
+let redisPubClient: ReturnType<typeof createClient> | undefined;
+let redisSubClient: ReturnType<typeof createClient> | undefined;
+const server = createServer(async (request, response) => {
+  if (request.url === "/health" || request.url === "/health/live") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ name: "kora-realtime", status: "alive" }));
+    return;
+  }
+  if (request.url === "/health/ready") {
+    let databaseReady = false;
+    try { await prisma.$queryRaw`SELECT 1`; databaseReady = true; }
+    catch { databaseReady = false; }
+    const redisState = process.env.REDIS_URL
+      ? (redisPubClient?.isReady && redisSubClient?.isReady ? "ready" : "unavailable")
+      : process.env.NODE_ENV === "production" ? "required" : "not_configured";
+    const ready = databaseReady && (redisState === "ready" || redisState === "not_configured");
+    response.writeHead(ready ? 200 : 503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ name: "kora-realtime", status: ready ? "ready" : "not_ready", database: databaseReady, redis: redisState }));
+    return;
+  }
   response.writeHead(404); response.end("Not found");
 });
 const io = new Server(server, { cors: { origin: allowedOrigins, credentials: true }, transports: ["websocket", "polling"], maxHttpBufferSize: 32 * 1024 });
 
 if (process.env.REDIS_URL) {
-  const pubClient = createClient({ url: process.env.REDIS_URL });
-  const subClient = pubClient.duplicate();
-  pubClient.on("error", (error) => console.error("KORA realtime Redis publisher error", error.message));
-  subClient.on("error", (error) => console.error("KORA realtime Redis subscriber error", error.message));
-  await Promise.all([pubClient.connect(), subClient.connect()]);
-  io.adapter(createAdapter(pubClient, subClient));
+  redisPubClient = createClient({ url: process.env.REDIS_URL });
+  redisSubClient = redisPubClient.duplicate();
+  redisPubClient.on("error", (error) => console.error("KORA realtime Redis publisher error", error.message));
+  redisSubClient.on("error", (error) => console.error("KORA realtime Redis subscriber error", error.message));
+  await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
+  io.adapter(createAdapter(redisPubClient, redisSubClient));
 }
 
 async function resolveSocketAccess(userId: string, userTenantId: string, outletId: string) {

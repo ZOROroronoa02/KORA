@@ -14,6 +14,8 @@ test('realtime security integration: socket expires on permission revocation', {
   let tenantId;
   let socket;
   try {
+    assert.equal((await fetch(realtime + '/health/live')).status, 200, 'liveness must stay available independently of dependencies');
+    assert.equal((await fetch(realtime + '/health/ready')).status, 200, 'readiness must verify the database and configured fan-out');
     const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
     const response = await fetch(api + '/api/auth/register', {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
