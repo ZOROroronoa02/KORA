@@ -20,6 +20,17 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     return body;
   };
   try {
+    const activeOwnershipGuards = await prisma.$queryRaw`
+      SELECT c.relname AS table_name
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public' AND t.tgname LIKE 'kora_tenant_guard_%' AND NOT t.tgisinternal
+    `;
+    const guardedTables = new Set(activeOwnershipGuards.map((trigger) => trigger.table_name));
+    for (const tableName of ['customer_outlets', 'orders', 'order_items', 'kots', 'bills', 'payments', 'shifts', 'raw_materials', 'purchases', 'audit_logs']) {
+      assert.ok(guardedTables.has(tableName), `database ownership trigger missing for ${tableName}`);
+    }
     const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
     const registerResponse = await fetch(api + '/api/auth/register', {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
@@ -45,6 +56,49 @@ test('API security integration: outlet customer isolation and concurrent bill sp
       body: JSON.stringify({ outletId: foreignOutlet.id, phone: '+919' + suffix.padEnd(9, '0'), name: 'Cross-Tenant Attempt' }),
     });
     assert.equal(crossTenantWrite.status, 403, 'a valid user from another tenant cannot write to a foreign outlet');
+
+    const foreignCustomer = await prisma.customer.create({
+      data: { tenantId: foreignTenantId, phone: '+918' + suffix.padEnd(9, '0'), name: 'Foreign Customer' },
+    });
+    const foreignCategory = await prisma.menuCategory.create({
+      data: { tenantId: foreignTenantId, outletId: foreignOutlet.id, name: 'Foreign Category' },
+    });
+    const foreignMenuItem = await prisma.menuItem.create({
+      data: { tenantId: foreignTenantId, categoryId: foreignCategory.id, name: 'Foreign Item', basePricePaise: 500n },
+    });
+    const assertDatabaseOwnershipRejection = (error) => {
+      const details = JSON.stringify({ code: error.code, meta: error.meta, message: error.message });
+      assert.match(details, /kora_tenant_ownership_guard|KORA ownership (violation|fields are immutable)/i);
+      return true;
+    };
+    await assert.rejects(
+      prisma.customerOutlet.create({ data: { customerId: foreignCustomer.id, outletId: registered.outlet.id } }),
+      assertDatabaseOwnershipRejection,
+      'direct Prisma writes cannot link a customer to an outlet in another tenant',
+    );
+    await assert.rejects(
+      prisma.customer.update({ where: { id: foreignCustomer.id }, data: { tenantId } }),
+      assertDatabaseOwnershipRejection,
+      'direct Prisma updates cannot move an existing customer between tenants',
+    );
+    assert.equal((await prisma.customer.findUniqueOrThrow({ where: { id: foreignCustomer.id } })).tenantId, foreignTenantId);
+    const crossTenantNestedOrderKey = 'cross-tenant-nested-' + suffix;
+    await assert.rejects(
+      prisma.order.create({
+        data: {
+          tenantId,
+          outletId: registered.outlet.id,
+          orderNumber: 900000 + Number.parseInt(suffix.slice(0, 4), 16),
+          idempotencyKey: crossTenantNestedOrderKey,
+          type: 'TAKEAWAY',
+          items: { create: [{ menuItemId: foreignMenuItem.id, nameSnapshot: foreignMenuItem.name, quantity: 1, unitPricePaise: 500n, gstBps: 500, totalPaise: 500n }] },
+        },
+      }),
+      assertDatabaseOwnershipRejection,
+      'nested order-item writes cannot reference another tenant menu item',
+    );
+    assert.equal(await prisma.order.count({ where: { tenantId, outletId: registered.outlet.id, idempotencyKey: crossTenantNestedOrderKey } }), 0,
+      'a rejected nested write must roll back its parent order');
 
     const phone = '+91' + randomUUID().replace(/\D/g, '').slice(0, 10);
     const customer = await prisma.customer.create({ data: { tenantId, phone, name: 'Private Outlet B Guest', email: 'private-' + suffix + '@example.test', birthday: new Date('1990-01-01'), consentAt: new Date() } });
