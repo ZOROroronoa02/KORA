@@ -56,4 +56,6 @@ npm run db:audit-tenant-ownership
 $env:DATABASE_URL='postgresql://postgres:postgres@localhost:5432/kora?schema=public'; npx prisma validate
 ```
 
+The outlet-profile API test verifies `settings.manage` authorization, tenant/outlet isolation, GSTIN/FSSAI/PIN validation, and audit history.
+
 To enable PostgreSQL API tests, also set `KORA_SECURITY_TEST_URL=http://localhost:3000` and `KORA_SECURITY_TEST_REALTIME_URL=http://localhost:4000` in the same shell before `npm test`. Without these values, database and Socket.IO integration tests are reported as skipped. The integration suite covers auth, cross-tenant/outlet isolation, database ownership triggers, idempotent orders/payments, KOT transitions, table transfer, menu availability, customer metrics, bill splits, and shift reconciliation. The `lint` script currently runs TypeScript checking only; it is not a separate ESLint pass. A rendered browser QA pass and physical ESC/POS printer test are still outstanding.

@@ -20,6 +20,7 @@ import { systemRolePermissions, type PermissionKey } from "@/lib/permissions";
 import { RoleAdministration } from "@/components/RoleAdministration";
 import { AuditLogViewer } from "@/components/AuditLogViewer";
 import { OutletApprovalSettings } from "@/components/OutletApprovalSettings";
+import { OutletProfileSettings } from "@/components/OutletProfileSettings";
 import { CloudCustomersPage, CloudInventoryPage, CloudOverview, CloudReportsPage } from "@/components/CloudWorkspaceViews";
 
 type Page = "Overview" | "POS" | "Orders" | "Kitchen" | "Kitchen Display" | "Menu" | "Inventory" | "Customers" | "Team" | "Reports" | "Audit" | "Settings";
@@ -586,7 +587,7 @@ export default function Home() {
           {page === "Team" && <RoleAdministration outletId={selectedOutletId} permissions={effectivePermissions} onNotify={notify} />}
           {page === "Reports" && (cloudMode ? <CloudReportsPage /> : <ReportsPage range={range} setRange={setRange} todaySales={todaySales} onNotify={notify} />)}
           {page === "Audit" && <AuditLogViewer outletId={selectedOutletId} onNotify={notify} />}
-          {page === "Settings" && <><SettingsPage data={data} setData={setData} onNotify={notify} /><OutletApprovalSettings outletId={selectedOutletId} permissions={effectivePermissions} cloudMode={cloudMode} demoRole={demoRole} setDemoRole={setDemoRole} onNotify={notify} /></>}
+          {page === "Settings" && <>{cloudMode ? <OutletProfileSettings key={selectedOutletId} outletId={selectedOutletId} permissions={effectivePermissions} onNotify={notify} /> : <SettingsPage data={data} setData={setData} onNotify={notify} />}<OutletApprovalSettings outletId={selectedOutletId} permissions={effectivePermissions} cloudMode={cloudMode} demoRole={demoRole} setDemoRole={setDemoRole} onNotify={notify} /></>}
           </>}
         </div>
       </section>
