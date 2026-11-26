@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: kora
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - kora-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -19,7 +19,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - kora-redis:/data
     command: ["redis-server", "--appendonly", "yes"]

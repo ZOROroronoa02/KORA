@@ -11,6 +11,8 @@ export default defineConfig({
   },
   engine: "classic",
   datasource: {
-    url: env("DATABASE_URL"),
+    // Keep DDL credentials out of the web/runtime process in production.
+    // Local development falls back to DATABASE_URL for a single-user setup.
+    url: process.env.MIGRATION_DATABASE_URL || env("DATABASE_URL"),
   },
 });

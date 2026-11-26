@@ -1,0 +1,111 @@
+name: KORA CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: kora
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kora"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/kora?schema=public
+      DATABASE_URL: postgresql://kora_runtime:kora-runtime-ci@localhost:5432/kora?schema=public
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+      KORA_PROXY_SHARED_SECRET: ci-only-proxy-shared-secret-at-least-32-bytes
+      KORA_APP_ORIGIN: http://localhost:3000
+      KORA_REALTIME_ORIGINS: http://localhost:3000
+      NEXT_PUBLIC_REALTIME_URL: http://localhost:4000
+      REALTIME_PORT: 4000
+      NEXT_TELEMETRY_DISABLED: 1
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run db:migrate:deploy
+
+      - name: Provision restricted runtime database role
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/kora?schema=public
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE kora_runtime LOGIN PASSWORD 'kora-runtime-ci';
+          GRANT CONNECT ON DATABASE kora TO kora_runtime;
+          GRANT USAGE ON SCHEMA public TO kora_runtime;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO kora_runtime;
+          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO kora_runtime;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO kora_runtime;
+          ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+            GRANT USAGE, SELECT ON SEQUENCES TO kora_runtime;
+          SQL
+          if psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'ALTER TABLE public.orders DISABLE TRIGGER kora_tenant_guard_orders'; then
+            echo 'Runtime role unexpectedly disabled a tenant guard.' >&2
+            exit 1
+          fi
+      - run: npm run db:audit-tenant-ownership
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Build production container targets
+        run: |
+          docker build --build-arg NEXT_PUBLIC_REALTIME_URL=http://localhost:4000 --target web -t kora-web:ci .
+          docker build --target realtime -t kora-realtime:ci .
+          docker build --target migrator -t kora-migrator:ci .
+
+      - name: Start services and run live test suite
+        env:
+          KORA_SECURITY_TEST_URL: http://localhost:3000
+          KORA_SECURITY_TEST_REALTIME_URL: http://localhost:4000
+        run: |
+          set -euo pipefail
+          NODE_ENV=development npm run dev -- --port 3000 > /tmp/kora-web.log 2>&1 &
+          web_pid=$!
+          NODE_ENV=development npm run realtime:dev > /tmp/kora-realtime.log 2>&1 &
+          realtime_pid=$!
+          cleanup() {
+            kill "$web_pid" "$realtime_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/api/health/ready >/dev/null && curl -fsS http://localhost:4000/health/ready >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:3000/api/health/ready >/dev/null
+          curl -fsS http://localhost:4000/health/ready >/dev/null
+          npm test
