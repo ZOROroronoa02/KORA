@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Activity, AlertTriangle, ArrowRight, Box, Clock3, Package, RefreshCw, Search, ShoppingBag, Users } from "lucide-react";
+import type { FormEvent } from "react";
+import { Activity, AlertTriangle, ArrowRight, Box, Clock3, Package, Plus, RefreshCw, Search, ShoppingBag, Users } from "lucide-react";
 import { readJson } from "@/lib/client-api";
 
 type CloudOrder = {
@@ -86,11 +87,73 @@ export function CloudOverview({
   </>;
 }
 
-export function CloudInventoryPage({ outletId }: { outletId: string }) {
+function parseMilliQuantity(value: string): bigint | null {
+  const cleaned = value.trim();
+  if (!/^(?:\d{1,12})(?:\.\d{1,3})?$/.test(cleaned)) return null;
+  const [whole, fraction = ""] = cleaned.split(".");
+  const milli = BigInt(whole) * 1000n + BigInt((fraction + "000").slice(0, 3));
+  return milli > 0n && milli <= BigInt(Number.MAX_SAFE_INTEGER) ? milli : null;
+}
+
+function parseMilliNonNegative(value: string): bigint | null {
+  const cleaned = value.trim();
+  if (!/^(?:\d{1,12})(?:\.\d{1,3})?$/.test(cleaned)) return null;
+  const [whole, fraction = ""] = cleaned.split(".");
+  const milli = BigInt(whole) * 1000n + BigInt((fraction + "000").slice(0, 3));
+  return milli <= BigInt(Number.MAX_SAFE_INTEGER) ? milli : null;
+}
+
+function parseRupeesToPaise(value: string): bigint | null {
+  const cleaned = value.trim();
+  if (!/^(?:\d{1,12})(?:\.\d{1,2})?$/.test(cleaned)) return null;
+  const [rupees, paise = ""] = cleaned.split(".");
+  return BigInt(rupees) * 100n + BigInt((paise + "00").slice(0, 2));
+}
+
+function formatMilliQuantity(value: string, unit: string) {
+  const milli = BigInt(value);
+  const whole = milli / 1000n;
+  const fraction = (milli % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
+  return `${new Intl.NumberFormat("en-IN").format(whole)}${fraction ? `.${fraction}` : ""} ${unit}`;
+}
+
+function formatStockValue(material: CloudMaterial) {
+  const paise = (BigInt(material.quantityMilli) * BigInt(material.costPerUnitPaise) + 500n) / 1000n;
+  const rupees = paise / 100n;
+  const fraction = (paise % 100n).toString().padStart(2, "0");
+  return `${new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(rupees)}.${fraction}`;
+}
+
+export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: string; canAdjustStock: boolean }) {
   const [materials, setMaterials] = useState<CloudMaterial[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
+  const [movementOpen, setMovementOpen] = useState(false);
+  const [movementKind, setMovementKind] = useState<"adjust" | "wastage">("adjust");
+  const [direction, setDirection] = useState<"add" | "remove">("add");
+  const [selectedMaterialId, setSelectedMaterialId] = useState("");
+  const [quantity, setQuantity] = useState("");
+  const [reason, setReason] = useState("");
+  const [movementError, setMovementError] = useState("");
+  const [movementNotice, setMovementNotice] = useState("");
+  const [savingMovement, setSavingMovement] = useState(false);
+  const [materialOpen, setMaterialOpen] = useState(false);
+  const [newMaterialName, setNewMaterialName] = useState("");
+  const [newMaterialUnit, setNewMaterialUnit] = useState("kg");
+  const [newReorderQuantity, setNewReorderQuantity] = useState("0");
+  const [newMaterialCost, setNewMaterialCost] = useState("0");
+  const [materialError, setMaterialError] = useState("");
+  const [savingMaterial, setSavingMaterial] = useState(false);
+
+  useEffect(() => {
+    setMovementOpen(false);
+    setSelectedMaterialId("");
+    setMovementError("");
+    setMovementNotice("");
+    setMaterialOpen(false);
+    setMaterialError("");
+  }, [outletId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -109,15 +172,103 @@ export function CloudInventoryPage({ outletId }: { outletId: string }) {
   }, [outletId, refreshKey]);
 
   const lowStockCount = materials.filter((material) => BigInt(material.quantityMilli) <= BigInt(material.reorderMilli)).length;
-  const quantityLabel = (value: string, unit: string) => `${(Number(value) / 1000).toLocaleString("en-IN", { maximumFractionDigits: 3 })} ${unit}`;
-  const valueLabel = (material: CloudMaterial) => {
-    const paise = Number(material.quantityMilli) * Number(material.costPerUnitPaise) / 1000;
-    return Number.isFinite(paise) ? new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 }).format(paise / 100) : "—";
+  const submitMovement = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setMovementError("");
+    setMovementNotice("");
+    const quantityMilli = parseMilliQuantity(quantity);
+    if (!selectedMaterialId || quantityMilli === null) {
+      setMovementError("Enter a quantity greater than zero with up to three decimal places.");
+      return;
+    }
+    const cleanedReason = reason.trim();
+    if (cleanedReason.length < 3 || cleanedReason.length > 300) {
+      setMovementError("Enter a reason between 3 and 300 characters.");
+      return;
+    }
+    const signedQuantity = movementKind === "wastage" ? quantityMilli : direction === "remove" ? -quantityMilli : quantityMilli;
+    setSavingMovement(true);
+    try {
+      await readJson("/api/inventory", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outletId, rawMaterialId: selectedMaterialId, operation: movementKind, quantityMilli: signedQuantity.toString(), reason: cleanedReason }),
+      });
+      setMovementOpen(false);
+      setQuantity("");
+      setReason("");
+      setRefreshKey((key) => key + 1);
+      setMovementNotice(movementKind === "wastage" ? "Wastage recorded and stock updated." : "Stock correction saved and audited.");
+    } catch (reason) {
+      setMovementError(reason instanceof Error ? reason.message : "Could not save the stock movement.");
+    } finally {
+      setSavingMovement(false);
+    }
+  };
+
+  const submitMaterial = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setMaterialError("");
+    const name = newMaterialName.trim();
+    const unit = newMaterialUnit.trim();
+    const reorderMilli = parseMilliNonNegative(newReorderQuantity);
+    const costPerUnitPaise = parseRupeesToPaise(newMaterialCost);
+    if (!name || name.length > 100 || !unit || unit.length > 16 || reorderMilli === null || costPerUnitPaise === null) {
+      setMaterialError("Enter a name, unit, valid reorder quantity (up to three decimals), and unit cost (up to two decimals).");
+      return;
+    }
+    setSavingMaterial(true);
+    try {
+      const result = await readJson<{ material: CloudMaterial }>("/api/inventory", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outletId, operation: "create", name, unit, reorderMilli: reorderMilli.toString(), costPerUnitPaise: costPerUnitPaise.toString() }),
+      });
+      setMaterialOpen(false);
+      setNewMaterialName("");
+      setNewMaterialUnit("kg");
+      setNewReorderQuantity("0");
+      setNewMaterialCost("0");
+      setSelectedMaterialId(result.material.id);
+      setMovementKind("adjust");
+      setDirection("add");
+      setRefreshKey((key) => key + 1);
+      setMovementOpen(true);
+      setMovementNotice("Ingredient created. You can record its opening stock below.");
+    } catch (reason) {
+      setMaterialError(reason instanceof Error ? reason.message : "Could not create this ingredient.");
+    } finally {
+      setSavingMaterial(false);
+    }
   };
 
   return <>
-    <div className="page-title-row"><div><p className="eyebrow">BACK OF HOUSE · LIVE DATA</p><h1>Inventory</h1><p className="muted">Current raw-material balances for this outlet.</p></div><button className="secondary-button" onClick={() => setRefreshKey((key) => key + 1)} disabled={loading}><RefreshCw size={15} /> Refresh stock</button></div>
+    <div className="page-title-row"><div><p className="eyebrow">BACK OF HOUSE · LIVE DATA</p><h1>Inventory</h1><p className="muted">Current raw-material balances for this outlet.</p></div><div className="title-actions">{canAdjustStock && <button className="primary-button" onClick={() => { setMaterialOpen(true); setMaterialError(""); }}><Plus size={15} /> Add ingredient</button>}{canAdjustStock && materials.length > 0 && <button className="secondary-button" onClick={() => { setSelectedMaterialId(materials[0].id); setMovementOpen(true); setMovementError(""); }}><Package size={15} /> Record stock movement</button>}<button className="secondary-button" onClick={() => setRefreshKey((key) => key + 1)} disabled={loading}><RefreshCw size={15} /> Refresh stock</button></div></div>
     {error && <div className="cloud-data-notice" role="alert"><AlertTriangle size={16} /><span>{error}</span></div>}
+    {movementNotice && <div className="cloud-data-notice" role="status" aria-live="polite"><Package size={16} /><span>{movementNotice}</span></div>}
+    {materialOpen && canAdjustStock && <form className="card inventory-movement-form" onSubmit={submitMaterial} aria-labelledby="inventory-create-title">
+      <div className="inventory-movement-heading"><div><p className="eyebrow">OUTLET INGREDIENT</p><h2 id="inventory-create-title">Add ingredient</h2><p className="muted">The opening balance starts at zero. Record a stock movement after saving.</p></div><button type="button" className="secondary-button" onClick={() => setMaterialOpen(false)} disabled={savingMaterial}>Cancel</button></div>
+      <div className="inventory-movement-fields">
+        <label>Ingredient name<input required maxLength={100} value={newMaterialName} onChange={(event) => setNewMaterialName(event.target.value)} placeholder="e.g. Basmati rice" /></label>
+        <label>Stock unit<input required maxLength={16} value={newMaterialUnit} onChange={(event) => setNewMaterialUnit(event.target.value)} placeholder="kg, L, pcs" /></label>
+        <label>Reorder level<input required inputMode="decimal" value={newReorderQuantity} onChange={(event) => setNewReorderQuantity(event.target.value)} placeholder="0.000" /></label>
+        <label>Cost per unit (₹)<input required inputMode="decimal" value={newMaterialCost} onChange={(event) => setNewMaterialCost(event.target.value)} placeholder="0.00" /></label>
+      </div>
+      <div className="inventory-movement-footer"><small>Enter the cost for one selected stock unit. Quantity precision is 0.001.</small><button className="primary-button" type="submit" disabled={savingMaterial}>{savingMaterial ? "Saving…" : "Create ingredient"}</button></div>
+      {materialError && <p className="inventory-movement-error" role="alert">{materialError}</p>}
+    </form>}
+    {movementOpen && canAdjustStock && materials.some((material) => material.id === selectedMaterialId) && <form className="card inventory-movement-form" onSubmit={submitMovement} aria-labelledby="inventory-movement-title">
+      <div className="inventory-movement-heading"><div><p className="eyebrow">AUDITED STOCK MOVEMENT</p><h2 id="inventory-movement-title">Record stock change</h2><p className="muted">Quantities support up to three decimal places. Every change needs a reason.</p></div><button type="button" className="secondary-button" onClick={() => setMovementOpen(false)} disabled={savingMovement}>Cancel</button></div>
+      <div className="inventory-movement-fields">
+        <label>Ingredient<select required value={selectedMaterialId} onChange={(event) => setSelectedMaterialId(event.target.value)}>{materials.map((material) => <option key={material.id} value={material.id}>{material.name} · {material.unit}</option>)}</select></label>
+        <label>Movement<select value={movementKind} onChange={(event) => setMovementKind(event.target.value as "adjust" | "wastage")}><option value="adjust">Stock correction</option><option value="wastage">Wastage</option></select></label>
+        {movementKind === "adjust" && <label>Direction<select value={direction} onChange={(event) => setDirection(event.target.value as "add" | "remove")}><option value="add">Add stock</option><option value="remove">Remove stock</option></select></label>}
+        <label>Quantity<input required inputMode="decimal" autoComplete="off" value={quantity} onChange={(event) => setQuantity(event.target.value)} placeholder="e.g. 1.250" aria-describedby="inventory-quantity-help" /></label>
+        <label className="inventory-reason-field">Reason<input required minLength={3} maxLength={300} value={reason} onChange={(event) => setReason(event.target.value)} placeholder={movementKind === "wastage" ? "e.g. spoiled during storage" : "e.g. physical stock count"} /></label>
+      </div>
+      <div className="inventory-movement-footer"><small id="inventory-quantity-help">Stored in milli-units; 1.000 {materials.find((item) => item.id === selectedMaterialId)?.unit ?? "unit"} = 1,000 milli-units.</small><button className="primary-button" type="submit" disabled={savingMovement}>{savingMovement ? "Saving…" : "Save movement"}</button></div>
+      {movementError && <p className="inventory-movement-error" role="alert">{movementError}</p>}
+    </form>}
     <div className="stats-grid inventory-stats">
       <div className="card cloud-metric"><span>Tracked ingredients</span><b>{loading ? "…" : materials.length}</b><small>Raw materials set up for this outlet</small></div>
       <div className="card cloud-metric"><span>At or below reorder level</span><b>{loading ? "…" : lowStockCount}</b><small>Based on saved reorder quantities</small></div>
@@ -125,14 +276,14 @@ export function CloudInventoryPage({ outletId }: { outletId: string }) {
     </div>
     <div className="card content-card">
       <div className="table-toolbar"><div><h2 className="section-title">Stock levels</h2></div><span className="muted">Values use stored unit cost and on-hand quantity.</span></div>
-      {loading && materials.length === 0 ? <div className="empty-state"><Package size={23} /><b>Loading stock</b><span>Reading the selected outlet’s inventory.</span></div> : materials.length === 0 ? <div className="empty-state"><Box size={23} /><b>No ingredients set up</b><span>This cloud outlet has no raw-material records yet. Demo stock is not shown here.</span></div> : <div className="wide-table">
+      {loading && materials.length === 0 ? <div className="empty-state"><Package size={23} /><b>Loading stock</b><span>Reading the selected outlet’s inventory.</span></div> : materials.length === 0 ? <div className="empty-state"><Box size={23} /><b>No ingredients set up</b><span>{canAdjustStock ? "Add the outlet’s first ingredient to begin tracking stock." : "This cloud outlet has no raw-material records yet. Demo stock is not shown here."}</span></div> : <div className="wide-table">
         <div className="table-head inventory-head cloud-inventory-head"><span>INGREDIENT</span><span>ON HAND</span><span>REORDER LEVEL</span><span>STATUS</span><span>EST. VALUE</span></div>
         {materials.map((material) => {
           const quantity = BigInt(material.quantityMilli);
           const reorder = BigInt(material.reorderMilli);
           const status = quantity === 0n ? "Out of stock" : quantity <= reorder ? "Reorder" : "In stock";
           return <div className="inventory-row cloud-inventory-row" key={material.id}>
-            <span><b>{material.name}</b></span><span>{quantityLabel(material.quantityMilli, material.unit)}</span><span>{quantityLabel(material.reorderMilli, material.unit)}</span><span><span className="role-tag">{status}</span></span><b>{valueLabel(material)}</b>
+            <span className="cloud-material-name"><b>{material.name}</b>{canAdjustStock && <button type="button" className="cloud-stock-action" onClick={() => { setSelectedMaterialId(material.id); setMovementOpen(true); setMovementError(""); }} aria-label={`Record stock movement for ${material.name}`}>Adjust</button>}</span><span>{formatMilliQuantity(material.quantityMilli, material.unit)}</span><span>{formatMilliQuantity(material.reorderMilli, material.unit)}</span><span><span className="role-tag">{status}</span></span><b>{formatStockValue(material)}</b>
           </div>;
         })}
       </div>}
