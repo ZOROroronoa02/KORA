@@ -115,16 +115,20 @@ test('bcrypt password policy measures UTF-8 bytes and blocks silent 72-byte trun
 });
 
 test('refresh-cookie endpoints can reject cross-origin browser requests', () => {
-  assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://kora.example', 'sec-fetch-site': 'same-origin' } })), true);
-  assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://attacker.example', 'sec-fetch-site': 'cross-site' } })), false);
-  assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { 'sec-fetch-site': 'cross-site' } })), false);
   const previousEnv = process.env.NODE_ENV;
   const previousOrigin = process.env.KORA_APP_ORIGIN;
-  process.env.NODE_ENV = 'production';
-  delete process.env.KORA_APP_ORIGIN;
-  assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://kora.example' } })), false);
-  process.env.KORA_APP_ORIGIN = 'https://kora.example';
-  assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://kora.example' } })), true);
-  if (previousEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previousEnv;
-  if (previousOrigin === undefined) delete process.env.KORA_APP_ORIGIN; else process.env.KORA_APP_ORIGIN = previousOrigin;
+  try {
+    delete process.env.KORA_APP_ORIGIN;
+    assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://kora.example', 'sec-fetch-site': 'same-origin' } })), true);
+    assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://attacker.example', 'sec-fetch-site': 'cross-site' } })), false);
+    assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { 'sec-fetch-site': 'cross-site' } })), false);
+    process.env.NODE_ENV = 'production';
+    delete process.env.KORA_APP_ORIGIN;
+    assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://kora.example' } })), false);
+    process.env.KORA_APP_ORIGIN = 'https://kora.example';
+    assert.equal(isSameOriginRequest(new Request('https://kora.example/api/auth/refresh', { method: 'POST', headers: { origin: 'https://kora.example' } })), true);
+  } finally {
+    if (previousEnv === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previousEnv;
+    if (previousOrigin === undefined) delete process.env.KORA_APP_ORIGIN; else process.env.KORA_APP_ORIGIN = previousOrigin;
+  }
 });

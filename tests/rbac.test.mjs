@@ -26,7 +26,7 @@ test('system role defaults match the restaurant access boundaries', () => {
   assert.equal(waiter.has('orders.create'), true);
   assert.equal(waiter.has('orders.move_table'), true);
   assert.equal([...waiter].some((permission) => permission.startsWith('bills.')), false);
-  assert.deepEqual(systemRolePermissions.CHEF, ['kds.view', 'kds.bump', 'kds.recall', 'kds.hold']);
+  assert.deepEqual(systemRolePermissions.CHEF, ['kds.view', 'kds.bump', 'kds.recall', 'kds.hold', 'kds.86']);
   assert.equal(systemRolePermissions.ACCOUNTANT.includes('audit.view'), true);
   assert.equal(systemRolePermissions.INVENTORY_MANAGER.includes('inventory.adjust'), true);
 });

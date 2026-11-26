@@ -5,6 +5,7 @@ import { PrismaClient } from '@prisma/client';
 
 const api = process.env.KORA_SECURITY_TEST_URL;
 const enabled = Boolean(api && process.env.DATABASE_URL);
+const testIp = `2001:db8:${randomUUID().slice(0, 4)}:${randomUUID().slice(4, 8)}::1`;
 
 test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, guest and close', { skip: !enabled, timeout: 60000 }, async () => {
   const prisma = new PrismaClient();
@@ -14,7 +15,7 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const email = `pos-owner-${suffix}@example.test`;
     const password = 'KoraCloudFlow123!';
     const registrationResponse = await fetch(`${api}/api/auth/register`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': `198.51.100.${Number.parseInt(suffix.slice(0, 2), 16) || 1}` },
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
       body: JSON.stringify({ tenantName: `Cloud Flow ${suffix}`, outletName: 'Test Outlet', name: 'POS Test Owner', email, password }),
     });
     const registration = await registrationResponse.json();
@@ -22,7 +23,7 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     tenantId = registration.tenant.id;
 
     const loginResponse = await fetch(`${api}/api/auth/login`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
       body: JSON.stringify({ tenantSlug: registration.tenant.slug, email, password }),
     });
     const login = await loginResponse.json();

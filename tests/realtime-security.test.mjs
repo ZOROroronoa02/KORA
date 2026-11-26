@@ -7,6 +7,7 @@ import { io } from 'socket.io-client';
 const api = process.env.KORA_SECURITY_TEST_URL;
 const realtime = process.env.KORA_SECURITY_TEST_REALTIME_URL;
 const enabled = Boolean(api && realtime && process.env.DATABASE_URL);
+const testIp = `2001:db8:${randomUUID().slice(0, 4)}:${randomUUID().slice(4, 8)}::1`;
 
 test('realtime security integration: socket expires on permission revocation', { skip: !enabled, timeout: 45000 }, async () => {
   const prisma = new PrismaClient();
@@ -15,7 +16,7 @@ test('realtime security integration: socket expires on permission revocation', {
   try {
     const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
     const response = await fetch(api + '/api/auth/register', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
       body: JSON.stringify({ tenantName: 'Realtime Test ' + suffix, outletName: 'Outlet', name: 'Realtime Owner', email: 'realtime-' + suffix + '@example.test', password: 'LongEnoughPass123!' }),
     });
     const result = await response.json();

@@ -6,6 +6,7 @@ import { hash } from 'bcryptjs';
 
 const api = process.env.KORA_SECURITY_TEST_URL;
 const enabled = Boolean(api && process.env.DATABASE_URL);
+const testIp = `2001:db8:${randomUUID().slice(0, 4)}:${randomUUID().slice(4, 8)}::1`;
 
 test('RBAC API: owner boundaries, manager PIN approvals, redaction, and cache invalidation', { skip: !enabled, timeout: 60000 }, async () => {
   const prisma = new PrismaClient();
@@ -18,7 +19,7 @@ test('RBAC API: owner boundaries, manager PIN approvals, redaction, and cache in
   try {
     const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
     const registration = await readJson(await fetch(`${api}/api/auth/register`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
       body: JSON.stringify({ tenantName: `RBAC ${suffix}`, outletName: 'Main outlet', name: 'Test Owner', email: `owner-${suffix}@example.test`, password: 'KoraRBACPass123!' }),
     }));
     assert.equal(registration.status, 201, JSON.stringify(registration.body));
@@ -44,7 +45,7 @@ test('RBAC API: owner boundaries, manager PIN approvals, redaction, and cache in
       const staff = await prisma.user.create({ data: { tenantId, name: label, email, passwordHash: await hash(password, 4) } });
       await prisma.userOutletRole.create({ data: { userId: staff.id, outletId: outlet.id, roleId: roleByName.get(roleName).id } });
       const login = await readJson(await fetch(`${api}/api/auth/login`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
+        method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
         body: JSON.stringify({ tenantSlug: tenant.slug, email, password }),
       }));
       assert.equal(login.status, 200, JSON.stringify(login.body));

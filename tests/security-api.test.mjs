@@ -6,6 +6,7 @@ import { hash } from 'bcryptjs';
 
 const api = process.env.KORA_SECURITY_TEST_URL;
 const enabled = Boolean(api && process.env.DATABASE_URL);
+const testIp = `2001:db8:${randomUUID().slice(0, 4)}:${randomUUID().slice(4, 8)}::1`;
 
 test('API security integration: outlet customer isolation and concurrent bill splits', { skip: !enabled, timeout: 60000 }, async () => {
   const prisma = new PrismaClient();
@@ -20,7 +21,7 @@ test('API security integration: outlet customer isolation and concurrent bill sp
   try {
     const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
     const registerResponse = await fetch(api + '/api/auth/register', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
       body: JSON.stringify({ tenantName: 'Security Test ' + suffix, outletName: 'Outlet A', name: 'Test Owner', email: 'owner-' + suffix + '@example.test', password: 'LongEnoughPass123!' }),
     });
     const registered = await readJson(registerResponse);
@@ -48,7 +49,7 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     const waiter = await prisma.user.create({ data: { tenantId, name: 'Test Waiter', email: waiterEmail, passwordHash: await hash('WaiterPass123!', 4) } });
     await prisma.userOutletRole.create({ data: { userId: waiter.id, outletId: registered.outlet.id, roleId: waiterRole.id } });
     const waiterLogin = await readJson(await fetch(api + '/api/auth/login', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
       body: JSON.stringify({ tenantSlug: registered.tenant.slug, email: waiterEmail, password: 'WaiterPass123!' }),
     }));
     const forbidden = await fetch(api + '/api/customers', {
