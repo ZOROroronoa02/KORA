@@ -5,6 +5,7 @@ import { accessTokenSeconds, createAccessToken, hashToken, newRefreshToken, refr
 import { isRateLimited, RateLimitUnavailableError } from "@/lib/rate-limit";
 import { passwordMeetsRegistrationPolicy } from "@/lib/password-policy";
 import { readJsonObject, RequestInputError } from "@/lib/http";
+import { ensureOutletSettings, ensureTenantSystemRoles } from "@/lib/role-seed";
 
 export const runtime = "nodejs";
 
@@ -24,12 +25,12 @@ export async function POST(request: Request) {
     }
     const baseSlug = tenantName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 35) || "restaurant";
     const slug = `${baseSlug}-${crypto.randomUUID().slice(0, 8)}`;
-    const permissions = ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "team.manage", "customer.manage", "kot.update"];
     const passwordHash = await hash(password, 12);
     const created = await prisma.$transaction(async (tx) => {
       const tenant = await tx.tenant.create({ data: { name: tenantName, slug } });
       const outlet = await tx.outlet.create({ data: { tenantId: tenant.id, name: outletName, code: "MAIN" } });
       const user = await tx.user.create({ data: { tenantId: tenant.id, name, email, phone, passwordHash } });
+      await ensureOutletSettings(tx, outlet.id);
       const categoryNames = ["Breakfast", "Starters", "Mains", "Breads", "Drinks"];
       const categoryIds = new Map<string, string>();
       for (const [sortOrder, categoryName] of categoryNames.entries()) {
@@ -50,19 +51,11 @@ export async function POST(request: Request) {
           await tx.outletMenuItem.create({ data: { outletId: outlet.id, menuItemId: item.id, available: true } });
         }
       }
-      const role = await tx.role.create({ data: { tenantId: tenant.id, name: "Owner", isSystem: true } });
-      const permissionRows = await Promise.all(permissions.map((key) => tx.permission.upsert({ where: { key }, update: {}, create: { key, description: key.replaceAll(".", " ") } })));
-      await tx.rolePermission.createMany({ data: permissionRows.map((permission) => ({ roleId: role.id, permissionId: permission.id })), skipDuplicates: true });
-      await tx.userOutletRole.create({ data: { userId: user.id, outletId: outlet.id, roleId: role.id } });
-      const roleAccess: Record<string, string[]> = {
-        Manager: ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "customer.manage", "kot.update"],
-        Cashier: ["order.create", "bill.split", "shift.open", "shift.close"], Waiter: ["order.create"], Kitchen: ["kot.update"],
-      };
-      for (const [roleName, allowed] of Object.entries(roleAccess)) {
-        const employeeRole = await tx.role.create({ data: { tenantId: tenant.id, name: roleName, isSystem: true } });
-        const granted = permissionRows.filter((permission) => allowed.includes(permission.key));
-        await tx.rolePermission.createMany({ data: granted.map((permission) => ({ roleId: employeeRole.id, permissionId: permission.id })), skipDuplicates: true });
-      }
+      const seededRoles = await ensureTenantSystemRoles(tx, tenant.id);
+      const ownerRoleId = seededRoles.roles.get("OWNER");
+      if (!ownerRoleId) throw new Error("Owner role could not be provisioned.");
+      await tx.userOutletRole.create({ data: { userId: user.id, outletId: outlet.id, roleId: ownerRoleId } });
+      await tx.auditLog.create({ data: { tenantId: tenant.id, outletId: outlet.id, userId: user.id, action: "INITIAL_OWNER_ROLE_ASSIGNED", entityType: "User", entityId: user.id, after: { role: "OWNER" } } });
       const refresh = newRefreshToken();
       const accessToken = await createAccessToken(user);
       await tx.refreshToken.create({ data: { userId: user.id, tokenHash: hashToken(refresh), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) } });

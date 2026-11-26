@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { KOTStatus, OrderStatus } from "@prisma/client";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { requirePermission, verifyManagerApprovalPin } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { publishOutletEvent } from "@/lib/realtime";
 import { transitionOrder } from "@/lib/billing";
@@ -15,8 +15,8 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ o
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
     const action = typeof body.action === "string" ? body.action : "";
-    const permission = action === "kot-ready" || action === "kot-served" ? "kot.update" : action === "void" ? "order.void" : "order.create";
-    const access = await authorizeOutlet(request, outletId, permission);
+    const permission = action === "kot-ready" || action === "kot-served" ? "kds.bump" : action === "void" ? "orders.void" : action === "transfer-table" ? "orders.move_table" : "orders.edit";
+    const access = await requirePermission(request, outletId, permission);
     if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
     const order = await prisma.order.findFirst({ where: { id: orderId, outletId, tenantId: access.tenantId }, include: { items: true, kots: { include: { items: true } }, bill: { include: { payments: true } } } });
     if (!order) return NextResponse.json({ error: "Order not found." }, { status: 404 });
@@ -57,18 +57,32 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ o
       if (reason.length < 3) return NextResponse.json({ error: "A reason is required to void an order." }, { status: 400 });
       if (order.status === OrderStatus.COMPLETED || order.status === OrderStatus.CANCELLED) return NextResponse.json({ error: "This order cannot be voided in its current state." }, { status: 409 });
       if (order.bill?.payments.some((payment) => payment.status === "PAID")) return NextResponse.json({ error: "A paid order requires a refund/reversal before it can be voided." }, { status: 409 });
+      const setting = await prisma.outletSettings.findUnique({ where: { outletId }, select: { settings: true } });
+      const config = setting?.settings && typeof setting.settings === "object" && !Array.isArray(setting.settings) ? setting.settings as Record<string, unknown> : {};
+      let approvalUserId: string | undefined;
+      if (config.voidRequiresApproval === true) {
+        approvalUserId = await verifyManagerApprovalPin({ outletId, pin: typeof body.approvalPin === "string" ? body.approvalPin : "", actorUserId: access.user.id, permission: "bills.void" }) ?? undefined;
+        if (!approvalUserId) return NextResponse.json({ error: "A separate manager approval PIN is required to void this order." }, { status: 403 });
+      }
       await prisma.$transaction(async (tx) => {
         const changed = await tx.order.updateMany({ where: { id: orderId, tenantId: access.tenantId, outletId, status: order.status }, data: { status: OrderStatus.CANCELLED } });
         if (changed.count !== 1) throw new RangeError("Order changed concurrently; reload before retrying.");
         await tx.kOT.updateMany({ where: { orderId, status: { not: KOTStatus.SERVED } }, data: { status: KOTStatus.CANCELLED } });
-        await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "ORDER_VOIDED", entityType: "Order", entityId: orderId, before: { status: order.status }, after: { status: OrderStatus.CANCELLED }, reason } });
+        await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, approvalUserId, action: "ORDER_VOIDED", entityType: "Order", entityId: orderId, before: { status: order.status }, after: { status: OrderStatus.CANCELLED }, reason } });
       });
     } else {
       return NextResponse.json({ error: "Supported actions are kot-ready, kot-served, transfer-table, and void." }, { status: 400 });
     }
     const updated = await prisma.order.findFirst({ where: { id: orderId, tenantId: access.tenantId, outletId }, include: { items: true, kots: { include: { items: true } }, bill: { include: { payments: true } } } });
     void publishOutletEvent(access.tenantId, outletId, action.startsWith("kot-") ? "kot:status" : "order:updated", { orderId, action });
-    return NextResponse.json({ order: safeJson(updated) });
+    const maySeeFinancials = access.permissions.includes("bills.settle") || access.permissions.includes("reports.view.financial");
+    const safeOrder = updated && !maySeeFinancials ? {
+      ...updated,
+      subtotalPaise: undefined, discountPaise: undefined, taxPaise: undefined, serviceChargePaise: undefined, totalPaise: undefined,
+      bill: undefined,
+      items: updated.items.map(({ unitPricePaise: _unitPrice, discountPaise: _discount, totalPaise: _total, ...item }) => item),
+    } : updated;
+    return NextResponse.json({ order: safeJson(safeOrder) });
   } catch (error) {
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });

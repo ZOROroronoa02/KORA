@@ -2,10 +2,14 @@ import { createServer } from "node:http";
 import { createAdapter } from "@socket.io/redis-adapter";
 import { createClient } from "redis";
 import { Server } from "socket.io";
+import nextEnv from "@next/env";
 import { prisma } from "../../src/lib/prisma.js";
 import { verifyAccessToken } from "../../src/lib/server-auth.js";
+import { realtimePermissionRoom } from "../../src/lib/realtime-permissions.js";
 
-type SocketIdentity = { tenantId: string; userId: string; outletId: string; expiresAt: number; permissions: string[] };
+nextEnv.loadEnvConfig(process.cwd());
+
+type SocketIdentity = { tenantId: string; userTenantId: string; userId: string; outletId: string; expiresAt: number; permissions: string[] };
 type KoraSocketData = { identity?: SocketIdentity };
 
 const originConfig = process.env.KORA_REALTIME_ORIGINS;
@@ -14,6 +18,7 @@ if (process.env.NODE_ENV === "production" && (!allowedOrigins.length || allowedO
   try { return new URL(origin).protocol !== "https:"; }
   catch { return true; }
 }))) throw new Error("KORA_REALTIME_ORIGINS must list exact HTTPS web origins in production");
+
 const server = createServer((request, response) => {
   if (request.url === "/health") { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ name: "kora-realtime", status: "ok" })); return; }
   response.writeHead(404); response.end("Not found");
@@ -29,27 +34,44 @@ if (process.env.REDIS_URL) {
   io.adapter(createAdapter(pubClient, subClient));
 }
 
+async function resolveSocketAccess(userId: string, userTenantId: string, outletId: string) {
+  const outlet = await prisma.outlet.findUnique({ where: { id: outletId }, select: { id: true, tenantId: true } });
+  if (!outlet) return null;
+  const [user, platformAssignments, assignments] = await Promise.all([
+    prisma.user.findFirst({ where: { id: userId, tenantId: userTenantId, active: true }, select: { id: true } }),
+    prisma.userPlatformRole.findMany({
+      where: { userId, role: { name: "SUPER_ADMIN", isSystem: true, tenantId: null } },
+      include: { role: { include: { permissions: { include: { permission: true } } } } },
+    }),
+    prisma.userOutletRole.findMany({
+      where: { userId, outletId, user: { tenantId: userTenantId, active: true }, outlet: { tenantId: outlet.tenantId } },
+      include: { role: { include: { permissions: { include: { permission: true } } } } },
+    }),
+  ]);
+  if (!user || (outlet.tenantId !== userTenantId && platformAssignments.length === 0)) return null;
+  const outletPermissions = assignments
+    .filter((assignment) => assignment.role.tenantId === outlet.tenantId && (!assignment.role.outletId || assignment.role.outletId === outletId))
+    .flatMap((assignment) => assignment.role.permissions.map((entry) => entry.permission.key));
+  const platformPermissions = platformAssignments.flatMap((assignment) => assignment.role.permissions.map((entry) => entry.permission.key));
+  return { tenantId: outlet.tenantId, permissions: [...new Set([...outletPermissions, ...platformPermissions])].sort() };
+}
+
 io.use(async (socket, next) => {
   try {
     const token = typeof socket.handshake.auth.accessToken === "string" ? socket.handshake.auth.accessToken : "";
     const outletId = typeof socket.handshake.auth.outletId === "string" ? socket.handshake.auth.outletId : "";
     if (!token || !outletId) return next(new Error("Authentication and outlet context are required"));
     const claims = await verifyAccessToken(token);
-    const user = await prisma.user.findFirst({
-      where: { id: claims.userId, tenantId: claims.tenantId, active: true },
-      include: { assignments: { where: { outletId, outlet: { tenantId: claims.tenantId } }, include: { outlet: true, role: { include: { permissions: { include: { permission: true } } } } } } },
-    });
-    const assignments = user?.assignments.filter((assignment) => assignment.outlet.tenantId === claims.tenantId) ?? [];
-    if (!user || assignments.length === 0) return next(new Error("Access to this outlet is not allowed"));
-    const permissions = [...new Set(assignments.flatMap((assignment) => assignment.role.permissions.map((rp) => rp.permission.key)))].sort();
-    socket.data.identity = { tenantId: claims.tenantId, userId: user.id, outletId, expiresAt: claims.expiresAt, permissions };
+    const access = await resolveSocketAccess(claims.userId, claims.tenantId, outletId);
+    if (!access) return next(new Error("Access to this outlet is not allowed"));
+    socket.data.identity = { tenantId: access.tenantId, userTenantId: claims.tenantId, userId: claims.userId, outletId, expiresAt: claims.expiresAt, permissions: access.permissions } satisfies SocketIdentity;
     next();
   } catch { next(new Error("Invalid or expired access token")); }
 });
 
 io.on("connection", (socket) => {
   const identity = (socket.data as KoraSocketData).identity!;
-  socket.join(`tenant:${identity.tenantId}:outlet:${identity.outletId}`);
+  for (const permission of identity.permissions) socket.join(realtimePermissionRoom(identity.tenantId, identity.outletId, permission));
   socket.emit("kora:ready", { outletId: identity.outletId });
 
   const expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(0, identity.expiresAt - Date.now()));
@@ -58,13 +80,8 @@ io.on("connection", (socket) => {
     if (checking || !socket.connected) return;
     checking = true;
     try {
-      const assignments = await prisma.userOutletRole.findMany({
-        where: { userId: identity.userId, outletId: identity.outletId, user: { tenantId: identity.tenantId, active: true }, outlet: { tenantId: identity.tenantId } },
-        include: { role: { include: { permissions: { include: { permission: true } } } } },
-      });
-      if (!assignments.length) { socket.disconnect(true); return; }
-      const current = [...new Set(assignments.flatMap((assignment) => assignment.role.permissions.map((rp) => rp.permission.key)))].sort();
-      if (current.length !== identity.permissions.length || current.some((permission, index) => permission !== identity.permissions[index])) {
+      const currentAccess = await resolveSocketAccess(identity.userId, identity.userTenantId, identity.outletId);
+      if (!currentAccess || currentAccess.tenantId !== identity.tenantId || currentAccess.permissions.length !== identity.permissions.length || currentAccess.permissions.some((permission, index) => permission !== identity.permissions[index])) {
         socket.disconnect(true);
       }
     } catch {
@@ -74,8 +91,8 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => { clearTimeout(expiryTimer); clearInterval(authorizationTimer); });
   socket.on("kot:ack", (payload: { kotId?: unknown }) => {
-    if (!identity.permissions.includes("kot.update") || typeof payload?.kotId !== "string" || payload.kotId.length > 80) return;
-    socket.emit("kora:action-required", { action: "kot.update", kotId: payload.kotId });
+    if (!identity.permissions.includes("kds.bump") || typeof payload?.kotId !== "string" || payload.kotId.length > 80) return;
+    socket.emit("kora:action-required", { action: "kds.bump", kotId: payload.kotId });
   });
 });
 

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { requirePermission } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise } from "@/lib/billing";
 import { readJsonObject, RequestInputError } from "@/lib/http";
@@ -57,7 +57,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ bi
     const mode = body.mode === "amount" || body.mode === "items" ? body.mode : null;
     if (!mode) return NextResponse.json({ error: "Mode must be amount or items." }, { status: 400 });
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
-    const access = await authorizeOutlet(request, outletId, "bill.split");
+    const access = await requirePermission(request, outletId, "bills.split");
     if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
 
     const result = await prisma.$transaction(async (tx) => {

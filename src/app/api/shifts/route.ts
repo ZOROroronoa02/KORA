@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Prisma, ShiftStatus } from "@prisma/client";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { requirePermission } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { reconcileCash } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
@@ -12,7 +12,7 @@ class ShiftConflictError extends Error {}
 
 export async function GET(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
-  const access = await authorizeOutlet(request, outletId, "shift.open");
+  const access = await requirePermission(request, outletId, "shift.open");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
   const shift = await prisma.shift.findFirst({ where: { tenantId: access.tenantId, outletId, userId: access.user.id, status: ShiftStatus.OPEN }, orderBy: { openedAt: "desc" } });
   return NextResponse.json({ shift: safeJson(shift) });
@@ -24,7 +24,7 @@ export async function POST(request: NextRequest) {
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
     const action = body.action;
     const permission = action === "close" ? "shift.close" : "shift.open";
-    const access = await authorizeOutlet(request, outletId, permission);
+    const access = await requirePermission(request, outletId, permission);
     if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
     if (action === "open") {
       const openingCashPaise = Number(body.openingCashPaise);

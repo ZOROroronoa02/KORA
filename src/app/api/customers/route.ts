@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { requirePermission } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
@@ -12,7 +12,7 @@ function normalizePhone(value: string) {
 
 export async function GET(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
-  const access = await authorizeOutlet(request, outletId, "customer.manage");
+  const access = await requirePermission(request, outletId, "customers.view");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
   const customers = await prisma.customer.findMany({
     where: { tenantId: access.tenantId, outletLinks: { some: { outletId } } },
@@ -32,7 +32,7 @@ export async function POST(request: NextRequest) {
   try { body = await readJsonObject(request); }
   catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: error instanceof RequestInputError ? error.statusCode : 400 }); }
   const outletId = typeof body.outletId === "string" ? body.outletId : "";
-  const access = await authorizeOutlet(request, outletId, "customer.manage");
+  const access = await requirePermission(request, outletId, "customers.manage");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
   const name = typeof body.name === "string" ? body.name.trim().slice(0, 120) : "";
   const phone = typeof body.phone === "string" ? normalizePhone(body.phone) : "";

@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { authorizeAnyOutletPermission } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
 export async function GET(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
-  const access = await authorizeOutlet(request, outletId, "order.create");
+  const access = await authorizeAnyOutletPermission(request, outletId, ["orders.create", "orders.read"]);
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
   const [tables, outlet] = await Promise.all([prisma.restaurantTable.findMany({
     where: { outletId, active: true }, orderBy: { label: "asc" },

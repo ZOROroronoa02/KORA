@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { requirePermission } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
@@ -18,7 +18,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ or
     const { orderId } = await context.params;
     const body = await readJsonObject(request);
     outletId = typeof body.outletId === "string" ? body.outletId : "";
-    const access = await authorizeOutlet(request, outletId, "order.create");
+    const access = await requirePermission(request, outletId, "bills.settle");
     if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
     deviceId = typeof body.deviceId === "string" ? body.deviceId.trim() : "";
     clientMutationId = typeof body.clientMutationId === "string" ? body.clientMutationId.trim() : "";

@@ -1,15 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { authorizeAnyOutletPermission, requirePermission, verifyManagerApprovalPin } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise, calculateSale, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
+import { requiresDiscountApproval, settingsForOutlet } from "@/lib/domain/discount-approval";
 
 export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI, Other: PaymentMethod.OTHER };
 const types: Record<string, OrderType> = { "Dine in": OrderType.DINE_IN, Takeaway: OrderType.TAKEAWAY, Delivery: OrderType.DELIVERY, QR: OrderType.QR, Aggregator: OrderType.AGGREGATOR };
 const jsonSafe = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
+function redactOrder<T extends { subtotalPaise: unknown; items?: Array<Record<string, unknown>>; bill?: unknown }>(order: T) {
+  return {
+    ...order,
+    subtotalPaise: undefined,
+    discountPaise: undefined,
+    taxPaise: undefined,
+    serviceChargePaise: undefined,
+    totalPaise: undefined,
+    bill: undefined,
+    items: order.items?.map(({ unitPricePaise: _unitPrice, discountPaise: _discount, totalPaise: _total, ...item }) => item),
+  };
+}
 class ConflictError extends Error {}
 async function withSerializableRetry<T>(operation: () => Promise<T>, attempts = 3): Promise<T> {
   for (let attempt = 0; ; attempt++) {
@@ -25,35 +38,34 @@ async function withSerializableRetry<T>(operation: () => Promise<T>, attempts = 
 export async function GET(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   if (!outletId) return NextResponse.json({ error: "outletId is required" }, { status: 400 });
-  let access = await authorizeOutlet(request, outletId, "reports.view");
-  let visibility: "all" | "own" | "kitchen" = "all";
-  if ("error" in access && access.error === "Unauthenticated") return NextResponse.json({ error: access.error }, { status: 401 });
-  if ("error" in access) {
-    access = await authorizeOutlet(request, outletId, "order.create");
-    visibility = "own";
-    if ("error" in access && access.error === "Unauthenticated") return NextResponse.json({ error: access.error }, { status: 401 });
-  }
-  if ("error" in access) {
-    access = await authorizeOutlet(request, outletId, "kot.update");
-    visibility = "kitchen";
-  }
+  const access = await authorizeAnyOutletPermission(request, outletId, ["reports.view.sales", "orders.read", "kds.view"]);
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
+  const visibility: "all" | "own" | "kitchen" = access.permissions.includes("reports.view.sales") || access.permissions.includes("bills.settle") ? "all" : access.permissions.includes("orders.read") ? "own" : "kitchen";
   const where: Prisma.OrderWhereInput = { tenantId: access.tenantId, outletId };
   if (visibility === "own") where.createdById = access.user.id;
   if (visibility === "kitchen") where.status = { notIn: [OrderStatus.COMPLETED, OrderStatus.CANCELLED] };
   const orders = await prisma.order.findMany({ where, include: { items: true, table: { select: { id: true, label: true } }, customer: { select: { name: true } }, kots: { include: { items: true } }, bill: { include: { payments: true } } }, orderBy: { createdAt: "desc" }, take: 100 });
-  return NextResponse.json(jsonSafe(orders));
+  const maySeeFinancials = access.permissions.includes("bills.settle") || access.permissions.includes("reports.view.financial");
+  const safeOrders = maySeeFinancials ? orders : orders.map((order) => ({
+    ...order,
+    subtotalPaise: undefined, discountPaise: undefined, taxPaise: undefined, serviceChargePaise: undefined, totalPaise: undefined,
+    bill: undefined,
+    items: order.items.map(({ unitPricePaise: _unitPrice, discountPaise: _discount, totalPaise: _total, ...item }) => item),
+  }));
+  return NextResponse.json(jsonSafe(safeOrders));
 }
 
 export async function POST(request: NextRequest) {
   let retryOutletId = "";
   let retryKey = "";
+  let maySeeFinancials = false;
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
     retryOutletId = outletId;
-    const access = await authorizeOutlet(request, outletId, "order.create");
+    const access = await requirePermission(request, outletId, "orders.create");
     if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
+    maySeeFinancials = access.permissions.includes("bills.settle") || access.permissions.includes("reports.view.financial");
     const idempotencyKey = typeof body.clientMutationId === "string" ? body.clientMutationId.trim() : "";
     retryKey = idempotencyKey;
     const deviceId = typeof body.deviceId === "string" ? body.deviceId.trim() : "unknown-device";
@@ -61,7 +73,7 @@ export async function POST(request: NextRequest) {
     const inputItems: Array<{ menuItemId: string; quantity: unknown; note?: unknown }> = Array.isArray(body.items) ? body.items : [];
     if (!idempotencyKey || idempotencyKey.length > 150 || !type || inputItems.length < 1 || inputItems.length > 100) return NextResponse.json({ error: "A valid clientMutationId, order type, and 1–100 items are required." }, { status: 400 });
     const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId, idempotencyKey } }, include: { items: true, bill: { include: { payments: true } }, kots: { include: { items: true } } } });
-    if (existing) return NextResponse.json({ order: jsonSafe(existing), kot: jsonSafe(existing.kots.at(-1) ?? null), bill: jsonSafe(existing.bill), replayed: true });
+    if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
     const uniqueIds: string[] = [...new Set(inputItems.map((item) => typeof item.menuItemId === "string" ? item.menuItemId : ""))].filter((id) => id.length > 0);
     if (uniqueIds.length !== inputItems.length) return NextResponse.json({ error: "Every order line needs a menu item ID." }, { status: 400 });
     const outlet = await prisma.outlet.findFirst({ where: { id: outletId, tenantId: access.tenantId } });
@@ -78,16 +90,30 @@ export async function POST(request: NextRequest) {
     const requestedDiscountBps = Number(body.discountBps ?? 0);
     if (!Number.isInteger(requestedDiscountBps) || requestedDiscountBps < 0 || requestedDiscountBps > 10000) return NextResponse.json({ error: "Discount rate must be between 0 and 10000 basis points." }, { status: 400 });
     if (requestedDiscountBps > 0) {
-      const permission = await authorizeOutlet(request, outletId, "order.discount");
+      const permission = await requirePermission(request, outletId, "bills.discount.apply");
       if ("error" in permission) return NextResponse.json({ error: "Discount permission required." }, { status: 403 });
+    }
+    const paidPaise = Number(body.paidPaise ?? 0);
+    if (!Number.isSafeInteger(paidPaise) || paidPaise < 0) return NextResponse.json({ error: "Payment must be a non-negative paise amount." }, { status: 400 });
+    if (paidPaise > 0) {
+      const settlement = await requirePermission(request, outletId, "bills.settle");
+      if ("error" in settlement) return NextResponse.json({ error: "Bill settlement permission required." }, { status: 403 });
+    }
+    const settingsRow = await prisma.outletSettings.findUnique({ where: { outletId }, select: { settings: true } });
+    const settings = settingsForOutlet(settingsRow?.settings);
+    let approvalUserId: string | undefined;
+    const thresholdPct = settings.discountApprovalThresholdPct ?? 10;
+    if (requiresDiscountApproval(requestedDiscountBps, settings)) {
+      const pin = typeof body.approvalPin === "string" ? body.approvalPin : "";
+      approvalUserId = await verifyManagerApprovalPin({ outletId, pin, actorUserId: access.user.id, permission: "bills.discount.approve" }) ?? undefined;
+      if (!approvalUserId) return NextResponse.json({ error: "A manager approval PIN is required for this discount." }, { status: 403 });
     }
     const saleLines = items.map((i) => ({ quantity: i.quantity, unitPricePaise: i.pricePaise, gstBps: i.product.gstBps }));
     const undiscounted = calculateSale(saleLines);
     const discountPaise = Number((BigInt(undiscounted.subtotalPaise) * BigInt(requestedDiscountBps) + 5000n) / 10000n);
     const itemDiscounts = allocatePaise(BigInt(discountPaise), items.map((item) => BigInt(item.pricePaise) * BigInt(item.quantity)));
     const totals = calculateSale(saleLines, { discountPaise, serviceChargeBps: type === OrderType.DINE_IN ? outlet.serviceChargeBps : 0 });
-    const paidPaise = Number(body.paidPaise ?? 0);
-    if (!Number.isSafeInteger(paidPaise) || paidPaise < 0 || paidPaise > totals.totalPaise) return NextResponse.json({ error: "Payment must be between zero and the bill total." }, { status: 400 });
+    if (paidPaise > totals.totalPaise) return NextResponse.json({ error: "Payment must be between zero and the bill total." }, { status: 400 });
     const paidStatus = paymentStatus(totals.totalPaise, paidPaise) as PaymentStatus;
     const method = typeof body.paymentMethod === "string" ? methods[body.paymentMethod] : undefined;
     if (paidPaise > 0 && !method) return NextResponse.json({ error: "A payment method is required for a recorded payment." }, { status: 400 });
@@ -127,11 +153,12 @@ export async function POST(request: NextRequest) {
         update: { lastVisitAt: new Date(), visits: { increment: 1 }, spendPaise: { increment: BigInt(totals.totalPaise) } },
         create: { customerId, outletId, visits: 1, spendPaise: BigInt(totals.totalPaise) },
       });
-      if (discountPaise > 0) await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "ORDER_DISCOUNT", entityType: "Order", entityId: order.id, after: { discountPaise, discountBps: requestedDiscountBps } } });
+      if (discountPaise > 0) await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, approvalUserId, action: "ORDER_DISCOUNT", entityType: "Order", entityId: order.id, after: { discountPaise, discountBps: requestedDiscountBps, thresholdPct } } });
       return { order, kot, bill };
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
     void publishOutletEvent(access.tenantId, outletId, "order:new", { orderId: saved.order.id, orderNumber: saved.order.orderNumber, kotId: saved.kot.id });
-    return NextResponse.json({ ...jsonSafe(saved), replayed: false }, { status: 201 });
+    const result = maySeeFinancials ? saved : { ...saved, order: redactOrder(saved.order), bill: undefined };
+    return NextResponse.json({ ...jsonSafe(result), replayed: false }, { status: 201 });
   } catch (error) {
     if (error instanceof ConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
@@ -140,7 +167,7 @@ export async function POST(request: NextRequest) {
     if (typeof error === "object" && error && "code" in error && (error.code === "P2002" || error.code === "P2034")) {
       if (retryOutletId && retryKey) {
         const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId: retryOutletId, idempotencyKey: retryKey } }, include: { items: true, bill: { include: { payments: true } }, kots: { include: { items: true } } } }).catch(() => null);
-        if (existing) return NextResponse.json({ order: jsonSafe(existing), kot: jsonSafe(existing.kots.at(-1) ?? null), bill: jsonSafe(existing.bill), replayed: true });
+        if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
       }
       return NextResponse.json({ error: "A conflicting order already exists. Retry with its original clientMutationId." }, { status: 409 });
     }

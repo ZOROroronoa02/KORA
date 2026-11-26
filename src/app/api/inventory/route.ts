@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { StockMovementType } from "@prisma/client";
-import { authorizeOutlet } from "@/lib/server-auth";
+import { requirePermission } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
@@ -9,7 +9,7 @@ const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, ent
 
 export async function GET(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
-  const access = await authorizeOutlet(request, outletId, "inventory.manage");
+  const access = await requirePermission(request, outletId, "inventory.view");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
   const materials = await prisma.rawMaterial.findMany({ where: { tenantId: access.tenantId, outletId }, orderBy: { name: "asc" } });
   return NextResponse.json(safeJson(materials));
@@ -19,7 +19,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await readJsonObject(request);
     const outletId = typeof body.outletId === "string" ? body.outletId : "";
-    const access = await authorizeOutlet(request, outletId, "inventory.manage");
+    const access = await requirePermission(request, outletId, "inventory.adjust");
     if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
     const operation = typeof body.operation === "string" ? body.operation : "";
     const rawMaterialId = typeof body.rawMaterialId === "string" ? body.rawMaterialId : "";
