@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { allocatePaise, applyIdempotently, applyStockChange, calculateSale, parseRupeesToPaise, paymentStatus, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
+import { addPaymentWithinBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, parseRupeesToPaise, paymentStatus, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
 
 test('rupee parsing uses integer paise and rejects precision loss', () => {
   assert.equal(parseRupeesToPaise('0'), 0);
@@ -55,6 +55,14 @@ test('payment supports pending, partial, paid, and rejects negative amounts', ()
   assert.equal(paymentStatus(1000, 1000), 'PAID');
   assert.throws(() => paymentStatus(1000, 1200), /exceed/);
   assert.throws(() => paymentStatus(1000, -1), /negative/);
+});
+
+test('payment recording cannot exceed the bill balance', () => {
+  assert.equal(addPaymentWithinBalance(1000, 400, 600), 1000);
+  assert.throws(() => addPaymentWithinBalance(1000, 400, 601), /outstanding bill balance/);
+  assert.throws(() => addPaymentWithinBalance(1000, 1001, 1), /outstanding bill balance/);
+  assert.throws(() => addPaymentWithinBalance(1000, 0, 0), /payment must be positive/);
+  assert.throws(() => addPaymentWithinBalance(Number.MAX_SAFE_INTEGER + 1, 0, 1), /safe integer/);
 });
 
 test('cash reconciliation accounts for opening float and reports over/short variance', () => {

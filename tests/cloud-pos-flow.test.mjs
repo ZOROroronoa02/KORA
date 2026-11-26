@@ -180,6 +180,22 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const guestOrder = await guestOrderResponse.json();
     assert.equal(guestOrderResponse.status, 201, JSON.stringify(guestOrder));
     assert.equal(guestOrder.bill.paymentStatus, 'PARTIAL');
+    const overpaymentResponse = await fetch(`${api}/api/orders/${guestOrder.order.id}/payments`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        outletId: registration.outlet.id,
+        deviceId: `device-${suffix}`,
+        clientMutationId: `overpayment-${suffix}`,
+        amountPaise: Number(guestOrder.order.totalPaise) - 500 + 1,
+        method: 'UPI',
+      }),
+    });
+    assert.equal(overpaymentResponse.status, 409);
+    const paymentsAfterRejectedOverpayment = await prisma.payment.aggregate({
+      where: { billId: guestOrder.bill.id, status: 'PAID' },
+      _sum: { amountPaise: true },
+    });
+    assert.equal(paymentsAfterRejectedOverpayment._sum.amountPaise, 500n, 'rejected overpayment must not enter the payment ledger');
     const guestLinkAfterSale = await prisma.customerOutlet.findUnique({ where: { customerId_outletId: { customerId: guest.id, outletId: registration.outlet.id } } });
     assert.equal(guestLinkAfterSale.visits, 1, 'a new idempotent sale records exactly one guest visit');
     assert.equal(guestLinkAfterSale.spendPaise.toString(), guestOrder.order.totalPaise);

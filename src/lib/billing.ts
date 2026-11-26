@@ -68,6 +68,20 @@ export function paymentStatus(totalPaise: number, paidPaise: number): "PENDING" 
   return "PAID";
 }
 
+/** Return the new settled amount only when this payment fits the remaining balance. */
+export function addPaymentWithinBalance(totalPaise: number, paidPaise: number, amountPaise: number): number {
+  safeInteger(totalPaise, "bill total");
+  safeInteger(paidPaise, "paid amount");
+  safeInteger(amountPaise, "payment amount");
+  if (totalPaise < 0 || paidPaise < 0 || amountPaise <= 0) {
+    throw new RangeError("Bill total and paid amount must be non-negative, and payment must be positive");
+  }
+  if (paidPaise > totalPaise || amountPaise > totalPaise - paidPaise) {
+    throw new RangeError("Payment exceeds the outstanding bill balance");
+  }
+  return paidPaise + amountPaise;
+}
+
 export function reconcileCash(openingCashPaise: number, cashPayments: number[], countedCashPaise: number) {
   for (const value of [openingCashPaise, countedCashPaise, ...cashPayments]) {
     safeInteger(value, "cash amount"); if (value < 0) throw new RangeError("Cash amounts cannot be negative");

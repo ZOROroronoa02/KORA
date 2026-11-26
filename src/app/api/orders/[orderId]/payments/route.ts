@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
-import { requirePermission } from "@/lib/server-auth";
+import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
-import { paymentStatus } from "@/lib/billing";
+import { addPaymentWithinBalance, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
@@ -10,7 +10,7 @@ export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI };
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
 
-export async function POST(request: NextRequest, context: { params: Promise<{ orderId: string }> }) {
+async function POSTHandler(request: NextRequest, context: { params: Promise<{ orderId: string }> }) {
   let outletId = "";
   let deviceId = "";
   let clientMutationId = "";
@@ -49,7 +49,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ or
       const paid = await tx.payment.aggregate({ where: { billId: bill.id, status: PaymentStatus.PAID }, _sum: { amountPaise: true } });
       const paidPaise = paid._sum.amountPaise ?? 0n;
       if (bill.totalPaise > BigInt(Number.MAX_SAFE_INTEGER) || paidPaise > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Bill amount exceeds supported payment range.");
-      const nextPaid = Number(paidPaise) + amountPaise;
+      const nextPaid = addPaymentWithinBalance(Number(bill.totalPaise), Number(paidPaise), amountPaise);
       const nextStatus = paymentStatus(Number(bill.totalPaise), nextPaid) as PaymentStatus;
       let shiftId: string | undefined;
       if (method === PaymentMethod.CASH) {
@@ -83,3 +83,5 @@ export async function POST(request: NextRequest, context: { params: Promise<{ or
     return NextResponse.json({ error: "Could not record payment." }, { status: 500 });
   }
 }
+
+export const POST = withTenantScope(POSTHandler);
