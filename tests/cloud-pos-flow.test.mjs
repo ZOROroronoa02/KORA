@@ -35,7 +35,10 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const session = await sessionResponse.json();
     assert.equal(sessionResponse.status, 200);
     assert.equal(session.user.id, registration.user.id);
-    assert.ok(session.outlets[0].permissions.includes('order.create'));
+    assert.ok(session.outlets[0].permissions.includes('orders.create') === false, 'owner should not receive day-to-day order-taking access');
+    assert.ok(session.outlets[0].permissions.includes('roles.manage'));
+    const cashierRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId: registration.tenant.id, name: 'CASHIER' } } });
+    await prisma.userOutletRole.create({ data: { userId: registration.user.id, outletId: registration.outlet.id, roleId: cashierRole.id } });
 
     const menuResponse = await fetch(`${api}/api/menu?outletId=${registration.outlet.id}`, { headers });
     const categories = await menuResponse.json();

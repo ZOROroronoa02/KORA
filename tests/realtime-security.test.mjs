@@ -21,7 +21,7 @@ test('realtime security integration: socket expires on permission revocation', {
     const result = await response.json();
     assert.equal(response.status, 201, JSON.stringify(result));
     tenantId = result.tenant.id;
-    const role = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'Owner' } } });
+    const role = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'OWNER' } } });
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Socket connection timed out')), 8000);
@@ -34,9 +34,9 @@ test('realtime security integration: socket expires on permission revocation', {
       socket.once('kora:action-required', (payload) => { clearTimeout(timeout); resolve(payload); });
     });
     socket.emit('kot:ack', { kotId: 'security-test-' + suffix });
-    assert.equal((await ack).action, 'kot.update');
+    assert.equal((await ack).action, 'kds.bump');
 
-    const permission = await prisma.permission.findUniqueOrThrow({ where: { key: 'kot.update' } });
+    const permission = await prisma.permission.findUniqueOrThrow({ where: { key: 'kds.bump' } });
     const disconnected = new Promise((resolve) => socket.once('disconnect', resolve));
     await prisma.rolePermission.deleteMany({ where: { roleId: role.id, permissionId: permission.id } });
     const reason = await Promise.race([disconnected, new Promise((resolve) => setTimeout(() => resolve(null), 35_000))]);

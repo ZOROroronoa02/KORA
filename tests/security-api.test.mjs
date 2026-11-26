@@ -27,7 +27,9 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     assert.equal(registerResponse.status, 201);
     tenantId = registered.tenant.id;
     const ownerHeaders = { authorization: 'Bearer ' + registered.accessToken };
-    const ownerRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'Owner' } } });
+    const ownerRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'OWNER' } } });
+    const cashierRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'CASHIER' } } });
+    await prisma.userOutletRole.create({ data: { userId: registered.user.id, outletId: registered.outlet.id, roleId: cashierRole.id } });
     const outletB = await prisma.outlet.create({ data: { tenantId, name: 'Outlet B', code: 'T-' + suffix } });
     await prisma.userOutletRole.create({ data: { userId: registered.user.id, outletId: outletB.id, roleId: ownerRole.id } });
 
@@ -41,7 +43,7 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     assert.ok(customerB);
     assert.equal(typeof customerB.outlet.spendPaise, 'string');
 
-    const waiterRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'Waiter' } } });
+    const waiterRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId, name: 'WAITER' } } });
     const waiterEmail = 'waiter-' + suffix + '@example.test';
     const waiter = await prisma.user.create({ data: { tenantId, name: 'Test Waiter', email: waiterEmail, passwordHash: await hash('WaiterPass123!', 4) } });
     await prisma.userOutletRole.create({ data: { userId: waiter.id, outletId: registered.outlet.id, roleId: waiterRole.id } });
