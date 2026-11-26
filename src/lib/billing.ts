@@ -71,12 +71,18 @@ export function calculateSale(lines: SaleLine[], options: { discountPaise?: numb
   const discountShares = allocatePaise(BigInt(orderDiscount), checked.map((line) => BigInt(line.netBeforeOrderDiscount)));
   const taxableLines = checked.map((line, index) => line.netBeforeOrderDiscount - Number(discountShares[index]));
   const discountPaise = itemDiscountTotal + orderDiscount;
-  const taxablePaise = safeInteger(taxableLines.reduce((sum, amount) => sum + amount, 0), "taxable subtotal");
-  const taxPaise = safeInteger(checked.reduce((sum, line, index) => sum + applyBasisPoints(taxableLines[index], line.rate, "GST"), 0), "GST total");
+  const itemTaxablePaise = safeInteger(taxableLines.reduce((sum, amount) => sum + amount, 0), "taxable subtotal");
   const serviceChargeBps = safeInteger(options.serviceChargeBps ?? 0, "service charge rate");
   if (serviceChargeBps < 0 || serviceChargeBps > 10000) throw new RangeError("Service charge rate must be between 0 and 10000 basis points");
-  const serviceChargePaise = applyBasisPoints(taxablePaise, serviceChargeBps, "Service charge");
-  const totalPaise = safeInteger(taxablePaise + taxPaise + serviceChargePaise, "total");
+  const serviceChargePaise = applyBasisPoints(itemTaxablePaise, serviceChargeBps, "Service charge");
+  // Treat service charge as part of the taxable consideration and apply each line's GST rate.
+  const serviceChargeShares = allocatePaise(BigInt(serviceChargePaise), taxableLines.map((amount) => BigInt(amount)));
+  const taxPaise = safeInteger(checked.reduce((sum, line, index) => {
+    const lineTaxablePaise = taxableLines[index] + Number(serviceChargeShares[index]);
+    return sum + applyBasisPoints(lineTaxablePaise, line.rate, "GST");
+  }, 0), "GST total");
+  const taxablePaise = safeInteger(itemTaxablePaise + serviceChargePaise, "taxable subtotal");
+  const totalPaise = safeInteger(taxablePaise + taxPaise, "total");
   return { subtotalPaise, discountPaise, taxablePaise, taxPaise, serviceChargePaise, totalPaise };
 }
 

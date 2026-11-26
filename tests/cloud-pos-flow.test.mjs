@@ -47,6 +47,7 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(categories.length, 5);
     const item = categories.flatMap((category) => category.items)[0];
     assert.ok(item?.id);
+    await prisma.outlet.update({ where: { id: registration.outlet.id }, data: { serviceChargeBps: 500 } });
     const menuCreateResponse = await fetch(`${api}/api/menu`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ outletId: registration.outlet.id, categoryId: categories[0].id, name: `Cloud special ${suffix}`, pricePaise: 7650 }),
@@ -83,6 +84,15 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(created.order.items[0].quantity, 2);
     assert.equal(created.kot.sequence, 1);
     assert.equal(created.bill.paymentStatus, 'PENDING');
+    const unitPricePaise = BigInt(item.outletPrices[0]?.pricePaise ?? item.basePricePaise);
+    const expectedSubtotalPaise = unitPricePaise * 2n;
+    const expectedServiceChargePaise = (expectedSubtotalPaise * 500n + 5000n) / 10000n;
+    const expectedTaxablePaise = expectedSubtotalPaise + expectedServiceChargePaise;
+    const expectedTaxPaise = (expectedTaxablePaise * BigInt(item.gstBps) + 5000n) / 10000n;
+    assert.equal(created.bill.taxablePaise, expectedTaxablePaise.toString());
+    assert.equal(created.bill.serviceChargePaise, expectedServiceChargePaise.toString());
+    assert.equal((BigInt(created.bill.cgstPaise) + BigInt(created.bill.sgstPaise)).toString(), expectedTaxPaise.toString());
+    assert.equal(created.bill.totalPaise, (expectedTaxablePaise + expectedTaxPaise).toString());
 
     const replayResponse = await fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(orderPayload),

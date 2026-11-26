@@ -15,6 +15,7 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 - Prisma `P2034` and raw SQL `40001`/`40P01` transaction conflicts now map to retryable 409 responses, including refund races.
 - Raw SQL row locks and invoice-sequence scans include tenant and outlet predicates. Cash refunds also require the same shift row to remain open when its lock is acquired.
 - GST and service-charge rates now use `BigInt` basis-point arithmetic; a near-safe-integer regression test proves exact paise rounding.
+- GST now includes service charge in the taxable base, apportioned to lines by their taxable values and calculated at each line's GST rate. Unit tests and a cloud order-to-invoice integration assertion cover the result. CBIC's FAQ identifies restaurant service charge as liable to GST; the live profile/rate setup still needs accountant confirmation.
 - Realtime production startup now fails closed without Redis; `/health/ready` checks PostgreSQL and Redis while `/health/live` stays independent for liveness probes.
 - Invoice numbers now use `prefix-FYyyyy-yy-sequence`, allocated under the serializable order transaction. On first use in a financial year, the allocator continues from the highest existing invoice suffix issued within that year.
 - SQL migration history includes `20261127153000_invoice_financial_year_sequence` after the tenant ownership guard migration.
@@ -27,9 +28,9 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 - `npx prisma validate`: passed on the current schema.
 - `npx prisma migrate status`: all seven migrations applied locally.
 - `npm run build`: passed on the production configuration; all App Router routes, including the refund route, compiled.
-- `npm test` with the local PostgreSQL API enabled: 50 passed, 0 failed, 1 skipped. Cloud POS, KDS, RBAC, tenant isolation, billing/refund, and cash reconciliation integration suites passed; Socket.IO revocation integration skipped because local Redis is unavailable.
+- `npm test` against the local PostgreSQL-backed development API: 51 passed, 0 failed, 1 skipped (52 tests total). Cloud POS, KDS, RBAC, tenant isolation, billing/refund, and cash reconciliation integration suites passed; Socket.IO revocation integration skipped because local Redis is unavailable.
 - `npm audit --omit=dev --audit-level=high`: zero production dependency advisories. `npm run db:audit-tenant-ownership`: zero local mismatches.
-- Rendered desktop demo check: Cashier “New order” opens POS; Masala Dosa at ₹180 calculated ₹9 GST and ₹189 due; a demo UPI payment appeared in Orders as paid. This did not exercise cloud refund UI or physical printing. A prior dev session showed a transient `unhandledRejection: undefined`; its cause remains unverified.
+- Rendered desktop demo check: Cashier “New order” opens POS; Masala Dosa at ₹180 calculated ₹9 GST and ₹189 due; a demo UPI payment appeared in Orders as paid. The cloud API integration now verifies GST on service charge and invoice total reconciliation. This did not exercise cloud refund UI or physical printing. A prior dev session showed a transient `unhandledRejection: undefined`; its cause remains unverified.
 - Git commits for the current security work: `c75eb1d`, `90d9842`, `a9abe8b`.
 
 ## Production blockers

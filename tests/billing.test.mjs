@@ -36,10 +36,10 @@ test('GST and service charge retain exact paise rounding near the safe-integer l
   assert.deepEqual(result, {
     subtotalPaise: 8000000000000149,
     discountPaise: 0,
-    taxablePaise: 8000000000000149,
-    taxPaise: 400000000000007,
+    taxablePaise: 8400000000000156,
+    taxPaise: 420000000000008,
     serviceChargePaise: 400000000000007,
-    totalPaise: 8800000000000163,
+    totalPaise: 8820000000000164,
   });
 });
 
@@ -50,7 +50,22 @@ test('discount is capped at subtotal; service charge is calculated on discounted
 
 test('discount and service charge produce deterministic paise rounding', () => {
   const result = calculateSale([{ quantity: 1, unitPricePaise: 9999, gstBps: 500 }], { discountPaise: 1000, serviceChargeBps: 500 });
-  assert.deepEqual(result, { subtotalPaise: 9999, discountPaise: 1000, taxablePaise: 8999, taxPaise: 450, serviceChargePaise: 450, totalPaise: 9899 });
+  assert.deepEqual(result, { subtotalPaise: 9999, discountPaise: 1000, taxablePaise: 9449, taxPaise: 472, serviceChargePaise: 450, totalPaise: 9921 });
+});
+
+test('service charge is included in the taxable base at each line GST rate', () => {
+  const result = calculateSale([
+    { quantity: 1, unitPricePaise: 10000, gstBps: 500 },
+    { quantity: 1, unitPricePaise: 10000, gstBps: 1200 },
+  ], { serviceChargeBps: 1000 });
+  assert.deepEqual(result, {
+    subtotalPaise: 20000,
+    discountPaise: 0,
+    taxablePaise: 22000,
+    taxPaise: 1870,
+    serviceChargePaise: 2000,
+    totalPaise: 23870,
+  });
 });
 
 test('line discounts and mixed GST rates preserve taxable totals', () => {
