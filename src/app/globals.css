@@ -29,3 +29,12 @@
 .bill-summary[hidden],.total-row[hidden]{display:none!important}.demo-role-switch select{height:36px;max-width:142px;padding:0 8px;border:1px solid var(--line);border-radius:7px;background:#fff;color:#56584d;font-size:9px;font-weight:600}.demo-role-switch select:focus-visible{outline:2px solid #9aaf58;outline-offset:2px}
 @media(max-width:900px){.cloud-order-list .activity-row{grid-template-columns:1fr 1.2fr}.cloud-inventory-head,.cloud-inventory-row{min-width:590px}.cloud-customer-head,.cloud-customer-row{min-width:560px}}
 @media(max-width:620px){.demo-role-switch select{height:44px;max-width:100px}.topbar-actions{gap:6px}.cloud-report-state{padding:19px}}
+
+@media(max-width:620px){
+  .crumbs>span,.crumbs>svg{display:none}
+  .topbar-actions{min-width:0;gap:4px}
+  .topbar-actions .sync-pill{width:28px;height:28px;padding:0;justify-content:center;font-size:0;flex:none}
+  .topbar-actions .sync-pill svg{width:15px;height:15px}
+  .demo-role-switch select{max-width:82px;padding:0 5px}
+  .topbar-actions>.secondary-button{height:32px;padding:0 8px;font-size:9px}
+}
