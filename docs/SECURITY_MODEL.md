@@ -18,4 +18,4 @@ Validate request schemas and sizes, rate-limit using a trusted proxy identity, v
 
 ## Current limitations
 
-There is no production CSP/TLS/deployment configuration or security test suite. Rate limiting trusts `x-forwarded-for` directly. API ownership checks need strengthening for order customer/table references. The web client currently has no authenticated session flow.
+The web client is still a local demo and is not yet connected to authenticated APIs. Production still requires verified TLS termination, PostgreSQL/S3 encryption, a trusted-edge HMAC header implementation, shared Redis, and a deployment security review. Authenticated customer, inventory and order API ownership rules still need broader tenant/outlet regression coverage.

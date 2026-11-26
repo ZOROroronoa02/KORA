@@ -21,7 +21,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   let body: Record<string, unknown>;
   try { body = await readJsonObject(request); }
-  catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: 400 }); }
+  catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: error instanceof RequestInputError ? error.statusCode : 400 }); }
   const outletId = typeof body.outletId === "string" ? body.outletId : "";
   const access = await authorizeOutlet(request, outletId, "menu.manage");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
 export async function PATCH(request: NextRequest) {
   let body: Record<string, unknown>;
   try { body = await readJsonObject(request); }
-  catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: 400 }); }
+  catch (error) { return NextResponse.json({ error: error instanceof RequestInputError ? error.message : "Invalid request body." }, { status: error instanceof RequestInputError ? error.statusCode : 400 }); }
   const outletId = typeof body.outletId === "string" ? body.outletId : "";
   const access = await authorizeOutlet(request, outletId, "menu.manage");
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });

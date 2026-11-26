@@ -5,16 +5,16 @@ Status: active. `[x]` means implemented and locally verified; `[~]` means partia
 ## Milestone 1 — stabilize the foundation
 
 - [ ] Enforce cross-tenant/outlet reference ownership and database constraints.
-- [ ] Guard order/KOT transitions against invalid or concurrent changes.
-- [ ] Make idempotent retries return the original committed order.
+- [x] Guard order/KOT transitions against invalid or concurrent changes.
+- [x] Make idempotent retries return the original committed order.
 - [ ] Keep all payment input and aggregation in integer paise; add reversal ledger.
-- [ ] Link payments to cashier shifts; make open/close transactional and exclusive.
+- [x] Link cash payments to cashier shifts; make open/close transactional and exclusive.
 - [ ] Commit an initial migration and add PostgreSQL integration/concurrency tests.
 
 ## Milestone 2 — make the SaaS real
 
-- [ ] Add registration/login/onboarding UI and usable tenant defaults.
-- [ ] Connect menu, order, shift and customer UI to authenticated APIs.
+- [x] Add registration/login/onboarding UI and usable tenant defaults.
+- [~] Connect menu, order, shift and customer UI to authenticated APIs.
 - [ ] Add schema validation and consistent API errors/pagination.
 
 ## Milestone 3 — restaurant operations

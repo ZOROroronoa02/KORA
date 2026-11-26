@@ -2,14 +2,13 @@ import { createHash, randomBytes } from "node:crypto";
 import { SignJWT, jwtVerify } from "jose";
 import type { NextRequest } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { accessTokenSigningKey } from "@/lib/jwt-secret";
 
 const COOKIE_NAME = "kora_refresh";
 const accessTtl = "15m";
 
 function signingKey() {
-  const secret = process.env.JWT_ACCESS_SECRET;
-  if (!secret || secret.length < 32) throw new Error("JWT_ACCESS_SECRET must contain at least 32 characters");
-  return new TextEncoder().encode(secret);
+  return accessTokenSigningKey(process.env.JWT_ACCESS_SECRET);
 }
 
 export async function createAccessToken(user: { id: string; tenantId: string }) {
@@ -23,8 +22,8 @@ export async function createAccessToken(user: { id: string; tenantId: string }) 
 
 export async function verifyAccessToken(token: string) {
   const { payload } = await jwtVerify(token, signingKey());
-  if (typeof payload.sub !== "string" || typeof payload.tenantId !== "string") throw new Error("Invalid access token");
-  return { userId: payload.sub, tenantId: payload.tenantId };
+  if (typeof payload.sub !== "string" || typeof payload.tenantId !== "string" || typeof payload.exp !== "number") throw new Error("Invalid access token");
+  return { userId: payload.sub, tenantId: payload.tenantId, expiresAt: payload.exp * 1000 };
 }
 
 export function newRefreshToken() { return randomBytes(48).toString("base64url"); }

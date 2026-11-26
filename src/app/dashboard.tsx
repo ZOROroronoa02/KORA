@@ -1,0 +1,626 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Activity, ArrowDownLeft, ArrowDownRight, ArrowLeft, ArrowRight, ArrowUpRight,
+  BadgeIndianRupee, BarChart3, Bell, BookOpen, Box, CalendarDays, Check,
+  CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clock3,
+  Command, CreditCard, Download, Ellipsis, FileDown, Filter, Flame, Gift,
+  Grid2X2, Headphones, House, IndianRupee, LayoutDashboard, ListFilter, LogOut,
+  Menu, Minus, MoreHorizontal, Package, Plus, Printer, Search, Settings,
+  ShieldCheck, ShoppingBag, ShoppingCart, SlidersHorizontal, Sparkles,
+  Star, Store, Tag, TrendingUp, Truck, UserRound, Users, Wallet, Wifi,
+  WifiOff, X, Zap,
+} from "lucide-react";
+import { calculateSale, parseRupeesToPaise } from "@/lib/billing";
+import { io } from "socket.io-client";
+import { ApiError, getAccessToken, readJson, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
+import { cacheMenu, cacheOfflineWorkspace, cacheTables, clearOfflineWorkspace, getDeviceId, getPendingOrders, queueOrder, readCachedMenu, readOfflineWorkspace, removePendingOrder, updatePendingOrderError, type CachedDisplayOrder, type CloudOrderPayload } from "@/lib/pos-offline";
+
+type Page = "Overview" | "POS" | "Orders" | "Kitchen" | "Menu" | "Inventory" | "Customers" | "Team" | "Reports" | "Settings";
+type Product = { id: string; name: string; category: string; categoryId?: string; price: number; gstBps?: number; color: string; emoji: string; stock?: number; available: boolean };
+type CartLine = { id: string; productId: string; name: string; price: number; gstBps?: number; qty: number; note?: string };
+type Order = CachedDisplayOrder & { serverId?: string; tableId?: string };
+type Customer = { id?: string; name: string; phone: string; visits: number; spend: number };
+type RestaurantTable = { id: string; label: string; section?: string | null; capacity: number; occupied?: boolean };
+type AppData = { products: Product[]; orders: Order[]; customers: Customer[]; shiftOpen: boolean; cashOpen: number; language: string; serviceChargeBps: number };
+
+const paiseToRupees = (value: unknown) => Number(value ?? 0) / 100;
+const serverType = (value: string) => ({ DINE_IN: "Dine in", TAKEAWAY: "Takeaway", DELIVERY: "Delivery", QR: "Delivery", AGGREGATOR: "Delivery" } as Record<string, string>)[value] ?? value;
+const serverStatus = (value: string) => ({ OPEN: "Preparing", SENT: "Preparing", PREPARING: "Preparing", READY: "Ready", SERVED: "Served", COMPLETED: "Completed", CANCELLED: "Cancelled" } as Record<string, string>)[value] ?? value;
+
+function mapCloudMenu(categories: Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>): Product[] {
+  const colors = ["peach", "sage", "pink", "yellow", "lavender"];
+  return categories.flatMap((category) => category.items.map((raw, index) => {
+    const prices = Array.isArray(raw.outletPrices) ? raw.outletPrices as Array<Record<string, unknown>> : [];
+    const price = prices[0]?.pricePaise ?? raw.basePricePaise ?? 0;
+    return {
+      id: String(raw.id), name: String(raw.name), category: category.name, categoryId: category.id,
+      price: paiseToRupees(price), gstBps: Number(raw.gstBps ?? 500), color: colors[index % colors.length], emoji: raw.isVeg === false ? "🍗" : "🍽️",
+      available: prices[0]?.available !== false,
+    };
+  }));
+}
+
+function mapCloudOrder(raw: Record<string, unknown>): Order {
+  const rawItems = Array.isArray(raw.items) ? raw.items as Array<Record<string, unknown>> : [];
+  const rawBill = raw.bill && typeof raw.bill === "object" ? raw.bill as Record<string, unknown> : {};
+  const payments = Array.isArray(rawBill.payments) ? rawBill.payments as Array<Record<string, unknown>> : [];
+  const paidPaise = payments.filter((p) => p.status === "PAID").reduce((sum, p) => sum + Number(p.amountPaise ?? 0), 0);
+  const total = paiseToRupees(raw.totalPaise);
+  const table = raw.table && typeof raw.table === "object" ? raw.table as Record<string, unknown> : null;
+  const customer = raw.customer && typeof raw.customer === "object" ? raw.customer as Record<string, unknown> : null;
+  const method = payments[0]?.method;
+  return {
+    id: `K-${String(raw.orderNumber ?? "").padStart(4, "0")}`, serverId: String(raw.id), tableId: typeof raw.tableId === "string" ? raw.tableId : undefined,
+    items: rawItems.map((line) => ({ id: String(line.id), productId: String(line.menuItemId), name: String(line.nameSnapshot), price: paiseToRupees(line.unitPricePaise), qty: Number(line.quantity), note: typeof line.notes === "string" ? line.notes : undefined })),
+    type: serverType(String(raw.type)), table: typeof table?.label === "string" ? table.label : "—", total, status: serverStatus(String(raw.status)),
+    time: new Date(String(raw.createdAt)).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }),
+    payment: paidPaise === 0 ? "Pending" : paidPaise < Number(raw.totalPaise ?? 0) ? "Partial" : ({ CASH: "Cash", CARD: "Card", UPI: "UPI", OTHER: "Other" } as Record<string, string>)[String(method)] ?? "Paid",
+    paidAmount: paiseToRupees(paidPaise), customer: typeof customer?.name === "string" ? customer.name : "Walk-in",
+  };
+}
+
+const initialProducts: Product[] = [
+  { id: "p1", name: "Masala Dosa", category: "Breakfast", price: 180, color: "peach", emoji: "🥞", available: true },
+  { id: "p2", name: "Idli Sambar", category: "Breakfast", price: 120, color: "sage", emoji: "🍛", available: true },
+  { id: "p3", name: "Paneer Tikka", category: "Starters", price: 280, color: "pink", emoji: "🧀", available: true },
+  { id: "p4", name: "Crispy Corn", category: "Starters", price: 220, color: "yellow", emoji: "🌽", available: true },
+  { id: "p5", name: "Butter Chicken", category: "Mains", price: 390, color: "peach", emoji: "🍗", available: true },
+  { id: "p6", name: "Dal Makhani", category: "Mains", price: 290, color: "lavender", emoji: "🫘", available: true },
+  { id: "p7", name: "Butter Naan", category: "Breads", price: 60, color: "yellow", emoji: "🫓", available: true },
+  { id: "p8", name: "Garlic Naan", category: "Breads", price: 80, color: "sage", emoji: "🫓", available: true },
+  { id: "p9", name: "Mango Lassi", category: "Drinks", price: 140, color: "yellow", emoji: "🥭", available: true },
+  { id: "p10", name: "Filter Coffee", category: "Drinks", price: 90, color: "peach", emoji: "☕", available: true },
+];
+
+const seed: AppData = {
+  products: initialProducts,
+  orders: [
+    { id: "K-1048", items: [{ id: "x1", productId: "p1", name: "Masala Dosa", price: 180, qty: 1 }], type: "Dine in", table: "T-04", total: 189, status: "Served", time: "12:42 PM", payment: "UPI", customer: "Walk-in" },
+    { id: "K-1047", items: [{ id: "x2", productId: "p5", name: "Butter Chicken", price: 390, qty: 1 }], type: "Takeaway", table: "—", total: 409.5, status: "Preparing", time: "12:38 PM", payment: "Pending", customer: "Aarav Shah" },
+    { id: "K-1046", items: [{ id: "x3", productId: "p2", name: "Idli Sambar", price: 120, qty: 2 }], type: "Dine in", table: "T-08", total: 252, status: "Ready", time: "12:31 PM", payment: "Cash", customer: "Walk-in" },
+    { id: "K-1045", items: [{ id: "x4", productId: "p3", name: "Paneer Tikka", price: 280, qty: 1 }], type: "Delivery", table: "—", total: 294, status: "Served", time: "12:24 PM", payment: "Card", customer: "Meera Nair" },
+  ],
+  customers: [
+    { name: "Aarav Shah", phone: "+91 98765 43210", visits: 12, spend: 8640 },
+    { name: "Meera Nair", phone: "+91 98450 12345", visits: 8, spend: 5320 },
+    { name: "Kabir Mehta", phone: "+91 98203 45678", visits: 6, spend: 3910 },
+    { name: "Ananya Rao", phone: "+91 99001 23456", visits: 4, spend: 2480 },
+  ], shiftOpen: true, cashOpen: 5000, language: "English", serviceChargeBps: 0,
+};
+
+const fmt = (amount: number) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: amount % 1 ? 2 : 0 }).format(amount);
+const navItems: { label: Page; icon: typeof House; group: string }[] = [
+  { label: "Overview", icon: LayoutDashboard, group: "Workspace" }, { label: "POS", icon: ShoppingCart, group: "Workspace" },
+  { label: "Orders", icon: BookOpen, group: "Workspace" }, { label: "Kitchen", icon: Flame, group: "Workspace" }, { label: "Menu", icon: Grid2X2, group: "Manage" },
+  { label: "Inventory", icon: Package, group: "Manage" }, { label: "Customers", icon: Users, group: "Manage" },
+  { label: "Team", icon: ShieldCheck, group: "Manage" }, { label: "Reports", icon: BarChart3, group: "Insights" },
+  { label: "Settings", icon: Settings, group: "Insights" },
+];
+const initials = (s: string) => s.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
+
+export default function Home() {
+  const [data, setData] = useState<AppData>(seed);
+  const latestData = useRef(data);
+  latestData.current = data;
+  const demoSnapshot = useRef<AppData | null>(null);
+  const [cloudSession, setCloudSession] = useState<AuthenticatedSession | null>(null);
+  const [offlineOnly, setOfflineOnly] = useState(false);
+  const [selectedOutletId, setSelectedOutletId] = useState("");
+  const [cloudTables, setCloudTables] = useState<RestaurantTable[]>([]);
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [cloudSaving, setCloudSaving] = useState(false);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [cloudError, setCloudError] = useState("");
+  const [loginInput, setLoginInput] = useState({ tenantSlug: "", email: "", password: "" });
+  const [registerInput, setRegisterInput] = useState({ tenantName: "", outletName: "", name: "", email: "", password: "" });
+  const [authMode, setAuthMode] = useState<"signin" | "register">("signin");
+  const [page, setPage] = useState<Page>("Overview");
+  const [online, setOnline] = useState(true);
+  const [notice, setNotice] = useState("");
+  const [query, setQuery] = useState("");
+  const [modal, setModal] = useState<"payment" | "additem" | "customer" | "shift" | "openShift" | "connect" | "outlet" | "" > ("");
+  const [cart, setCart] = useState<CartLine[]>([]);
+  const [category, setCategory] = useState("All items");
+  const [orderType, setOrderType] = useState("Dine in");
+  const [table, setTable] = useState("T-04");
+  const [discount, setDiscount] = useState(0);
+  const [paymentMethod, setPaymentMethod] = useState("UPI");
+  const [selectedCustomerId, setSelectedCustomerId] = useState("");
+  const [paymentValue, setPaymentValue] = useState("");
+  const [cashCounted, setCashCounted] = useState("");
+  const [openingCash, setOpeningCash] = useState("");
+  const [newItem, setNewItem] = useState({ name: "", category: "Mains", price: "" });
+  const [newCustomer, setNewCustomer] = useState({ name: "", phone: "" });
+  const [range, setRange] = useState("Today");
+  const cloudMode = Boolean(cloudSession && selectedOutletId);
+  const currentOutlet = cloudSession?.outlets.find((outlet) => outlet.id === selectedOutletId);
+  const canAccessPage = (label: Page) => {
+    if (!cloudMode) return true;
+    const permissions = currentOutlet?.permissions ?? [];
+    const access: Record<Page, string[]> = {
+      Overview: [], POS: ["order.create"], Orders: ["order.create", "reports.view", "kot.update"], Kitchen: ["kot.update"],
+      Menu: ["menu.manage"], Inventory: ["inventory.manage"], Customers: ["customer.manage"], Team: ["team.manage"],
+      Reports: ["reports.view"], Settings: [],
+    };
+    return access[label].some((permission) => permissions.includes(permission));
+  };
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("kora-demo-v1");
+      if (saved) {
+        const restored = JSON.parse(saved) as Partial<AppData>;
+        const migratedProducts = restored.products?.filter((product) => !["p11", "p12"].includes(product.id));
+        setData({ ...seed, ...restored, ...(migratedProducts ? { products: migratedProducts } : {}) });
+      }
+    } catch { setNotice("Saved demo data could not be read. The bundled sample menu is loaded instead."); }
+    const update = () => setOnline(navigator.onLine);
+    update(); window.addEventListener("online", update); window.addEventListener("offline", update);
+    return () => { window.removeEventListener("online", update); window.removeEventListener("offline", update); };
+  }, []);
+  useEffect(() => { if (!cloudMode) try { localStorage.setItem("kora-demo-v1", JSON.stringify(data)); } catch { setNotice("This device could not save the latest demo changes. Free storage before continuing."); } }, [data, cloudMode]);
+  useEffect(() => { if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => setNotice("Offline app-shell caching is unavailable in this browser.")); }, []);
+  useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(""), 2800); return () => clearTimeout(t); }, [notice]);
+
+  const notify = (text: string) => setNotice(text);
+  const refreshCloudOrders = async (outletId: string) => {
+    const [rawOrders, pendingOrders] = await Promise.all([
+      readJson<Array<Record<string, unknown>>>(`/api/orders?outletId=${encodeURIComponent(outletId)}`),
+      getPendingOrders(outletId),
+    ]);
+    const queued = pendingOrders.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const }));
+    setPendingCount(pendingOrders.length);
+    setData((current) => ({ ...current, orders: [...queued, ...rawOrders.map(mapCloudOrder)] }));
+  };
+  const loadCloudOutlet = async (outletId: string, permissions: string[]) => {
+    if (!outletId) return;
+    setCloudLoading(true); setCloudError("");
+    try {
+      const cached = await readCachedMenu(outletId).catch(() => undefined);
+      if (offlineOnly && !navigator.onLine) {
+        const pending = await getPendingOrders(outletId).catch(() => []);
+        if (cached?.categories) setData((current) => ({
+          ...current,
+          products: mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>),
+          serviceChargeBps: cached.serviceChargeBps ?? 0, customers: [], shiftOpen: false,
+          orders: pending.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const })),
+        }));
+        setCloudTables(cached?.tables ?? []); setPendingCount(pending.length); setCloudLoading(false); return;
+      }
+      if (cached?.categories) setData((current) => ({ ...current, products: mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>) }));
+      const jobs = await Promise.allSettled([
+        readJson<Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>>(`/api/menu?outletId=${encodeURIComponent(outletId)}`),
+        refreshCloudOrders(outletId),
+        permissions.includes("order.create") ? readJson<{ tables: RestaurantTable[]; serviceChargeBps: number }>(`/api/tables?outletId=${encodeURIComponent(outletId)}`) : Promise.resolve({ tables: [], serviceChargeBps: 0 }),
+        permissions.includes("shift.open") ? readJson<{ shift: Record<string, unknown> | null }>(`/api/shifts?outletId=${encodeURIComponent(outletId)}`) : Promise.resolve(null),
+        permissions.includes("customer.manage") ? readJson<Array<Record<string, unknown>>>(`/api/customers?outletId=${encodeURIComponent(outletId)}`) : Promise.resolve(null),
+      ]);
+      const menuResult = jobs[0];
+      if (menuResult.status === "fulfilled") {
+        await cacheMenu(outletId, menuResult.value).catch(() => undefined);
+        setData((current) => ({ ...current, products: mapCloudMenu(menuResult.value) }));
+      } else if (!cached) throw menuResult.reason;
+      const tableResult = jobs[2];
+      if (tableResult.status === "fulfilled") {
+        setCloudTables(tableResult.value.tables);
+        setTable((current) => tableResult.value.tables.some((item) => item.label === current && !item.occupied) ? current : tableResult.value.tables.find((item) => !item.occupied)?.label ?? "");
+        setData((current) => ({ ...current, serviceChargeBps: tableResult.value.serviceChargeBps }));
+        await cacheTables(outletId, tableResult.value.tables, tableResult.value.serviceChargeBps).catch(() => undefined);
+      }
+      if (jobs[3].status === "fulfilled" && jobs[3].value) {
+        const shift = jobs[3].value.shift;
+        setData((current) => ({ ...current, shiftOpen: Boolean(shift), cashOpen: shift ? paiseToRupees(shift.openingCashPaise) : 0 }));
+      }
+      if (jobs[4].status === "fulfilled" && jobs[4].value) {
+        const customers = jobs[4].value.map((customer) => {
+          const outlet = customer.outlet as Record<string, unknown> | null;
+          return { id: String(customer.id), name: String(customer.name ?? "Guest"), phone: String(customer.phone ?? ""), visits: Number(outlet?.visits ?? 0), spend: paiseToRupees(outlet?.spendPaise) };
+        });
+        setData((current) => ({ ...current, customers }));
+      }
+      const activeOutlet = cloudSession?.outlets.find((item) => item.id === outletId);
+      if (activeOutlet && cloudSession) void cacheOfflineWorkspace({ userId: cloudSession.user.id, userName: cloudSession.user.name, outletId, outletName: activeOutlet.name, role: activeOutlet.role }).catch(() => undefined);
+      const failures = jobs.filter((result) => result.status === "rejected");
+      if (failures.length) setCloudError("Some cloud data could not be refreshed. Check your connection or access permissions.");
+    } catch (error) {
+      setCloudError(error instanceof Error ? error.message : "Could not connect to this outlet.");
+    } finally { setCloudLoading(false); }
+  };
+  const syncPendingOrders = async (outletId: string) => {
+    if (!navigator.onLine || !outletId) return;
+    const pending = await getPendingOrders(outletId).catch(() => []);
+    let synced = 0;
+    for (const entry of pending) {
+      if (entry.nextAttemptAt && entry.nextAttemptAt > Date.now()) continue;
+      try {
+        await readJson("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(entry.payload) });
+        await removePendingOrder(entry.clientMutationId); synced++;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Sync failed.";
+        const permanent = error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
+        const retryCount = (entry.retryCount ?? 0) + 1;
+        const nextAttemptAt = permanent ? Number.MAX_SAFE_INTEGER : Date.now() + Math.min(300000, 2000 * (2 ** Math.min(retryCount - 1, 7)));
+        await updatePendingOrderError(entry.clientMutationId, message, retryCount, nextAttemptAt).catch(() => undefined);
+        if (permanent) notify(`Offline order ${entry.displayOrder.id} needs attention: ${message}`);
+        break;
+      }
+    }
+    if (synced) notify(`${synced} offline ${synced === 1 ? "order" : "orders"} synced`);
+    await refreshCloudOrders(outletId).catch(() => undefined);
+  };
+  const retryPendingOrder = async (order: Order) => {
+    const pending = await getPendingOrders(selectedOutletId).catch(() => []);
+    const entry = pending.find((item) => item.displayOrder.id === order.id);
+    if (!entry) return;
+    await updatePendingOrderError(entry.clientMutationId, "", entry.retryCount ?? 0, 0);
+    await syncPendingOrders(selectedOutletId);
+  };
+
+  useEffect(() => {
+    let active = true;
+    const restore = async () => {
+      if (!navigator.onLine) {
+        const cached = await readOfflineWorkspace().catch(() => undefined);
+        if (!active || !cached) return;
+        demoSnapshot.current = latestData.current;
+        setCloudSession({ user: { id: cached.userId, name: cached.userName, email: "" }, outlets: [{ id: cached.outletId, name: cached.outletName, role: cached.role, permissions: ["order.create"] }] });
+        setSelectedOutletId(cached.outletId); setOfflineOnly(true); setPage("POS"); return;
+      }
+      const session = await restoreSession();
+      if (!active || !session || !session.outlets.length) return;
+      demoSnapshot.current = latestData.current;
+      setCloudSession(session); setSelectedOutletId(session.outlets[0].id); setOfflineOnly(false); setPage("POS");
+    };
+    void restore();
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    if (!cloudMode || !currentOutlet) return;
+    void loadCloudOutlet(selectedOutletId, currentOutlet.permissions);
+    const refresh = () => {
+      if (!navigator.onLine) return;
+      void restoreSession().then((session) => {
+        const outlet = session?.outlets.find((item) => item.id === selectedOutletId);
+        if (!session || session.user.id !== cloudSession?.user.id || !outlet) return;
+        setCloudSession(session); setOfflineOnly(false);
+        void cacheOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: outlet.id, outletName: outlet.name, role: outlet.role }).catch(() => undefined);
+      });
+      void syncPendingOrders(selectedOutletId);
+      void refreshCloudOrders(selectedOutletId).catch(() => undefined);
+    };
+    window.addEventListener("online", refresh);
+    const realtimeUrl = process.env.NEXT_PUBLIC_REALTIME_URL ?? `${window.location.protocol}//${window.location.hostname}:4000`;
+    const socket = io(realtimeUrl, { autoConnect: true, withCredentials: true, auth: { accessToken: getAccessToken(), outletId: selectedOutletId }, reconnection: true, reconnectionDelayMax: 10000 });
+    const updateOrders = () => { void refreshCloudOrders(selectedOutletId).catch(() => undefined); };
+    const updateShift = () => {
+      if (!currentOutlet.permissions.includes("shift.open")) return;
+      void readJson<{ shift: Record<string, unknown> | null }>(`/api/shifts?outletId=${encodeURIComponent(selectedOutletId)}`).then(({ shift }) => {
+        setData((current) => ({ ...current, shiftOpen: Boolean(shift), cashOpen: shift ? paiseToRupees(shift.openingCashPaise) : 0 }));
+      }).catch(() => undefined);
+    };
+    socket.on("order:new", updateOrders);
+    socket.on("order:updated", updateOrders);
+    socket.on("kot:status", updateOrders);
+    socket.on("menu:updated", refresh);
+    socket.on("shift:updated", updateShift);
+    let refreshingSocketSession = false;
+    socket.on("connect_error", (error) => {
+      if (refreshingSocketSession || !/access token|authentication and outlet context/i.test(error.message)) return;
+      refreshingSocketSession = true;
+      void restoreSession().then((session) => {
+        if (session && session.user.id === cloudSession?.user.id && session.outlets.some((outlet) => outlet.id === selectedOutletId)) {
+          socket.auth = { accessToken: getAccessToken(), outletId: selectedOutletId };
+          socket.connect();
+        } else {
+          setCloudError("Your cloud session expired. Sign in again."); setCloudSession(null); setSelectedOutletId(""); setModal("connect");
+        }
+      }).finally(() => { refreshingSocketSession = false; });
+    });
+    // The polling fallback recovers missed broadcasts and works when Redis fan-out is absent.
+    const timer = window.setInterval(refresh, 30000);
+    return () => { window.removeEventListener("online", refresh); window.clearInterval(timer); socket.removeAllListeners(); socket.disconnect(); };
+  }, [cloudMode, selectedOutletId, currentOutlet?.id, offlineOnly]);
+
+  const categories = ["All items", ...Array.from(new Set(data.products.map((p) => p.category)))];
+  const visibleProducts = useMemo(() => data.products.filter((p) => p.available && (category === "All items" || p.category === category) && p.name.toLowerCase().includes(query.toLowerCase())), [data.products, category, query]);
+  const totals = cart.length ? calculateSale(cart.map((i) => ({ quantity: i.qty, unitPricePaise: Math.round(i.price * 100), gstBps: i.gstBps ?? 500 })), { discountPaise: Math.round(cart.reduce((s, i) => s + i.price * i.qty, 0) * 100 * discount / 100), serviceChargeBps: orderType === "Dine in" ? data.serviceChargeBps : 0 }) : { subtotalPaise: 0, taxPaise: 0, discountPaise: 0, serviceChargePaise: 0, totalPaise: 0 };
+  const subtotal = totals.subtotalPaise / 100;
+  const tax = totals.taxPaise / 100;
+  const discountAmount = totals.discountPaise / 100;
+  const total = totals.totalPaise / 100;
+  const parsedPaymentPaise = useMemo(() => {
+    if (!paymentValue.trim()) return null;
+    try { return parseRupeesToPaise(paymentValue); } catch { return Number.NaN; }
+  }, [paymentValue]);
+  const cartQty = cart.reduce((s, i) => s + i.qty, 0);
+  const todayOrders = data.orders.length + 42;
+  const todaySales = data.orders.reduce((s, o) => s + o.total, 0) + 23680;
+
+  const addToCart = (product: Product) => setCart((prev) => {
+    const found = prev.find((i) => i.productId === product.id);
+    return found ? prev.map((i) => i.productId === product.id ? { ...i, qty: i.qty + 1 } : i) : [...prev, { id: crypto.randomUUID(), productId: product.id, name: product.name, price: product.price, gstBps: product.gstBps ?? 500, qty: 1 }];
+  });
+  const changeQty = (id: string, by: number) => setCart((prev) => prev.map((i) => i.id === id ? { ...i, qty: i.qty + by } : i).filter((i) => i.qty > 0));
+  const placeOrder = async (method: string) => {
+    if (!cart.length) return;
+    let receivedPaise: number;
+    try { receivedPaise = method === "Pending" ? 0 : paymentValue.trim() ? parseRupeesToPaise(paymentValue) : totals.totalPaise; }
+    catch { notify("Enter a valid amount with no more than two decimal places"); return; }
+    if (receivedPaise > totals.totalPaise) { notify("Payment cannot exceed the bill total"); return; }
+    const received = receivedPaise / 100;
+    if (cloudMode && currentOutlet) {
+      if (offlineOnly && method === "Cash" && receivedPaise > 0) { notify("Offline cash collection needs an open server shift. Record the bill as pending, then settle it after reconnecting."); return; }
+      setCloudSaving(true);
+      const clientMutationId = crypto.randomUUID();
+      const selectedTable = cloudTables.find((item) => item.label === table);
+      const payload: CloudOrderPayload = {
+        outletId: selectedOutletId, clientMutationId, deviceId: (() => { try { return getDeviceId(); } catch { return crypto.randomUUID(); } })(),
+        type: orderType as CloudOrderPayload["type"], ...(orderType === "Dine in" && selectedTable ? { tableId: selectedTable.id } : {}), ...(selectedCustomerId ? { customerId: selectedCustomerId } : {}),
+        items: cart.map((item) => ({ menuItemId: item.productId, quantity: item.qty, ...(item.note ? { note: item.note } : {}) })),
+        paidPaise: receivedPaise, discountBps: discount * 100, ...(receivedPaise > 0 ? { paymentMethod: method as "Cash" | "Card" | "UPI" } : {}),
+      };
+      const displayOrder: Order = { id: `OFFLINE-${clientMutationId.slice(0, 6).toUpperCase()}`, items: cart, type: orderType, table: orderType === "Dine in" ? table : "—", total, status: "Preparing", time: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }), payment: received === 0 ? "Pending" : received < total ? "Partial" : method, paidAmount: received, customer: "Walk-in", syncState: "queued" };
+      try {
+        if (!navigator.onLine) throw new TypeError("offline");
+        await readJson("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+        await refreshCloudOrders(selectedOutletId);
+        notify("Order saved to KORA cloud and kitchen ticket created");
+      } catch (error) {
+        if (!(error instanceof TypeError) && navigator.onLine) { notify(error instanceof Error ? error.message : "Order could not be saved."); setCloudSaving(false); return; }
+        try {
+          await queueOrder({ outletId: selectedOutletId, clientMutationId, payload, displayOrder, createdAt: Date.now() });
+          setData((current) => ({ ...current, orders: [displayOrder, ...current.orders] }));
+          setPendingCount((count) => count + 1);
+          notify(`${displayOrder.id} saved offline · will sync when connection returns`);
+        } catch {
+          notify("Offline order was not saved. Keep this screen open and retry; device storage is unavailable.");
+          setCloudSaving(false); return;
+        }
+      } finally { setCloudSaving(false); }
+      setCart([]); setDiscount(0); setPaymentValue(""); setSelectedCustomerId(""); setModal(""); setPage("Orders");
+      return;
+    }
+    const nextOrderNumber = Math.max(1048, ...data.orders.map((o) => Number(o.id.replace(/\D/g, "")) || 0)) + 1;
+    const order: Order = { id: `K-${nextOrderNumber}`, items: cart, type: orderType, table: orderType === "Dine in" ? table : "—", total, status: "Preparing", time: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }), payment: received === 0 ? "Pending" : received < total ? "Partial" : method, paidAmount: received, customer: "Walk-in" };
+    const nextData = { ...data, orders: [order, ...data.orders] };
+    try { localStorage.setItem("kora-demo-v1", JSON.stringify(nextData)); }
+    catch { notify("Order was not saved. Free device storage and retry."); return; }
+    setData(nextData); setCart([]); setDiscount(0); setPaymentValue(""); setSelectedCustomerId(""); setModal(""); setPage("Orders");
+    notify(`${order.id} saved on this device${online ? " · demo mode" : " · working offline"}`);
+  };
+
+  const connectCloud = async () => {
+    if (cart.length) { setCloudError("Clear the local demo cart before connecting a restaurant account."); return; }
+    setCloudError(""); setCloudLoading(true);
+    try {
+      const session = await signIn(loginInput);
+      if (!session.outlets.length) throw new Error("This account has no assigned outlets.");
+      demoSnapshot.current = latestData.current;
+      setCloudSession(session); setSelectedOutletId(session.outlets[0].id); setOfflineOnly(false); setModal("");
+      void cacheOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: session.outlets[0].id, outletName: session.outlets[0].name, role: session.outlets[0].role }).catch(() => undefined);
+      setLoginInput((value) => ({ ...value, password: "" }));
+      notify(`Connected to ${session.outlets[0].name}`);
+    } catch (error) { setCloudError(error instanceof Error ? error.message : "Sign-in failed."); }
+    finally { setCloudLoading(false); }
+  };
+  const createRestaurantAccount = async () => {
+    if (cart.length) { setCloudError("Clear the local demo cart before creating a restaurant account."); return; }
+    setCloudError(""); setCloudLoading(true);
+    try {
+      const session = await registerRestaurant(registerInput);
+      if (!session.outlets.length) throw new Error("Restaurant account was created without an outlet assignment.");
+      demoSnapshot.current = latestData.current;
+      setCloudSession(session); setSelectedOutletId(session.outlets[0].id); setOfflineOnly(false); setPage("POS"); setModal("");
+      void cacheOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: session.outlets[0].id, outletName: session.outlets[0].name, role: session.outlets[0].role }).catch(() => undefined);
+      setRegisterInput((value) => ({ ...value, password: "" }));
+      notify(`Restaurant ready · ${session.outlets[0].name}`);
+    } catch (error) { setCloudError(error instanceof Error ? error.message : "Restaurant setup failed."); }
+    finally { setCloudLoading(false); }
+  };
+  const disconnectCloud = async () => {
+    await signOut();
+    setCloudSession(null); setSelectedOutletId(""); setCloudTables([]); setPendingCount(0); setCart([]); setOfflineOnly(false);
+    await clearOfflineWorkspace().catch(() => undefined);
+    setData(demoSnapshot.current ?? seed); demoSnapshot.current = null; setModal("");
+    notify("Signed out of the restaurant account");
+  };
+  const changeOrderStatus = async (order: Order, status: string) => {
+    if (!cloudMode) {
+      setData((current) => ({ ...current, orders: current.orders.map((item) => item.id === order.id ? { ...item, status } : item) }));
+      notify(`${order.id} marked ${status.toLowerCase()}`); return;
+    }
+    if (!order.serverId) { notify("This offline order must sync before its kitchen status can change."); return; }
+    try {
+      const action = status === "Ready" ? "kot-ready" : "kot-served";
+      await readJson(`/api/orders/${encodeURIComponent(order.serverId)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, action }) });
+      await refreshCloudOrders(selectedOutletId); notify(`${order.id} marked ${status.toLowerCase()}`);
+    } catch (error) { notify(error instanceof Error ? error.message : "Kitchen status could not be updated."); }
+  };
+  const transferCloudOrder = async (order: Order, targetLabel: string) => {
+    if (!cloudMode) {
+      setData((current) => ({ ...current, orders: current.orders.map((item) => item.id === order.id ? { ...item, table: targetLabel } : item) }));
+      notify(`${order.id} moved to ${targetLabel}`); return;
+    }
+    const target = cloudTables.find((item) => item.label === targetLabel);
+    if (!order.serverId || !target) { notify("Choose an active table before transferring this order."); return; }
+    try {
+      await readJson(`/api/orders/${encodeURIComponent(order.serverId)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, action: "transfer-table", tableId: target.id }) });
+      await refreshCloudOrders(selectedOutletId); notify(`${order.id} moved to ${targetLabel}`);
+    } catch (error) { notify(error instanceof Error ? error.message : "Table transfer failed."); }
+  };
+  const recordOrderPayment = async (order: Order, amountPaise: number, method: "Cash" | "Card" | "UPI", clientMutationId: string) => {
+    if (!cloudMode) {
+      const amount = amountPaise / 100;
+      const alreadyPaid = order.paidAmount ?? (order.payment === "Pending" ? 0 : order.total);
+      const paidAmount = alreadyPaid + amount;
+      setData((current) => ({ ...current, orders: current.orders.map((item) => item.id === order.id ? { ...item, paidAmount, payment: paidAmount >= item.total ? method : "Partial" } : item) }));
+      notify(`${fmt(amount)} payment recorded for ${order.id}`); return;
+    }
+    if (!order.serverId) throw new Error("This offline order must sync before another payment can be recorded.");
+    if (!navigator.onLine) throw new Error("Payment recording needs a live connection. No payment was recorded.");
+    await readJson(`/api/orders/${encodeURIComponent(order.serverId)}/payments`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, deviceId: getDeviceId(), clientMutationId, amountPaise, method }) });
+    await refreshCloudOrders(selectedOutletId);
+    notify(`${fmt(amountPaise / 100)} payment recorded for ${order.id}`);
+  };
+  const updateAvailability = async (product: Product) => {
+    if (!cloudMode) { setData((current) => ({ ...current, products: current.products.map((item) => item.id === product.id ? { ...item, available: !item.available } : item) })); return; }
+    try {
+      await readJson("/api/menu", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, menuItemId: product.id, available: !product.available }) });
+      setData((current) => ({ ...current, products: current.products.map((item) => item.id === product.id ? { ...item, available: !item.available } : item) }));
+      notify(`${product.name} ${product.available ? "marked unavailable" : "marked available"}`);
+    } catch (error) { notify(error instanceof Error ? error.message : "Menu availability could not be updated."); }
+  };
+  const createMenuItem = async () => {
+    const pricePaise = Math.round(Number(newItem.price) * 100);
+    if (!newItem.name.trim() || !Number.isSafeInteger(pricePaise) || pricePaise <= 0) return;
+    if (!cloudMode) {
+      setData((current) => ({ ...current, products: [{ id: crypto.randomUUID(), name: newItem.name.trim(), category: newItem.category, price: pricePaise / 100, color: "sage", emoji: "🍽️", available: true }, ...current.products] }));
+    } else {
+      const categoryId = data.products.find((product) => product.category === newItem.category)?.categoryId;
+      if (!categoryId) { notify("This category is not available for menu changes."); return; }
+      try {
+        await readJson("/api/menu", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, categoryId, name: newItem.name.trim(), pricePaise }) });
+        await loadCloudOutlet(selectedOutletId, currentOutlet?.permissions ?? []);
+      } catch (error) { notify(error instanceof Error ? error.message : "Menu item could not be created."); return; }
+    }
+    setModal(""); setNewItem({ name: "", category: "Mains", price: "" }); notify("Dish added to your menu");
+  };
+  const createCustomer = async () => {
+    if (!newCustomer.name.trim() || !newCustomer.phone.trim()) return;
+    if (!cloudMode) setData((current) => ({ ...current, customers: [{ ...newCustomer, visits: 0, spend: 0 }, ...current.customers] }));
+    else {
+      try {
+        const saved = await readJson<{ id: string; name: string | null; phone: string }>("/api/customers", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, ...newCustomer }) });
+        setData((current) => ({ ...current, customers: [{ id: saved.id, name: saved.name ?? newCustomer.name, phone: saved.phone, visits: 0, spend: 0 }, ...current.customers.filter((customer) => customer.id !== saved.id)] }));
+        setSelectedCustomerId(saved.id);
+      } catch (error) { notify(error instanceof Error ? error.message : "Customer profile could not be saved."); return; }
+    }
+    setNewCustomer({ name: "", phone: "" }); setModal(""); notify("Customer profile created");
+  };
+  const openCashierShift = async () => {
+    let paise: number;
+    try { paise = parseRupeesToPaise(openingCash); } catch { notify("Enter a valid opening float with no more than two decimal places"); return; }
+    if (cloudMode) {
+      try {
+        await readJson("/api/shifts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, action: "open", openingCashPaise: paise }) });
+      } catch (error) { notify(error instanceof Error ? error.message : "Shift could not be opened."); return; }
+    }
+    setData((current) => ({ ...current, shiftOpen: true, cashOpen: paise / 100 })); setModal(""); notify(`Shift opened · opening float ${fmt(paise / 100)}${cloudMode ? " · cloud" : " · local demo"}`);
+  };
+  const closeCashierShift = async () => {
+    let countedPaise: number;
+    try { countedPaise = parseRupeesToPaise(cashCounted); } catch { notify("Enter a valid cash count with no more than two decimal places"); return; }
+    let variancePaise = countedPaise - Math.round(data.cashOpen * 100);
+    if (cloudMode) {
+      try {
+        const result = await readJson<{ reconciliation: { variancePaise: number } }>("/api/shifts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, action: "close", countedCashPaise: countedPaise }) });
+        variancePaise = result.reconciliation.variancePaise;
+      } catch (error) { notify(error instanceof Error ? error.message : "Shift could not be closed."); return; }
+    }
+    setData((current) => ({ ...current, shiftOpen: false })); setModal(""); notify(`Shift closed · cash variance ${fmt(variancePaise / 100)}${cloudMode ? " · cloud" : " · local demo"}`);
+  };
+
+  return (
+    <main className="app-shell">
+      <aside className="sidebar">
+        <button className="brand" onClick={() => setPage("Overview")}><span className="brand-mark">k</span><span className="brand-name">kora<span className="brand-period">.</span><small>RESTAURANT OS</small></span><ChevronDown size={15} className="brand-chevron" /></button>
+        <button className="outlet-select" onClick={() => cloudSession ? setModal("outlet") : setModal("connect")}><span className="outlet-icon"><Store size={16} /></span><span className="outlet-copy"><b>{currentOutlet?.name ?? "The Saffron Room"}</b><small>{cloudSession ? `${cloudSession.user.name} · ${currentOutlet?.role ?? "Choose outlet"}` : "Local demo workspace"}</small></span><ChevronDown size={14} /></button>
+        {(["Workspace", "Manage", "Insights"] as const).map((group) => <div className="nav-group" key={group}><p className="nav-heading">{group}</p>{navItems.filter((n) => n.group === group && canAccessPage(n.label)).map(({ label, icon: Icon }) => <button key={label} className={`nav-link ${page === label ? "active" : ""}`} onClick={() => setPage(label)}><Icon size={17} strokeWidth={1.9} /><span>{label}</span>{label === "Orders" && <span className="nav-badge">{data.orders.filter((o)=>["Preparing","Ready"].includes(o.status)).length}</span>}</button>)}</div>)}
+        <div className="sidebar-bottom"><div className="plan-card"><span className="plan-icon"><Sparkles size={15} /></span><div><b>{cloudMode ? "Cloud account" : "Free plan"}</b><small>{cloudMode ? currentOutlet?.role : "Explore KORA Plus"}</small></div><ArrowUpRight size={14} /></div><button className="profile-row" onClick={() => cloudMode ? void disconnectCloud() : setModal("connect")}><span className="avatar avatar-moss">{initials(cloudSession?.user.name ?? "Arjun Sharma")}</span><span className="profile-copy"><b>{cloudSession?.user.name ?? "Arjun Sharma"}</b><small>{cloudMode ? "Sign out" : "Connect restaurant"}</small></span><LogOut size={17} /></button></div>
+      </aside>
+
+      <section className="main-area">
+        <header className="topbar"><div className="crumbs"><span>Workspace</span><ChevronRight size={13} /><strong>{page === "POS" ? "Point of sale" : page}</strong></div><div className="topbar-actions">{(!cloudMode || currentOutlet?.permissions.includes("shift.open")) && <button className={`shift-pill ${data.shiftOpen ? "shift-open" : "shift-closed"}`} onClick={() => { if (data.shiftOpen) { setCashCounted(""); setModal("shift"); } else { setOpeningCash(""); setModal("openShift"); } }}><Clock3 size={13}/>{data.shiftOpen ? "Shift open" : "Open shift"}</button>}<span className={`sync-pill ${online ? "online" : "offline"}`}>{online ? <Wifi size={13} /> : <WifiOff size={13} />}{cloudMode ? (online ? `Cloud · ${pendingCount ? `${pendingCount} pending` : "synced"}` : `Offline · ${pendingCount} queued`) : online ? "Local demo mode" : "Working offline"}</span>{cloudMode ? <button className="secondary-button" onClick={() => setModal("outlet")}>{currentOutlet?.name ?? "Outlet"}</button> : <button className="secondary-button" onClick={() => setModal("connect")}>Connect cloud</button>}<button className="icon-button notification-button" aria-label="Notifications" onClick={() => notify("You’re all caught up")}><Bell size={17} /><i /></button><span className="top-divider" /><button className="avatar avatar-small avatar-moss" onClick={() => cloudMode ? void disconnectCloud() : setPage("Settings")}>{initials(cloudSession?.user.name ?? "Arjun Sharma")}</button></div></header>
+        <div className="page-content">
+          {page === "Overview" && <Overview data={data} todayOrders={todayOrders} todaySales={todaySales} onNavigate={setPage} onNotify={notify} />}
+          {page === "POS" && <section className="pos-layout"><div className="menu-panel"><div className="page-title-row"><div><p className="eyebrow">POINT OF SALE</p><h1>{cloudMode ? "Welcome, " + (cloudSession?.user.name.split(" ")[0] ?? "") : "Good afternoon, Arjun"} <span className="wave">✳</span></h1><p className="muted">{cloudMode ? (currentOutlet?.name ?? "Cloud outlet") + " · " + (online ? "Cloud data" : "Offline menu cache") : "Tuesday, 24 November · Lunch service is in full swing."}</p></div><button className="secondary-button" onClick={() => cloudMode ? void loadCloudOutlet(selectedOutletId, currentOutlet?.permissions ?? []) : notify("Menu is up to date")}><Clock3 size={15} /> {cloudLoading ? "Syncing…" : "Refresh menu"}</button></div><div className="pos-toolbar"><div className="search-box"><Search size={16} /><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search dishes..." /><kbd>⌘ K</kbd></div><button className="filter-button" onClick={() => setCategory("All items")}><SlidersHorizontal size={15} /> Filter</button></div><div className="category-row">{categories.map((c) => <button key={c} className={`category-chip ${category === c ? "selected" : ""}`} onClick={() => setCategory(c)}>{c}</button>)}</div><div className="product-grid">{visibleProducts.map((p) => <button key={p.id} className="product-card" onClick={() => addToCart(p)}><span className={`product-art ${p.color}`}><span>{p.emoji}</span><i>＋</i></span><span className="product-info"><b>{p.name}</b><small>{p.category}</small><strong>{fmt(p.price)}</strong></span></button>)}{visibleProducts.length === 0 && <div className="empty-state"><Search size={25} /><b>{cloudLoading ? "Loading outlet menu" : "No dishes found"}</b><span>{cloudError || "Try another search or category."}</span></div>}</div><div className="menu-footer"><span><span className="green-dot" /> {cloudMode ? "Outlet menu · cached for offline use" : "Menu saved on this device"}</span><button onClick={() => setPage("Menu")}>Manage menu <ArrowRight size={14} /></button></div></div>
+            <div className="cart-panel"><div className="cart-header"><div><p className="eyebrow">CURRENT ORDER</p><h2>New order <span className="order-dot">●</span></h2></div><button className="icon-button" aria-label="Clear order" onClick={() => { setCart([]); setDiscount(0); }}><Ellipsis size={18} /></button></div><div className="order-toggle">{["Dine in", "Takeaway", "Delivery"].map((t) => <button key={t} className={orderType === t ? "chosen" : ""} onClick={() => setOrderType(t)}>{t}</button>)}</div>{orderType === "Dine in" && <div className="table-line"><span>Table</span><div className="table-selects">{(cloudMode ? cloudTables : ["T-04", "T-05", "T-06", "T-08"].map((label) => ({ id: label, label, capacity: 2, occupied: false }))).map((t) => <button key={t.id} disabled={cloudMode && t.occupied} className={(table === t.label ? "selected" : "") + (t.occupied ? " unavailable" : "")} onClick={() => setTable(t.label)}>{t.label}</button>)}</div><button aria-label="More tables" className="table-more" onClick={() => notify(cloudMode ? String(cloudTables.length) + " outlet tables loaded" : "Showing available tables")}>···</button></div>}{cloudMode && currentOutlet?.permissions.includes("customer.manage") && <div className="table-line"><span>Guest</span><select aria-label="Link customer to order" value={selectedCustomerId} onChange={(e) => setSelectedCustomerId(e.target.value)}><option value="">Walk-in guest</option>{data.customers.filter((customer) => customer.id).map((customer) => <option key={customer.id} value={customer.id}>{customer.name} · {customer.phone}</option>)}</select></div>}<div className="cart-items">{cart.length ? cart.map((item) => <div className="cart-item" key={item.id}><div className="cart-item-icon">{data.products.find((p) => p.id === item.productId)?.emoji ?? "🍽️"}</div><div className="cart-item-name"><b>{item.name}</b><small>{fmt(item.price)} / item</small></div><div className="qty-control"><button aria-label={`Remove one ${item.name}`} onClick={() => changeQty(item.id, -1)}><Minus size={12} /></button><b>{item.qty}</b><button aria-label={`Add one ${item.name}`} onClick={() => changeQty(item.id, 1)}><Plus size={12} /></button></div><strong className="line-total">{fmt(item.price * item.qty)}</strong></div>) : <div className="cart-empty"><span className="cart-empty-icon"><ShoppingBag size={20} /></span><b>Your order is empty</b><small>Add dishes from the menu to get started.</small></div>}</div><button className="add-note" onClick={() => notify("Add notes to a dish from the order details")}>＋ <span>Add a note or cooking request</span></button><div className="bill-summary"><div><span>Subtotal <small>({cartQty} items)</small></span><b>{fmt(subtotal)}</b></div><div><span>GST <small>5%</small></span><b>{fmt(tax)}</b></div>{totals.serviceChargePaise>0&&<div><span>Service charge</span><b>{fmt(totals.serviceChargePaise/100)}</b></div>}<div><button className="discount-link" disabled={cloudMode && !currentOutlet?.permissions.includes("order.discount")} onClick={() => setDiscount(discount ? 0 : 10)}><Tag size={13} />{discount ? `Discount (${discount}%) · remove` : "Add discount / coupon"}</button><b>{discountAmount ? `−${fmt(discountAmount)}` : "—"}</b></div></div><div className="total-row"><span>Total due</span><b>{fmt(total)}</b></div><button className="pay-button" disabled={!cart.length || cloudSaving || (cloudMode && orderType === "Dine in" && !cloudTables.some((item) => item.label === table && !item.occupied))} onClick={() => setModal("payment")}><span>Charge {fmt(total)}</span><span className="pay-button-right">Pay now <ArrowRight size={15} /></span></button><div className="cart-footnote"><ShieldCheck size={13} /> Secure billing · GST invoice included</div></div></section>}
+          {page === "Orders" && <OrdersPage orders={data.orders} setData={setData} onNotify={notify} onStatusChange={changeOrderStatus} onTransfer={transferCloudOrder} onRecordPayment={recordOrderPayment} onRetrySync={retryPendingOrder} tables={cloudTables} cloudMode={cloudMode} />}
+          {page === "Kitchen" && <KitchenPage orders={data.orders} setData={setData} onNotify={notify} onStatusChange={changeOrderStatus} />}
+          {page === "Menu" && <MenuPage data={data} setData={setData} onAdd={() => setModal("additem")} onNotify={notify} onAvailabilityChange={updateAvailability} cloudMode={cloudMode} />}
+          {page === "Inventory" && <InventoryPage products={data.products} onNotify={notify} />}
+          {page === "Customers" && <CustomersPage customers={data.customers} onAdd={() => setModal("customer")} />}
+          {page === "Team" && <TeamPage onNotify={notify} />}
+          {page === "Reports" && <ReportsPage range={range} setRange={setRange} todaySales={todaySales} onNotify={notify} />}
+          {page === "Settings" && <SettingsPage data={data} setData={setData} onNotify={notify} />}
+        </div>
+      </section>
+      {notice && <div className="toast"><CheckCircle2 size={17} />{notice}<button onClick={() => setNotice("")} aria-label="Dismiss"><X size={14} /></button></div>}
+      {modal === "payment" && <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setModal(""); }}><div className="modal payment-modal"><button className="modal-close" onClick={() => setModal("")}><X size={18} /></button><span className="modal-icon"><Wallet size={20} /></span><p className="eyebrow">COMPLETE ORDER</p><h2>Choose payment</h2><p className="muted">Record full, partial, or pending payment for this bill.</p><div className="payment-total"><span>Amount due</span><b>{fmt(total)}</b></div><div className="payment-options">{[{ n: "UPI", e: "◉", d: "QR or UPI app" }, { n: "Cash", e: "₹", d: "Cash at counter" }, { n: "Card", e: "▣", d: "Credit or debit" }, { n: "Pending", e: "◷", d: "Pay later" }].map(({ n, e, d }) => <button key={n} className={paymentMethod === n ? "selected" : ""} onClick={() => setPaymentMethod(n)}><span className="method-icon">{e}</span><span><b>{n}</b><small>{d}</small></span>{paymentMethod === n && <Check size={16} />}</button>)}</div>{paymentMethod !== "Pending" && <label className="payment-amount">Amount received (₹)<input type="text" inputMode="decimal" min="0" max={total} value={paymentValue} onChange={(e) => setPaymentValue(e.target.value)} placeholder={`${fmt(total)} · full amount`} /></label>}<button className="primary-button full-button" onClick={() => placeOrder(paymentMethod)} disabled={!cart.length || cloudSaving || (parsedPaymentPaise !== null && (!Number.isSafeInteger(parsedPaymentPaise) || parsedPaymentPaise < 0 || parsedPaymentPaise > totals.totalPaise))}>Confirm {paymentMethod === "Pending" || parsedPaymentPaise === 0 ? "order" : parsedPaymentPaise !== null && parsedPaymentPaise < totals.totalPaise ? "partial payment" : "payment"} · {fmt((paymentMethod === "Pending" ? 0 : parsedPaymentPaise ?? totals.totalPaise) / 100)} <ArrowRight size={16} /></button><div className="secure-note"><ShieldCheck size={14} /> {cloudMode ? (online ? "Saved to KORA cloud · kitchen ticket included" : "Queued securely on this device for sync") : "Saved on this device · demo mode"}</div></div></div>}
+      {modal === "additem" && <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setModal(""); }}><form className="modal form-modal" onSubmit={(e) => { e.preventDefault(); void createMenuItem(); }}><button type="button" className="modal-close" onClick={() => setModal("")}><X size={18} /></button><p className="eyebrow">MENU MANAGEMENT</p><h2>Add a dish</h2><label>Dish name<input required autoFocus value={newItem.name} onChange={(e) => setNewItem({ ...newItem, name: e.target.value })} placeholder="e.g. Tandoori Roti" /></label><div className="form-split"><label>Category<select value={newItem.category} onChange={(e) => setNewItem({ ...newItem, category: e.target.value })}>{categories.slice(1).map((c) => <option key={c}>{c}</option>)}{!cloudMode && <option>New category</option>}</select></label><label>Price (₹)<input required type="number" min="1" step="1" value={newItem.price} onChange={(e) => setNewItem({ ...newItem, price: e.target.value })} placeholder="0" /></label></div><button className="primary-button full-button" type="submit">Add to menu <ArrowRight size={15} /></button></form></div>}
+      {modal === "customer" && <div className="modal-backdrop"><form className="modal form-modal" onSubmit={(e) => { e.preventDefault(); void createCustomer(); }}><button type="button" className="modal-close" onClick={() => setModal("")}><X size={18} /></button><p className="eyebrow">CUSTOMER CRM</p><h2>Add a customer</h2><label>Full name<input required value={newCustomer.name} onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })} placeholder="Customer name" /></label><label>Mobile number<input required type="tel" pattern="[+0-9() -]{8,}" value={newCustomer.phone} onChange={(e) => setNewCustomer({ ...newCustomer, phone: e.target.value })} placeholder="+91 98765 43210" /></label><button className="primary-button full-button">Create profile <ArrowRight size={15} /></button></form></div>}
+      {modal === "shift" && <div className="modal-backdrop"><form className="modal form-modal" onSubmit={(e) => { e.preventDefault(); void closeCashierShift(); }}><button type="button" className="modal-close" onClick={() => setModal("")}><X size={18}/></button><p className="eyebrow">SHIFT RECONCILIATION</p><h2>Close your shift</h2><p className="muted">{cloudMode ? "Count the cash drawer. KORA reconciles paid cash against this shift." : "Count the cash drawer and compare it with the opening float recorded on this device."}</p><div className="payment-total"><span>Opening cash</span><b>{fmt(data.cashOpen)}</b></div><label>Cash counted (₹)<input required type="text" inputMode="decimal" value={cashCounted} onChange={(e)=>setCashCounted(e.target.value)} placeholder="Enter drawer total"/></label><button className="primary-button full-button" type="submit" disabled={!cashCounted}>Close shift <Check size={15}/></button></form></div>}
+      {modal === "openShift" && <div className="modal-backdrop"><form className="modal form-modal" onSubmit={(e) => { e.preventDefault(); void openCashierShift(); }}><button type="button" className="modal-close" onClick={() => setModal("")}><X size={18}/></button><p className="eyebrow">START A CASHIER SHIFT</p><h2>Count opening cash</h2><p className="muted">{cloudMode ? "This opening float is stored in the outlet shift ledger." : "This demo records the opening float on this device only."}</p><label>Opening cash (₹)<input required type="text" inputMode="decimal" value={openingCash} onChange={(e) => setOpeningCash(e.target.value)} placeholder="e.g. 5000.00" /></label><button className="primary-button full-button" type="submit" disabled={!openingCash}>Open shift <ArrowRight size={15}/></button></form></div>}
+      {modal === "connect" && <div className="modal-backdrop" role="presentation"><form className="modal form-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" onSubmit={(e) => { e.preventDefault(); authMode === "signin" ? void connectCloud() : void createRestaurantAccount(); }}><button type="button" className="modal-close" onClick={() => { setModal(""); setCloudError(""); setLoginInput((value) => ({ ...value, password: "" })); setRegisterInput((value) => ({ ...value, password: "" })); }} aria-label="Close"><X size={18}/></button><p className="eyebrow">RESTAURANT CLOUD</p>{authMode === "signin" ? <><h2 id="connect-title">Connect to KORA</h2><p className="muted">Sign in to load your outlet menu, shifts, customers, orders, and kitchen tickets.</p><label>Restaurant slug<input required autoCapitalize="none" value={loginInput.tenantSlug} onChange={(e) => setLoginInput({ ...loginInput, tenantSlug: e.target.value })} placeholder="e.g. saffron-room-demo"/></label><label>Email<input required type="email" autoCapitalize="none" value={loginInput.email} onChange={(e) => setLoginInput({ ...loginInput, email: e.target.value })} placeholder="owner@restaurant.in"/></label><label>Password<input required type="password" value={loginInput.password} onChange={(e) => setLoginInput({ ...loginInput, password: e.target.value })}/></label></> : <><h2 id="connect-title">Set up your restaurant</h2><p className="muted">Create an owner account and a starter outlet with an Indian menu.</p><label>Restaurant name<input required minLength={2} value={registerInput.tenantName} onChange={(e) => setRegisterInput({ ...registerInput, tenantName: e.target.value })} placeholder="The Saffron Room"/></label><label>First outlet name<input required minLength={2} value={registerInput.outletName} onChange={(e) => setRegisterInput({ ...registerInput, outletName: e.target.value })} placeholder="Indiranagar"/></label><label>Your name<input required minLength={2} value={registerInput.name} onChange={(e) => setRegisterInput({ ...registerInput, name: e.target.value })} placeholder="Restaurant owner"/></label><label>Email<input required type="email" autoCapitalize="none" value={registerInput.email} onChange={(e) => setRegisterInput({ ...registerInput, email: e.target.value })} placeholder="owner@restaurant.in"/></label><label>Password<input required type="password" minLength={12} value={registerInput.password} onChange={(e) => setRegisterInput({ ...registerInput, password: e.target.value })}/><small>Use 12–72 characters.</small></label></>}{cloudError && <p className="form-error" role="alert">{cloudError}</p>}<button className="primary-button full-button" type="submit" disabled={cloudLoading}>{cloudLoading ? "Connecting…" : authMode === "signin" ? "Sign in securely" : "Create restaurant"} <ArrowRight size={15}/></button><button type="button" className="text-link" onClick={() => { setAuthMode(authMode === "signin" ? "register" : "signin"); setCloudError(""); }}>{authMode === "signin" ? "New to KORA? Create a restaurant" : "Already set up? Sign in"}</button><p className="secure-note"><ShieldCheck size={14}/> Access tokens stay in memory. Refresh session uses an HttpOnly cookie.</p></form></div>}
+      {modal === "outlet" && cloudSession && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setModal(""); }}><div className="modal form-modal" role="dialog" aria-modal="true" aria-labelledby="outlet-title"><button type="button" className="modal-close" onClick={() => setModal("")} aria-label="Close"><X size={18}/></button><p className="eyebrow">OWNER WORKSPACE</p><h2 id="outlet-title">Switch outlet</h2><p className="muted">Each outlet keeps its own menu, orders, tables, and shift.</p><label>Outlet<select value={selectedOutletId} onChange={(e) => { if (cart.length) { notify("Finish or clear the current cart before switching outlets."); return; } setSelectedOutletId(e.target.value); setModal(""); }}><option value="" disabled>Select outlet</option>{cloudSession.outlets.map((outlet) => <option key={outlet.id} value={outlet.id}>{outlet.name} · {outlet.role}</option>)}</select></label><button type="button" className="secondary-button full-button" onClick={() => void disconnectCloud()}><LogOut size={15}/> Sign out</button></div></div>}    </main>
+  );
+}
+
+function Overview({ data, todayOrders, todaySales, onNavigate, onNotify }: { data: AppData; todayOrders: number; todaySales: number; onNavigate: (p: Page) => void; onNotify: (s: string) => void }) {
+  return <><div className="page-title-row overview-title"><div><p className="eyebrow">TUESDAY, 24 NOVEMBER 2026 <span className="live-tag"><i /> LIVE</span></p><h1>Your restaurant, at a glance<span className="title-period">.</span></h1><p className="muted">Here’s what’s happening at The Saffron Room today.</p></div><button className="primary-button" onClick={() => onNavigate("POS")}><Plus size={16} /> New order</button></div><div className="stats-grid"><StatCard icon={BadgeIndianRupee} label="Gross sales" value={fmt(todaySales)} note="vs. yesterday" change="↑ 12.8%" good /><StatCard icon={ShoppingBag} label="Orders today" value={String(todayOrders)} note="vs. yesterday" change="↑ 8.2%" good /><StatCard icon={IndianRupee} label="Avg. order value" value={fmt(Math.round(todaySales / todayOrders))} note="vs. last 7 days" change="↑ 4.1%" good /><StatCard icon={Clock3} label="Avg. prep time" value="14 min" note="vs. last 7 days" change="↓ 2 min" good /></div><div className="dashboard-grid"><section className="card sales-card"><div className="card-heading"><div><h2>Sales overview</h2><p>Revenue performance through the day</p></div><select defaultValue="Today"><option>Today</option><option>This week</option><option>This month</option></select></div><div className="chart-legend"><span><i className="legend-primary" /> Today</span><span><i className="legend-secondary" /> Yesterday</span></div><div className="sales-chart"><div className="y-axis"><span>₹30k</span><span>₹20k</span><span>₹10k</span><span>₹0</span></div><div className="chart-canvas"><div className="grid-lines"><i /><i /><i /><i /></div><svg viewBox="0 0 740 215" preserveAspectRatio="none" role="img" aria-label="Hourly revenue chart"><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#d9ec79" stopOpacity=".32"/><stop offset="100%" stopColor="#d9ec79" stopOpacity="0"/></linearGradient></defs><path d="M0 184 C45 178 51 164 92 166 S144 143 184 151 S228 116 277 126 S319 110 369 116 S415 76 461 87 S506 64 553 72 S599 47 646 52 S696 24 740 32 L740 215 L0 215Z" fill="url(#area)"/><path d="M0 184 C45 178 51 164 92 166 S144 143 184 151 S228 116 277 126 S319 110 369 116 S415 76 461 87 S506 64 553 72 S599 47 646 52 S696 24 740 32" fill="none" stroke="#7b8d4d" strokeWidth="3" strokeLinecap="round"/><path d="M0 197 C45 189 51 192 92 179 S144 175 184 169 S228 168 277 150 S319 156 369 145 S415 131 461 135 S506 117 553 121 S599 105 646 109 S696 93 740 94" fill="none" stroke="#d3d3c8" strokeWidth="2.5" strokeDasharray="5 7" strokeLinecap="round"/></svg><div className="x-axis"><span>8 AM</span><span>10 AM</span><span>12 PM</span><span>2 PM</span><span>4 PM</span><span>6 PM</span><span>8 PM</span></div></div></div><div className="chart-callout"><span className="callout-dot" /> Peak hour <b>1:00 – 2:00 PM</b><span className="callout-divider" /> Revenue <b>₹6,420</b></div></section><section className="card channel-card"><div className="card-heading"><div><h2>Order channels</h2><p>Where your orders are coming from</p></div><button className="icon-button" onClick={() => onNavigate("Reports")}><ArrowUpRight size={16} /></button></div><div className="donut-wrap"><div className="donut"><div className="donut-center"><b>46</b><small>orders</small></div></div><div className="channel-list"><Channel name="Dine in" pct="52%" amount="24 orders" color="moss"/><Channel name="Takeaway" pct="28%" amount="13 orders" color="lime"/><Channel name="Delivery" pct="20%" amount="9 orders" color="sand"/></div></div><div className="channel-foot"><span>Net sales</span><b>{fmt(todaySales)}</b><span className="trend-small">↑ 12.8%</span></div></section></div><div className="lower-grid"><section className="card activity-card"><div className="card-heading"><div><h2>Live order activity</h2><p>Orders being prepared right now <span className="live-dot" /></p></div><button className="text-link" onClick={() => onNavigate("Orders")}>View all <ArrowRight size={14} /></button></div><div className="activity-table"><div className="table-head"><span>ORDER</span><span>ITEMS</span><span>TYPE</span><span>STATUS</span><span>TOTAL</span></div>{data.orders.slice(0, 4).map((o) => <div className="activity-row" key={o.id}><span><b>{o.id}</b><small>{o.time}</small></span><span>{o.items.reduce((s, i) => s + i.qty, 0)} items <small>{o.items[0]?.name}</small></span><span><i className="table-type-icon">{o.type === "Dine in" ? "▦" : o.type === "Delivery" ? "↗" : "▱"}</i>{o.type}</span><span><Status status={o.status} /></span><b>{fmt(o.total)}</b></div>)}</div><button className="mobile-view-all" onClick={() => onNavigate("Orders")}>View all orders <ArrowRight size={14} /></button></section><section className="card best-sellers"><div className="card-heading"><div><h2>Popular this week</h2><p>Your guest favourites</p></div><button className="icon-button" onClick={() => onNavigate("Reports")}><ArrowUpRight size={16}/></button></div>{[{e:"🥞",n:"Masala Dosa",c:"Breakfast",s:"128 sold",r:"₹23,040"},{e:"🧀",n:"Paneer Tikka",c:"Starters",s:"96 sold",r:"₹26,880"},{e:"🍗",n:"Butter Chicken",c:"Mains",s:"84 sold",r:"₹32,760"},{e:"☕",n:"Filter Coffee",c:"Drinks",s:"72 sold",r:"₹6,480"}].map((x,i)=><div className="seller-row" key={x.n}><span className={`seller-emoji tone-${i}`}>{x.e}</span><span className="seller-name"><b>{x.n}</b><small>{x.c}</small></span><span className="seller-sales"><b>{x.r}</b><small>{x.s}</small></span></div>)}<button className="seller-footer" onClick={() => onNavigate("Reports")}>Explore menu insights <ArrowRight size={14} /></button></section></div><div className="quick-actions"><span className="quick-label">QUICK ACTIONS</span><button onClick={() => onNavigate("POS")}><span className="quick-icon lime-icon"><Plus size={16}/></span><span><b>New order</b><small>Start a fresh bill</small></span><ArrowRight size={15}/></button><button onClick={() => onNavigate("Menu")}><span className="quick-icon peach-icon"><Grid2X2 size={16}/></span><span><b>Update menu</b><small>Prices & availability</small></span><ArrowRight size={15}/></button><button onClick={() => onNavigate("Reports")}><span className="quick-icon lavender-icon"><FileDown size={16}/></span><span><b>Download report</b><small>Daily sales summary</small></span><ArrowRight size={15}/></button><button onClick={() => onNotify("Your team is up to date")}><span className="quick-icon sage-icon"><Users size={16}/></span><span><b>Manage team</b><small>Roles & permissions</small></span><ArrowRight size={15}/></button></div></>;
+}
+function StatCard({ icon: Icon, label, value, note, change, good }: { icon: typeof House; label: string; value: string; note: string; change: string; good?: boolean }) { return <div className="stat-card"><div className="stat-top"><span className="stat-icon"><Icon size={17}/></span><button className="stat-menu" aria-label={`${label} options`}><MoreHorizontal size={17}/></button></div><p>{label}</p><b className="stat-value">{value}</b><div className="stat-note"><span className={good ? "positive-change" : "negative-change"}>{change}</span><span>{note}</span></div><span className="stat-spark"><svg viewBox="0 0 95 32"><path d="M2 25 C15 24 14 17 24 20 S39 14 48 17 S62 8 72 13 S85 3 94 5" fill="none" stroke="#9eae68" strokeWidth="2" strokeLinecap="round"/></svg></span></div>; }
+function Channel({ name, pct, amount, color }: { name: string; pct: string; amount: string; color: string }) { return <div className="channel-row"><span className={`channel-dot ${color}`}/><span>{name}</span><small>{amount}</small><b>{pct}</b></div>; }
+function Status({ status }: { status: string }) { const cls = status.toLowerCase().replace(" ", "-"); return <span className={`status-pill ${cls}`}><i/>{status}</span>; }
+
+function OrdersPage({ orders, setData, onNotify, onStatusChange, onTransfer, onRecordPayment, onRetrySync, tables, cloudMode }: { orders: Order[]; setData: React.Dispatch<React.SetStateAction<AppData>>; onNotify: (s: string) => void; onStatusChange: (order: Order, status: string) => Promise<void>; onTransfer: (order: Order, table: string) => Promise<void>; onRecordPayment: (order: Order, amountPaise: number, method: "Cash" | "Card" | "UPI", clientMutationId: string) => Promise<void>; onRetrySync: (order: Order) => Promise<void>; tables: RestaurantTable[]; cloudMode: boolean }) {
+  const [filter, setFilter] = useState("All orders");
+  const [search, setSearch] = useState("");
+  const [detailId, setDetailId] = useState("");
+  const [transferTable, setTransferTable] = useState("T-05");
+  const [recordAmount, setRecordAmount] = useState("");
+  const [recordMethod, setRecordMethod] = useState<"Cash" | "Card" | "UPI">("Cash");
+  const paymentMutationIds = useRef<Record<string, string>>({});
+  const detail = orders.find((o) => o.id === detailId);
+  const visible = orders.filter((o) => (filter === "All orders" || o.status === filter) && `${o.id} ${o.customer} ${o.type}`.toLowerCase().includes(search.toLowerCase()));
+  const advance = (order: Order) => {
+    const next = order.status === "Preparing" ? "Ready" : order.status === "Ready" ? "Served" : "Completed";
+    if (next !== "Completed") void onStatusChange(order, next);
+    else { setData((d) => ({ ...d, orders: d.orders.map((o) => o.id === order.id ? { ...o, status: next } : o) })); onNotify(`${order.id} marked completed`); }
+  };
+  const transfer = () => {
+    if (!detail || transferTable === detail.table) return;
+    void onTransfer(detail, transferTable);
+    setDetailId("");
+  };
+  const addPayment = () => {
+    if (!detail) return;
+    let amountPaise: number;
+    try { amountPaise = parseRupeesToPaise(recordAmount); } catch { onNotify("Enter a valid payment with no more than two decimal places"); return; }
+    const remainingPaise = Math.max(0, Math.round((detail.total - (detail.paidAmount ?? (detail.payment === "Pending" ? 0 : detail.total))) * 100));
+    if (amountPaise <= 0 || amountPaise > remainingPaise) return;
+    const mutationId = paymentMutationIds.current[detail.id] ?? (paymentMutationIds.current[detail.id] = crypto.randomUUID());
+    void onRecordPayment(detail, amountPaise, recordMethod, mutationId).then(() => {
+      delete paymentMutationIds.current[detail.id]; setRecordAmount("");
+    }).catch((error) => onNotify(error instanceof Error ? error.message : "Payment could not be recorded."));
+  };
+  return <><div className="page-title-row"><div><p className="eyebrow">SERVICE</p><h1>Orders <span className="count-bubble">{orders.length}</span></h1><p className="muted">Every order, from first ticket to final bill.</p></div><button className="primary-button" onClick={() => onNotify("Open the POS to start a new order")}><Plus size={16}/> New order</button></div><div className="card content-card"><div className="table-toolbar"><div className="tabs">{["All orders", "Preparing", "Ready", "Served"].map((f) => <button className={filter === f ? "active" : ""} key={f} onClick={() => setFilter(f)}>{f}{f === "Preparing" && <i className="tab-count">{orders.filter((o)=>o.status==="Preparing").length}</i>}</button>)}</div><div className="table-actions"><div className="search-box compact"><Search size={15}/><input placeholder="Search orders" value={search} onChange={(e)=>setSearch(e.target.value)}/></div><button className="filter-button" onClick={() => onNotify("Showing orders for today")}><CalendarDays size={15}/> Today <ChevronDown size={14}/></button></div></div><div className="wide-table"><div className="table-head order-table-head"><span>ORDER DETAILS</span><span>TYPE / TABLE</span><span>ITEMS</span><span>STATUS</span><span>PAYMENT</span><span>TOTAL</span><span/></div>{visible.map((o) => <div className="order-table-row" key={o.id}><span><b>{o.id}</b><small>{o.time} · {o.customer}{o.syncState ? ` · ${o.syncState === "queued" ? "waiting to sync" : "sync needs attention"}` : ""}</small>{o.syncState === "needs-attention" && <button className="text-link" onClick={() => void onRetrySync(o)}>Retry sync</button>}</span><span>{o.type}<small>{o.table !== "—" ? `Table ${o.table}` : "—"}</small></span><span>{o.items.reduce((s,i)=>s+i.qty,0)} items<small>{o.items[0]?.name}</small></span><span><Status status={o.status}/></span><span><span className={`payment-type ${(o.paidAmount !== undefined && o.paidAmount < o.total ? "partial" : o.payment).toLowerCase()}`}>{o.paidAmount !== undefined && o.paidAmount > 0 && o.paidAmount < o.total ? `Partial · ${fmt(o.paidAmount)}` : o.payment}</span></span><b>{fmt(o.total)}</b><button className="icon-button" onClick={() => { setDetailId(o.id); setRecordAmount(""); setTransferTable((cloudMode ? tables.find((t) => !t.occupied && t.label !== o.table)?.label : o.table === "T-04" ? "T-05" : "T-04") ?? ""); }} aria-label={`View ${o.id}`}><MoreHorizontal size={17}/></button></div>)}{visible.length === 0 && <div className="empty-state"><BookOpen size={23}/><b>No orders here</b><span>Try a different filter.</span></div>}</div><div className="table-bottom"><span>Showing {visible.length} of {orders.length} orders</span><div><button disabled><ChevronLeft size={15}/></button><button className="page-current">1</button><button disabled><ChevronRight size={15}/></button></div></div></div>
+    {detail && <div className="modal-backdrop" onMouseDown={(e)=>{if(e.target===e.currentTarget)setDetailId("");}}><div className="modal order-detail-modal"><button className="modal-close" onClick={()=>setDetailId("")}><X size={18}/></button><p className="eyebrow">ORDER DETAILS · {detail.time}</p><h2>{detail.id} <Status status={detail.status}/></h2><p className="muted">{detail.type}{detail.table !== "—" ? ` · Table ${detail.table}` : ""} · {detail.customer}</p><div className="detail-lines">{detail.items.map((i)=><div key={i.id}><span>{i.qty} × {i.name}</span><b>{fmt(i.qty*i.price)}</b></div>)}<div><span>GST included</span><b>{fmt(detail.total-detail.total/1.05)}</b></div><div className="detail-total"><span>Bill total</span><b>{fmt(detail.total)}</b></div></div>{detail.type==="Dine in" && detail.status!=="Completed" && <div className="form-split transfer-row"><label>Transfer table<select value={transferTable} onChange={(e)=>setTransferTable(e.target.value)}>{(cloudMode ? tables.filter((t) => !t.occupied && t.label !== detail.table).map((t) => t.label) : ["T-04","T-05","T-06","T-08"].filter((t)=>t!==detail.table)).map((t)=><option key={t}>{t}</option>)}</select></label><button className="secondary-button" onClick={transfer}><ArrowRight size={14}/> Move</button></div>}{detail.paidAmount!==undefined && detail.paidAmount<detail.total && <div className="payment-entry"><span>Remaining balance <b>{fmt(detail.total-detail.paidAmount)}</b></span><div><select aria-label="Payment method" value={recordMethod} onChange={(e) => setRecordMethod(e.target.value as "Cash" | "Card" | "UPI")}><option>Cash</option><option>UPI</option><option>Card</option></select><input aria-label="Payment amount" type="number" min="0.01" max={detail.total-detail.paidAmount} step="0.01" value={recordAmount} onChange={(e)=>setRecordAmount(e.target.value)} placeholder="Amount ₹"/><button className="secondary-button" disabled={!recordAmount || Number(recordAmount)<=0 || Number(recordAmount)>detail.total-detail.paidAmount} onClick={addPayment}>Record payment</button></div></div>}{detail.paidAmount===undefined && detail.payment==="Pending" && <div className="payment-entry"><span>Bill pending <b>{fmt(detail.total)}</b></span><div><select aria-label="Payment method" value={recordMethod} onChange={(e) => setRecordMethod(e.target.value as "Cash" | "Card" | "UPI")}><option>Cash</option><option>UPI</option><option>Card</option></select><input aria-label="Payment amount" type="number" min="0.01" max={detail.total} step="0.01" value={recordAmount} onChange={(e)=>setRecordAmount(e.target.value)} placeholder="Amount ₹"/><button className="secondary-button" disabled={!recordAmount || Number(recordAmount)<=0 || Number(recordAmount)>detail.total} onClick={addPayment}>Record payment</button></div></div>}<div className="detail-actions"><button className="secondary-button" onClick={()=>window.print()}><Printer size={14}/> Print bill</button><button className="secondary-button" onClick={()=>onNotify(`${detail.id} · KOT ${detail.status.toUpperCase()}`)}><Flame size={14}/> View KOT</button>{detail.status!=="Served"&&detail.status!=="Completed"&&<button className="primary-button" onClick={()=>advance(detail)}>{detail.status==="Preparing"?"Mark ready":"Mark served"}<ArrowRight size={14}/></button>}</div></div></div>}
+  </>;
+}
+
+function KitchenPage({ orders, setData, onNotify, onStatusChange }: { orders: Order[]; setData: React.Dispatch<React.SetStateAction<AppData>>; onNotify: (s:string)=>void; onStatusChange: (order: Order, status: string) => Promise<void> }) {
+  const active = orders.filter((o)=>["Preparing","Ready"].includes(o.status));
+  const update = (order:Order) => { const status=order.status==="Preparing"?"Ready":"Served"; void onStatusChange(order,status); };
+  return <><div className="page-title-row"><div><p className="eyebrow">KITCHEN DISPLAY</p><h1>Kitchen tickets <span className="live-tag"><i/> LIVE</span></h1><p className="muted">New items appear as soon as they’re sent from the POS.</p></div><button className="secondary-button" onClick={()=>onNotify("Kitchen tickets refreshed")}><Activity size={15}/> Refresh</button></div><div className="kitchen-summary"><span><i className="live-dot"/> {active.length} active tickets</span><span>Average prep time <b>14 min</b></span><span>Sorted by oldest first</span></div><div className="kitchen-grid">{active.map((o,i)=><article className={`kitchen-ticket ${o.status.toLowerCase()}`} key={o.id}><div className="ticket-top"><span className="ticket-no">{o.id} <small>· {o.type}{o.table!=="—"?` · ${o.table}`:""}</small></span><span className="ticket-time"><Clock3 size={12}/>{o.time}</span></div><div className="ticket-status"><Status status={o.status}/><span>KOT #{i+1}</span></div><div className="ticket-items">{o.items.map((item)=><div key={item.id}><b>{item.qty}×</b><span>{item.name}</span><small>{item.note??""}</small></div>)}</div><button className={o.status==="Preparing"?"primary-button":"secondary-button"} onClick={()=>update(o)}>{o.status==="Preparing"?"Mark order ready":"Mark as served"}<ArrowRight size={14}/></button></article>)}{!active.length&&<div className="empty-state"><CheckCircle2 size={25}/><b>Kitchen is all caught up</b><span>New KOTs will show up here.</span></div>}</div></>;
+}
+
+function MenuPage({ data, setData, onAdd, onNotify, onAvailabilityChange, cloudMode }: { data: AppData; setData: React.Dispatch<React.SetStateAction<AppData>>; onAdd: () => void; onNotify: (s: string) => void; onAvailabilityChange: (product: Product) => Promise<void>; cloudMode: boolean }) {
+ const [tab, setTab] = useState("All items"); const cats = ["All items", ...Array.from(new Set(data.products.map((p)=>p.category)))]; const list = data.products.filter((p)=>tab==="All items"||p.category===tab);
+ return <><div className="page-title-row"><div><p className="eyebrow">CATALOGUE</p><h1>Your menu</h1><p className="muted">Manage dishes, prices, and what’s on the menu today.</p></div><button className="primary-button" onClick={onAdd}><Plus size={16}/> Add dish</button></div><div className="menu-kpis"><div><span>Menu items</span><b>{data.products.length}</b><small>Across {cats.length-1} categories</small></div><div><span>Available today</span><b>{data.products.filter(p=>p.available).length}</b><small>Ready to order</small></div><div><span>Out of stock</span><b>{data.products.filter(p=>!p.available).length}</b><small>Hidden from POS</small></div></div><div className="card content-card"><div className="table-toolbar"><div className="tabs menu-tabs">{cats.map((c)=> <button className={tab===c?"active":""} key={c} onClick={()=>setTab(c)}>{c}</button>)}</div><button className="filter-button" onClick={()=>onNotify("Menu display preferences saved")}><ListFilter size={15}/> Sort</button></div><div className="menu-list">{list.map((p)=> <div className={`menu-row ${!p.available?"unavailable":""}`} key={p.id}><span className={`seller-emoji tone-${data.products.indexOf(p)%4}`}>{p.emoji}</span><span className="menu-row-main"><b>{p.name}</b><small>{p.category}</small></span><span className="menu-price">{fmt(p.price)}</span><span className={`availability ${p.available?"in-stock":"out-stock"}`}><i/>{p.available?"Available":"Out of stock"}</span><button className={`switch ${p.available?"on":""}`} aria-label={`Toggle ${p.name} availability`} onClick={()=>cloudMode ? void onAvailabilityChange(p) : setData(d=>({...d,products:d.products.map(x=>x.id===p.id?{...x,available:!x.available}:x)}))}><i/></button><button className="icon-button" onClick={()=>onNotify(`Editing ${p.name} is ready in the full menu editor`)}><MoreHorizontal size={17}/></button></div>)}</div><div className="table-bottom"><span>Showing {list.length} menu items</span><button className="text-link" onClick={()=>onNotify(cloudMode ? "Changes saved to KORA cloud" : "Menu changes are saved automatically")}>{cloudMode ? "Cloud synced" : "Changes saved"} <CheckCircle2 size={14}/></button></div></div></>;
+}
+
+function InventoryPage({ products, onNotify }: { products: Product[]; onNotify: (s:string)=>void }) {
+ const [tab,setTab]=useState("Stock levels"); const materials=[{n:"Basmati rice",cat:"Grains & pulses",qty:"18.5 kg",min:"10 kg",status:"Healthy",cost:"₹1,850"},{n:"Paneer",cat:"Dairy",qty:"4.2 kg",min:"5 kg",status:"Low stock",cost:"₹2,100"},{n:"Cooking oil",cat:"Oils & spices",qty:"12 L",min:"8 L",status:"Healthy",cost:"₹1,440"},{n:"Tomatoes",cat:"Fresh produce",qty:"2.4 kg",min:"5 kg",status:"Low stock",cost:"₹192"},{n:"Chicken",cat:"Meat & poultry",qty:"8.0 kg",min:"4 kg",status:"Healthy",cost:"₹2,800"},{n:"Moong dal",cat:"Grains & pulses",qty:"0 kg",min:"3 kg",status:"Out of stock",cost:"₹0"}];
+ return <><div className="page-title-row"><div><p className="eyebrow">BACK OF HOUSE</p><h1>Inventory</h1><p className="muted">Know what’s in stock before the kitchen runs out.</p></div><div className="title-actions"><button className="secondary-button" onClick={()=>onNotify("Stock movement report downloaded")}><Download size={15}/> Export</button><button className="primary-button" onClick={()=>onNotify("Purchase order draft created")}><Plus size={16}/> New purchase</button></div></div><div className="stats-grid inventory-stats"><StatCard icon={Box} label="Stock value" value="₹84,320" note="across all items" change="↑ 3.4%" good/><StatCard icon={Activity} label="Stock items" value="48" note="tracked ingredients" change="+ 4 this month" good/><StatCard icon={ArrowDownRight} label="Low stock alerts" value="3 items" note="need attention" change="View items"/></div><div className="card content-card"><div className="table-toolbar"><div className="tabs">{["Stock levels","Recipes","Purchases","Wastage"].map(x=><button className={tab===x?"active":""} key={x} onClick={()=>setTab(x)}>{x}</button>)}</div><button className="filter-button" onClick={()=>onNotify("Filter options: outlet, category, and stock status")}><Filter size={15}/> Filter</button></div>{tab==="Stock levels"?<div className="wide-table"><div className="table-head inventory-head"><span>INGREDIENT</span><span>CATEGORY</span><span>ON HAND</span><span>MINIMUM</span><span>STATUS</span><span>VALUE</span><span/></div>{materials.map((m,i)=><div className="inventory-row" key={m.n}><span><i className={`ingredient-dot ingredient-${i}`}/><b>{m.n}</b></span><span>{m.cat}</span><span><b>{m.qty}</b></span><span>{m.min}</span><span><Status status={m.status}/></span><b>{m.cost}</b><button className="icon-button" onClick={()=>onNotify(`Stock adjustment started for ${m.n}`)}><MoreHorizontal size={17}/></button></div>)}</div>:<div className="feature-placeholder"><span className="feature-icon"><Package size={22}/></span><h3>{tab} workspace</h3><p>Ingredient recipes, vendor purchases, and waste logs are ready to configure for your outlet.</p><button className="primary-button" onClick={()=>onNotify(`${tab} setup started`)}><Plus size={15}/> Add {tab === "Recipes" ? "recipe" : tab === "Purchases" ? "purchase" : "wastage log"}</button></div>}<div className="table-bottom"><span>Inventory updates are recorded by outlet</span><button className="text-link" onClick={()=>onNotify("Inventory synced")}><CheckCircle2 size={14}/> Synced</button></div></div><div className="inventory-hint"><Sparkles size={16}/><span><b>Recipe-linked deductions</b><small>Connect menu items to recipes and ingredient stock will adjust automatically after every sale.</small></span><button onClick={()=>setTab("Recipes")}>Set up recipes <ArrowRight size={14}/></button></div><div className="sr-only">{products.length} menu products</div></>;
+}
+
+function CustomersPage({ customers, onAdd }: { customers: AppData["customers"]; onAdd: ()=>void }) { return <><div className="page-title-row"><div><p className="eyebrow">GUEST RELATIONSHIPS</p><h1>Customers</h1><p className="muted">Every regular has a story. Keep it close.</p></div><button className="primary-button" onClick={onAdd}><Plus size={16}/> Add customer</button></div><div className="stats-grid customer-stats"><StatCard icon={Users} label="Total guests" value="1,284" note="vs. last month" change="↑ 14.2%" good/><StatCard icon={Star} label="Returning guests" value="38.6%" note="repeat visit rate" change="↑ 2.1%" good/><StatCard icon={Gift} label="Loyalty points issued" value="24,680" note="this month" change="↑ 8.4%" good/><StatCard icon={TrendingUp} label="Guest lifetime value" value="₹2,840" note="average per guest" change="↑ 5.6%" good/></div><div className="card content-card"><div className="table-toolbar"><div><h2 className="section-title">Guest book <span className="count-bubble">{customers.length}</span></h2></div><div className="table-actions"><div className="search-box compact"><Search size={15}/><input placeholder="Find a guest"/></div><button className="filter-button"><ListFilter size={15}/> Filter</button></div></div><div className="wide-table"><div className="table-head customer-head"><span>GUEST</span><span>PHONE</span><span>VISITS</span><span>LIFETIME SPEND</span><span>LOYALTY</span><span/></div>{customers.map((c,i)=><div className="customer-row" key={c.phone}><span className="customer-name-cell"><i className={`avatar avatar-${i%4}`}>{initials(c.name)}</i><b>{c.name}</b></span><span>{c.phone}</span><span>{c.visits} visits</span><b>{fmt(c.spend)}</b><span className="loyalty-points"><Star size={13}/>{(c.visits*120).toLocaleString("en-IN")} pts</span><button className="icon-button" aria-label={`More about ${c.name}`}><MoreHorizontal size={17}/></button></div>)}</div><div className="table-bottom"><span>Showing {customers.length} guests</span><button className="text-link">Customer insights <ArrowRight size={14}/></button></div></div></>; }
+
+function TeamPage({onNotify}:{onNotify:(s:string)=>void}){const rows=[{n:"Arjun Sharma",r:"Owner",p:"Full access",s:"Active",a:"AS"},{n:"Priya Menon",r:"Manager",p:"Outlet management",s:"Active",a:"PM"},{n:"Rohan Das",r:"Cashier",p:"Billing & shifts",s:"Active",a:"RD"},{n:"Isha Kapoor",r:"Kitchen",p:"KOT & menu",s:"Active",a:"IK"},{n:"Dev Patel",r:"Waiter",p:"Orders & tables",s:"Invited",a:"DP"}];return <><div className="page-title-row"><div><p className="eyebrow">PEOPLE & ACCESS</p><h1>Your team</h1><p className="muted">Good service starts with a great crew.</p></div><button className="primary-button" onClick={()=>onNotify("Invite link copied to clipboard")}><Plus size={16}/> Invite team member</button></div><div className="team-banner"><span className="team-banner-icon"><ShieldCheck size={20}/></span><span><b>Roles keep every shift running smoothly</b><small>Only owners and managers can approve discounts and void bills.</small></span><button onClick={()=>onNotify("Role permissions opened")}>Manage permissions <ArrowRight size={14}/></button></div><div className="card content-card"><div className="table-toolbar"><div><h2 className="section-title">Team members <span className="count-bubble">5</span></h2></div><button className="filter-button" onClick={()=>onNotify("Showing all outlet team members")}><Store size={14}/> Indiranagar <ChevronDown size={14}/></button></div><div className="wide-table"><div className="table-head team-head"><span>TEAM MEMBER</span><span>ROLE</span><span>ACCESS</span><span>STATUS</span><span>LAST ACTIVE</span><span/></div>{rows.map((r,i)=><div className="team-row" key={r.n}><span className="customer-name-cell"><i className={`avatar avatar-${i%4}`}>{r.a}</i><b>{r.n}</b></span><span className="role-tag">{r.r}</span><span>{r.p}</span><span><Status status={r.s}/></span><span>{i===0?"Now":i===4?"Invitation sent":"Today, 9:12 AM"}</span><button className="icon-button" onClick={()=>onNotify(`Team profile opened for ${r.n}`)}><MoreHorizontal size={17}/></button></div>)}</div><div className="table-bottom"><span>5 members · Free plan includes 1 user</span><button className="text-link" onClick={()=>onNotify("Explore KORA Plus for unlimited team seats")}>Upgrade plan <ArrowUpRight size={14}/></button></div></div></>;}
+
+function ReportsPage({range,setRange,todaySales,onNotify}:{range:string;setRange:(s:string)=>void;todaySales:number;onNotify:(s:string)=>void}){return <><div className="page-title-row"><div><p className="eyebrow">INSIGHTS</p><h1>Reports</h1><p className="muted">Clear numbers, so you can focus on the food.</p></div><div className="title-actions"><select className="date-select" value={range} onChange={e=>setRange(e.target.value)}><option>Today</option><option>This week</option><option>This month</option></select><button className="secondary-button" onClick={()=>onNotify("Your report is ready to download")}><Download size={15}/> Export report</button></div></div><div className="stats-grid"><StatCard icon={BadgeIndianRupee} label="Net sales" value={fmt(todaySales*0.95)} note="after discounts & tax" change="↑ 12.8%" good/><StatCard icon={ShoppingBag} label="Orders" value="46" note="vs. previous period" change="↑ 8.2%" good/><StatCard icon={IndianRupee} label="Average order" value={fmt(Math.round(todaySales/46))} note="per transaction" change="↑ 4.1%" good/><StatCard icon={CreditCard} label="GST collected" value={fmt(todaySales*0.05)} note="5% food GST" change="View summary"/></div><div className="dashboard-grid report-grid"><section className="card sales-card"><div className="card-heading"><div><h2>Sales trend</h2><p>{range} · compared to previous period</p></div><button className="icon-button" onClick={()=>onNotify("Sales chart exported")}>···</button></div><div className="report-bars">{[35,49,41,66,54,78,61,84,70,93,76,100].map((h,i)=><div className="bar-pair" key={i}><i style={{height:`${h*0.73}%`}}/><b style={{height:`${h}%`}}/><small>{["8","9","10","11","12","1","2","3","4","5","6","7"][i]}</small></div>)}</div><div className="report-chart-legend"><span><i/> This period</span><span><i/> Previous period</span></div></section><section className="card channel-card"><div className="card-heading"><div><h2>Payment mix</h2><p>How guests paid today</p></div></div><div className="payment-mix"><div><span>UPI</span><b>48%</b><i><i style={{width:"48%"}}/></i><small>₹{Math.round(todaySales*.48).toLocaleString("en-IN")}</small></div><div><span>Cash</span><b>31%</b><i><i style={{width:"31%"}}/></i><small>₹{Math.round(todaySales*.31).toLocaleString("en-IN")}</small></div><div><span>Card</span><b>21%</b><i><i style={{width:"21%"}}/></i><small>₹{Math.round(todaySales*.21).toLocaleString("en-IN")}</small></div></div></section></div><div className="report-shortcuts"><button onClick={()=>onNotify("GST summary CSV prepared")}><FileDown size={17}/><span><b>GST summary</b><small>Tax collected by rate</small></span><ArrowDownRight size={15}/></button><button onClick={()=>onNotify("Shift report prepared")}><Wallet size={17}/><span><b>Shift report</b><small>Cashier reconciliation</small></span><ArrowDownRight size={15}/></button><button onClick={()=>onNotify("Top and bottom items report prepared")}><Flame size={17}/><span><b>Item performance</b><small>Top & bottom sellers</small></span><ArrowDownRight size={15}/></button></div></>;}
+
+function SettingsPage({data,setData,onNotify}:{data:AppData;setData:React.Dispatch<React.SetStateAction<AppData>>;onNotify:(s:string)=>void}){return <><div className="page-title-row"><div><p className="eyebrow">YOUR BUSINESS</p><h1>Settings</h1><p className="muted">Make KORA work the way your restaurant does.</p></div><button className="primary-button" onClick={()=>onNotify("Settings saved successfully")}><Check size={15}/> Save changes</button></div><div className="settings-grid"><div className="settings-nav card">{["Restaurant profile","Outlets & tables","Billing & GST","Receipt & printer","Language & display","Plan & billing"].map((x,i)=><button key={x} className={i===0?"active":""} onClick={()=>onNotify(`${x} settings selected`)}>{[Store,House,BadgeIndianRupee,Printer,Command,Star].map((Icon,j)=>j===i?<Icon key={j} size={16}/>:null)}{x}<ChevronRight size={14}/></button>)}</div><div className="card settings-content"><p className="eyebrow">RESTAURANT PROFILE</p><h2>The Saffron Room</h2><p className="muted">This information appears on your bills and GST invoices.</p><div className="settings-form"><label>Restaurant name<input defaultValue="The Saffron Room"/></label><label>Legal business name<input defaultValue="Saffron Hospitality LLP"/></label><div className="form-split"><label>Phone number<input defaultValue="+91 80412 34567"/></label><label>Business email<input defaultValue="hello@saffronroom.in"/></label></div><label>Address<input defaultValue="12th Main Road, Indiranagar, Bengaluru, Karnataka 560038"/></label><div className="form-split"><label>GSTIN<input defaultValue="29AAXXX1234X1Z5"/></label><label>FSSAI license<input defaultValue="11223344556677"/></label></div><div className="settings-divider"/><p className="settings-subhead">Preferences</p><div className="setting-option"><span><b>Interface language</b><small>Choose the language used across KORA.</small></span><select value={data.language} onChange={e=>setData(d=>({...d,language:e.target.value}))}><option>English</option><option>हिन्दी</option></select></div><div className="setting-option"><span><b>GST on food items</b><small>Default tax rate applied to menu items.</small></span><span className="tax-pill">5% GST</span></div><div className="setting-option"><span><b>Service charge</b><small>Optional 5% charge applied to dine-in orders.</small></span><button className={`switch ${data.serviceChargeBps>0?"on":""}`} aria-label="Toggle service charge" onClick={()=>{const enabled=data.serviceChargeBps===0;setData(d=>({...d,serviceChargeBps:enabled?500:0}));onNotify(enabled?"5% dine-in service charge enabled":"Service charge disabled");}}><i/></button></div></div></div></div></>;}

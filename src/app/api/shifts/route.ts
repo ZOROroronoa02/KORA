@@ -62,8 +62,9 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof ShiftConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
-    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: 400 });
+    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     if (typeof error === "object" && error && "code" in error && (error.code === "P2002" || error.code === "P2034")) return NextResponse.json({ error: "Shift changed concurrently. Reload and retry." }, { status: 409 });
+    console.error("KORA shift update failed", error);
     return NextResponse.json({ error: "Could not update shift." }, { status: 500 });
   }
 }

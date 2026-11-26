@@ -2,15 +2,14 @@ import { NextResponse } from "next/server";
 import { hash } from "bcryptjs";
 import { prisma } from "@/lib/prisma";
 import { accessTokenSeconds, createAccessToken, hashToken, newRefreshToken, refreshCookie } from "@/lib/server-auth";
-import { isRateLimited } from "@/lib/rate-limit";
+import { isRateLimited, RateLimitUnavailableError } from "@/lib/rate-limit";
+import { passwordMeetsRegistrationPolicy } from "@/lib/password-policy";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 
 export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
-    const throttle = await isRateLimited(request, "register", 5, 3600);
-    if (throttle.limited) return NextResponse.json({ error: "Too many account setup attempts. Try again later." }, { status: 429, headers: { "Retry-After": String(throttle.retryAfter) } });
     const body = await readJsonObject(request);
     const tenantName = typeof body.tenantName === "string" ? body.tenantName.trim() : "";
     const outletName = typeof body.outletName === "string" ? body.outletName.trim() : "";
@@ -18,12 +17,14 @@ export async function POST(request: Request) {
     const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
     const password = typeof body.password === "string" ? body.password : "";
     const phone = typeof body.phone === "string" ? body.phone.trim() : null;
-    if (tenantName.length < 2 || outletName.length < 2 || name.length < 2 || !/^\S+@\S+\.\S+$/.test(email) || password.length < 12) {
-      return NextResponse.json({ error: "Provide restaurant, outlet, owner name, a valid email, and a password of at least 12 characters." }, { status: 400 });
+    const throttle = await isRateLimited(request, "register", 5, 3600, email || undefined);
+    if (throttle.limited) return NextResponse.json({ error: "Too many account setup attempts. Try again later." }, { status: 429, headers: { "Retry-After": String(throttle.retryAfter) } });
+    if (tenantName.length < 2 || outletName.length < 2 || name.length < 2 || !/^\S+@\S+\.\S+$/.test(email) || !passwordMeetsRegistrationPolicy(password)) {
+      return NextResponse.json({ error: "Provide restaurant, outlet, owner name, a valid email, and a password of 12–72 UTF-8 bytes." }, { status: 400 });
     }
     const baseSlug = tenantName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 35) || "restaurant";
     const slug = `${baseSlug}-${crypto.randomUUID().slice(0, 8)}`;
-    const permissions = ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "team.manage", "kot.update"];
+    const permissions = ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "team.manage", "customer.manage", "kot.update"];
     const passwordHash = await hash(password, 12);
     const created = await prisma.$transaction(async (tx) => {
       const tenant = await tx.tenant.create({ data: { name: tenantName, slug } });
@@ -54,7 +55,7 @@ export async function POST(request: Request) {
       await tx.rolePermission.createMany({ data: permissionRows.map((permission) => ({ roleId: role.id, permissionId: permission.id })), skipDuplicates: true });
       await tx.userOutletRole.create({ data: { userId: user.id, outletId: outlet.id, roleId: role.id } });
       const roleAccess: Record<string, string[]> = {
-        Manager: ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "kot.update"],
+        Manager: ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "customer.manage", "kot.update"],
         Cashier: ["order.create", "bill.split", "shift.open", "shift.close"], Waiter: ["order.create"], Kitchen: ["kot.update"],
       };
       for (const [roleName, allowed] of Object.entries(roleAccess)) {
@@ -62,17 +63,18 @@ export async function POST(request: Request) {
         const granted = permissionRows.filter((permission) => allowed.includes(permission.key));
         await tx.rolePermission.createMany({ data: granted.map((permission) => ({ roleId: employeeRole.id, permissionId: permission.id })), skipDuplicates: true });
       }
-      return { tenant, outlet, user };
+      const refresh = newRefreshToken();
+      const accessToken = await createAccessToken(user);
+      await tx.refreshToken.create({ data: { userId: user.id, tokenHash: hashToken(refresh), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) } });
+      return { tenant, outlet, user, refresh, accessToken };
     });
-    const refresh = newRefreshToken();
-    await prisma.refreshToken.create({ data: { userId: created.user.id, tokenHash: hashToken(refresh), expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) } });
-    const accessToken = await createAccessToken(created.user);
-    const response = NextResponse.json({ accessToken, expiresIn: accessTokenSeconds, tenant: { id: created.tenant.id, name: created.tenant.name, slug: created.tenant.slug }, outlet: { id: created.outlet.id, name: created.outlet.name }, user: { id: created.user.id, name: created.user.name, email: created.user.email } }, { status: 201 });
-    response.headers.set("set-cookie", refreshCookie(refresh, 30 * 24 * 60 * 60));
+    const response = NextResponse.json({ accessToken: created.accessToken, expiresIn: accessTokenSeconds, tenant: { id: created.tenant.id, name: created.tenant.name, slug: created.tenant.slug }, outlet: { id: created.outlet.id, name: created.outlet.name }, user: { id: created.user.id, name: created.user.name, email: created.user.email } }, { status: 201 });
+    response.headers.set("set-cookie", refreshCookie(created.refresh, 30 * 24 * 60 * 60));
     return response;
   } catch (error) {
-    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: 400 });
-    if (error instanceof Error && error.message.includes("JWT_ACCESS_SECRET")) return NextResponse.json({ error: error.message }, { status: 503 });
+    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
+    if (error instanceof RateLimitUnavailableError) return NextResponse.json({ error: "Account setup is temporarily unavailable." }, { status: 503 });
+    if (error instanceof Error && error.message.includes("JWT_ACCESS_SECRET")) return NextResponse.json({ error: "Account setup is temporarily unavailable." }, { status: 503 });
     if (typeof error === "object" && error && "code" in error && error.code === "P2002") return NextResponse.json({ error: "That email or restaurant already exists." }, { status: 409 });
     return NextResponse.json({ error: "Could not create the restaurant account." }, { status: 500 });
   }

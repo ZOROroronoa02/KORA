@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
+import { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
 import { authorizeOutlet } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise, calculateSale, paymentStatus } from "@/lib/billing";
@@ -11,13 +11,37 @@ const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card:
 const types: Record<string, OrderType> = { "Dine in": OrderType.DINE_IN, Takeaway: OrderType.TAKEAWAY, Delivery: OrderType.DELIVERY, QR: OrderType.QR, Aggregator: OrderType.AGGREGATOR };
 const jsonSafe = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
 class ConflictError extends Error {}
+async function withSerializableRetry<T>(operation: () => Promise<T>, attempts = 3): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try { return await operation(); }
+    catch (error) {
+      const serializationConflict = typeof error === "object" && error !== null && "code" in error && error.code === "P2034";
+      if (!serializationConflict || attempt + 1 >= attempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
+    }
+  }
+}
 
 export async function GET(request: NextRequest) {
   const outletId = request.nextUrl.searchParams.get("outletId") ?? "";
   if (!outletId) return NextResponse.json({ error: "outletId is required" }, { status: 400 });
-  const access = await authorizeOutlet(request, outletId, "reports.view");
+  let access = await authorizeOutlet(request, outletId, "reports.view");
+  let visibility: "all" | "own" | "kitchen" = "all";
+  if ("error" in access && access.error === "Unauthenticated") return NextResponse.json({ error: access.error }, { status: 401 });
+  if ("error" in access) {
+    access = await authorizeOutlet(request, outletId, "order.create");
+    visibility = "own";
+    if ("error" in access && access.error === "Unauthenticated") return NextResponse.json({ error: access.error }, { status: 401 });
+  }
+  if ("error" in access) {
+    access = await authorizeOutlet(request, outletId, "kot.update");
+    visibility = "kitchen";
+  }
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
-  const orders = await prisma.order.findMany({ where: { tenantId: access.tenantId, outletId }, include: { items: true, kots: { include: { items: true } }, bill: { include: { payments: true } } }, orderBy: { createdAt: "desc" }, take: 100 });
+  const where: Prisma.OrderWhereInput = { tenantId: access.tenantId, outletId };
+  if (visibility === "own") where.createdById = access.user.id;
+  if (visibility === "kitchen") where.status = { notIn: [OrderStatus.COMPLETED, OrderStatus.CANCELLED] };
+  const orders = await prisma.order.findMany({ where, include: { items: true, table: { select: { id: true, label: true } }, customer: { select: { name: true } }, kots: { include: { items: true } }, bill: { include: { payments: true } } }, orderBy: { createdAt: "desc" }, take: 100 });
   return NextResponse.json(jsonSafe(orders));
 }
 
@@ -71,7 +95,7 @@ export async function POST(request: NextRequest) {
     const tableId = typeof body.tableId === "string" ? body.tableId : undefined;
     if (type === OrderType.DINE_IN && !tableId) return NextResponse.json({ error: "A table is required for dine-in orders." }, { status: 400 });
     if (type !== OrderType.DINE_IN && tableId) return NextResponse.json({ error: "Tables can only be assigned to dine-in orders." }, { status: 400 });
-    const saved = await prisma.$transaction(async (tx) => {
+    const saved = await withSerializableRetry(() => prisma.$transaction(async (tx) => {
       if (customerId) {
         const customer = await tx.customer.findFirst({ where: { id: customerId, tenantId: access.tenantId } });
         if (!customer) throw new ReferenceError("Customer not found in this restaurant.");
@@ -98,15 +122,20 @@ export async function POST(request: NextRequest) {
         cgstPaise: BigInt(Math.floor(totals.taxPaise / 2)), sgstPaise: BigInt(totals.taxPaise - Math.floor(totals.taxPaise / 2)), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise), paymentStatus: paidStatus,
         payments: paidPaise > 0 ? { create: { method: method!, amountPaise: BigInt(paidPaise), status: PaymentStatus.PAID, shiftId: activeShift?.id } } : undefined,
       }, include: { payments: true } });
+      if (customerId) await tx.customerOutlet.upsert({
+        where: { customerId_outletId: { customerId, outletId } },
+        update: { lastVisitAt: new Date(), visits: { increment: 1 }, spendPaise: { increment: BigInt(totals.totalPaise) } },
+        create: { customerId, outletId, visits: 1, spendPaise: BigInt(totals.totalPaise) },
+      });
       if (discountPaise > 0) await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "ORDER_DISCOUNT", entityType: "Order", entityId: order.id, after: { discountPaise, discountBps: requestedDiscountBps } } });
       return { order, kot, bill };
-    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
     void publishOutletEvent(access.tenantId, outletId, "order:new", { orderId: saved.order.id, orderNumber: saved.order.orderNumber, kotId: saved.kot.id });
     return NextResponse.json({ ...jsonSafe(saved), replayed: false }, { status: 201 });
   } catch (error) {
     if (error instanceof ConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
-    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: 400 });
+    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     if (error instanceof ReferenceError) return NextResponse.json({ error: error.message }, { status: 404 });
     if (typeof error === "object" && error && "code" in error && (error.code === "P2002" || error.code === "P2034")) {
       if (retryOutletId && retryKey) {

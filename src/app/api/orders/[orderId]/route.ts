@@ -71,7 +71,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ o
     return NextResponse.json({ order: safeJson(updated) });
   } catch (error) {
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 409 });
-    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: 400 });
+    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     return NextResponse.json({ error: "Could not update order." }, { status: 500 });
   }
 }

@@ -16,6 +16,11 @@ async function main() {
     create: { tenantId: tenant.id, name: "Indiranagar", code: "BLR-IND", gstin: "29AAXXX1234X1Z5", address: { line1: "12th Main Road", city: "Bengaluru", state: "Karnataka", pincode: "560038" } },
   });
 
+  await prisma.restaurantTable.createMany({
+    data: Array.from({ length: 10 }, (_, index) => ({ outletId: outlet.id, label: `T-${String(index + 1).padStart(2, "0")}`, capacity: index < 4 ? 2 : 4 })),
+    skipDuplicates: true,
+  });
+
   const categories = ["Breakfast", "Starters", "Mains", "Breads", "Drinks"];
   const categoryRecords = new Map<string, string>();
   for (const [sortOrder, name] of categories.entries()) {
@@ -43,11 +48,11 @@ async function main() {
   }
 
   const roleNames = ["Owner", "Manager", "Cashier", "Waiter", "Kitchen"];
-  const permissions = ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "team.manage", "kot.update"];
+  const permissions = ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "team.manage", "customer.manage", "kot.update"];
   const permissionRecords = await Promise.all(permissions.map((key) => prisma.permission.upsert({ where: { key }, update: {}, create: { key, description: key.replaceAll(".", " ") } })));
   const roleAccess: Record<string, string[]> = {
     Owner: permissions,
-    Manager: ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "kot.update"],
+    Manager: ["order.create", "order.discount", "order.void", "bill.refund", "bill.split", "shift.open", "shift.close", "menu.manage", "inventory.manage", "reports.view", "customer.manage", "kot.update"],
     Cashier: ["order.create", "bill.split", "shift.open", "shift.close"],
     Waiter: ["order.create"],
     Kitchen: ["kot.update"],
@@ -60,7 +65,7 @@ async function main() {
   const seedEmail = process.env.SEED_OWNER_EMAIL?.trim().toLowerCase();
   const seedPassword = process.env.SEED_OWNER_PASSWORD;
   if (seedEmail && seedPassword) {
-    if (seedPassword.length < 12) throw new Error("SEED_OWNER_PASSWORD must contain at least 12 characters.");
+    if (Array.from(seedPassword).length < 12 || Buffer.byteLength(seedPassword, "utf8") > 72) throw new Error("SEED_OWNER_PASSWORD must contain at least 12 characters and at most 72 UTF-8 bytes.");
     const ownerRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId: tenant.id, name: "Owner" } } });
     const passwordHash = await hash(seedPassword, 12);
     const owner = await prisma.user.upsert({

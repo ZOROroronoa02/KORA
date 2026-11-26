@@ -45,7 +45,7 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(safeJson(result), { status: 201 });
   } catch (error) {
-    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: 400 });
+    if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 409 });
     return NextResponse.json({ error: "Could not update ingredient stock." }, { status: 500 });
   }

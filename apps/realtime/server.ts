@@ -5,15 +5,20 @@ import { Server } from "socket.io";
 import { prisma } from "../../src/lib/prisma.js";
 import { verifyAccessToken } from "../../src/lib/server-auth.js";
 
-type SocketIdentity = { tenantId: string; userId: string; outletId: string; permissions: string[] };
+type SocketIdentity = { tenantId: string; userId: string; outletId: string; expiresAt: number; permissions: string[] };
 type KoraSocketData = { identity?: SocketIdentity };
 
-const allowedOrigins = (process.env.KORA_REALTIME_ORIGINS ?? "http://localhost:3000,http://localhost:3001").split(",").map((origin) => origin.trim());
+const originConfig = process.env.KORA_REALTIME_ORIGINS;
+const allowedOrigins = (originConfig ?? "http://localhost:3000,http://localhost:3001").split(",").map((origin) => origin.trim()).filter(Boolean);
+if (process.env.NODE_ENV === "production" && (!allowedOrigins.length || allowedOrigins.some((origin) => {
+  try { return new URL(origin).protocol !== "https:"; }
+  catch { return true; }
+}))) throw new Error("KORA_REALTIME_ORIGINS must list exact HTTPS web origins in production");
 const server = createServer((request, response) => {
   if (request.url === "/health") { response.writeHead(200, { "content-type": "application/json" }); response.end(JSON.stringify({ name: "kora-realtime", status: "ok" })); return; }
   response.writeHead(404); response.end("Not found");
 });
-const io = new Server(server, { cors: { origin: allowedOrigins, credentials: true }, transports: ["websocket", "polling"] });
+const io = new Server(server, { cors: { origin: allowedOrigins, credentials: true }, transports: ["websocket", "polling"], maxHttpBufferSize: 32 * 1024 });
 
 if (process.env.REDIS_URL) {
   const pubClient = createClient({ url: process.env.REDIS_URL });
@@ -30,21 +35,46 @@ io.use(async (socket, next) => {
     const outletId = typeof socket.handshake.auth.outletId === "string" ? socket.handshake.auth.outletId : "";
     if (!token || !outletId) return next(new Error("Authentication and outlet context are required"));
     const claims = await verifyAccessToken(token);
-    const user = await prisma.user.findFirst({ where: { id: claims.userId, tenantId: claims.tenantId, active: true }, include: { assignments: { where: { outletId }, include: { outlet: true, role: { include: { permissions: { include: { permission: true } } } } } } } });
-    const assignment = user?.assignments[0];
-    if (!user || !assignment || assignment.outlet.tenantId !== claims.tenantId) return next(new Error("Access to this outlet is not allowed"));
-    socket.data.identity = { tenantId: claims.tenantId, userId: user.id, outletId, permissions: assignment.role.permissions.map((rp) => rp.permission.key) };
+    const user = await prisma.user.findFirst({
+      where: { id: claims.userId, tenantId: claims.tenantId, active: true },
+      include: { assignments: { where: { outletId, outlet: { tenantId: claims.tenantId } }, include: { outlet: true, role: { include: { permissions: { include: { permission: true } } } } } } },
+    });
+    const assignments = user?.assignments.filter((assignment) => assignment.outlet.tenantId === claims.tenantId) ?? [];
+    if (!user || assignments.length === 0) return next(new Error("Access to this outlet is not allowed"));
+    const permissions = [...new Set(assignments.flatMap((assignment) => assignment.role.permissions.map((rp) => rp.permission.key)))].sort();
+    socket.data.identity = { tenantId: claims.tenantId, userId: user.id, outletId, expiresAt: claims.expiresAt, permissions };
     next();
   } catch { next(new Error("Invalid or expired access token")); }
 });
 
 io.on("connection", (socket) => {
-  const identity = socket.data.identity!;
+  const identity = (socket.data as KoraSocketData).identity!;
   socket.join(`tenant:${identity.tenantId}:outlet:${identity.outletId}`);
   socket.emit("kora:ready", { outletId: identity.outletId });
+
+  const expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(0, identity.expiresAt - Date.now()));
+  let checking = false;
+  const authorizationTimer = setInterval(async () => {
+    if (checking || !socket.connected) return;
+    checking = true;
+    try {
+      const assignments = await prisma.userOutletRole.findMany({
+        where: { userId: identity.userId, outletId: identity.outletId, user: { tenantId: identity.tenantId, active: true }, outlet: { tenantId: identity.tenantId } },
+        include: { role: { include: { permissions: { include: { permission: true } } } } },
+      });
+      if (!assignments.length) { socket.disconnect(true); return; }
+      const current = [...new Set(assignments.flatMap((assignment) => assignment.role.permissions.map((rp) => rp.permission.key)))].sort();
+      if (current.length !== identity.permissions.length || current.some((permission, index) => permission !== identity.permissions[index])) {
+        socket.disconnect(true);
+      }
+    } catch {
+      socket.disconnect(true);
+    } finally { checking = false; }
+  }, 30_000);
+
+  socket.on("disconnect", () => { clearTimeout(expiryTimer); clearInterval(authorizationTimer); });
   socket.on("kot:ack", (payload: { kotId?: unknown }) => {
-    if (!identity.permissions.includes("kot.update") || typeof payload?.kotId !== "string") return;
-    // Kitchen status is written through the authenticated API so it receives the same audit trail.
+    if (!identity.permissions.includes("kot.update") || typeof payload?.kotId !== "string" || payload.kotId.length > 80) return;
     socket.emit("kora:action-required", { action: "kot.update", kotId: payload.kotId });
   });
 });
