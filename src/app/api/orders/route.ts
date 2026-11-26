@@ -6,6 +6,7 @@ import { allocatePaise, calculateSale, indianFinancialYear, paymentStatus } from
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { requiresDiscountApproval, settingsForOutlet } from "@/lib/domain/discount-approval";
+import { isTransactionConflict } from "@/lib/db-conflicts";
 
 export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI, Other: PaymentMethod.OTHER };
@@ -28,7 +29,7 @@ async function withSerializableRetry<T>(operation: () => Promise<T>, attempts = 
   for (let attempt = 0; ; attempt++) {
     try { return await operation(); }
     catch (error) {
-      const serializationConflict = typeof error === "object" && error !== null && "code" in error && error.code === "P2034";
+      const serializationConflict = isTransactionConflict(error);
       if (!serializationConflict || attempt + 1 >= attempts) throw error;
       await new Promise((resolve) => setTimeout(resolve, 20 * (attempt + 1)));
     }
@@ -44,7 +45,7 @@ async function GETHandler(request: NextRequest) {
   const where: Prisma.OrderWhereInput = { tenantId: access.tenantId, outletId };
   if (visibility === "own") where.createdById = access.user.id;
   if (visibility === "kitchen") where.status = { notIn: [OrderStatus.COMPLETED, OrderStatus.CANCELLED] };
-  const orders = await prisma.order.findMany({ where, include: { items: true, table: { select: { id: true, label: true } }, customer: { select: { name: true } }, kots: { include: { items: true } }, bill: { include: { payments: true } } }, orderBy: { createdAt: "desc" }, take: 100 });
+  const orders = await prisma.order.findMany({ where, include: { items: true, table: { select: { id: true, label: true } }, customer: { select: { name: true } }, kots: { include: { items: true } }, bill: { include: { payments: { include: { reversals: true } } } } }, orderBy: { createdAt: "desc" }, take: 100 });
   const maySeeFinancials = access.permissions.includes("bills.settle") || access.permissions.includes("reports.view.financial");
   const safeOrders = maySeeFinancials ? orders : orders.map((order) => ({
     ...order,
@@ -72,7 +73,7 @@ async function POSTHandler(request: NextRequest) {
     const type = typeof body.type === "string" ? types[body.type] : undefined;
     const inputItems: Array<{ menuItemId: string; quantity: unknown; note?: unknown }> = Array.isArray(body.items) ? body.items : [];
     if (!idempotencyKey || idempotencyKey.length > 150 || !type || inputItems.length < 1 || inputItems.length > 100) return NextResponse.json({ error: "A valid clientMutationId, order type, and 1–100 items are required." }, { status: 400 });
-    const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId, idempotencyKey } }, include: { items: true, bill: { include: { payments: true } }, kots: { include: { items: true } } } });
+    const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId, idempotencyKey } }, include: { items: true, bill: { include: { payments: { include: { reversals: true } } } }, kots: { include: { items: true } } } });
     if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
     const uniqueIds: string[] = [...new Set(inputItems.map((item) => typeof item.menuItemId === "string" ? item.menuItemId : ""))].filter((id) => id.length > 0);
     if (uniqueIds.length !== inputItems.length) return NextResponse.json({ error: "Every order line needs a menu item ID." }, { status: 400 });
@@ -127,7 +128,7 @@ async function POSTHandler(request: NextRequest) {
         if (!customer) throw new ReferenceError("Customer not found in this restaurant.");
       }
       if (tableId) {
-        const lockedTables = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "restaurant_tables" WHERE "id" = ${tableId} AND "outletId" = ${outletId} AND "active" = true FOR UPDATE`;
+        const lockedTables = await tx.$queryRaw<Array<{ id: string }>>`SELECT t."id" FROM "restaurant_tables" AS t JOIN "outlets" AS o ON o."id" = t."outletId" WHERE t."id" = ${tableId} AND o."tenantId" = ${access.tenantId} AND t."outletId" = ${outletId} AND t."active" = true FOR UPDATE OF t`;
         if (!lockedTables.length) throw new ReferenceError("Table not found in this outlet.");
         const occupied = await tx.order.findFirst({ where: { outletId, tableId, status: { in: ["OPEN", "SENT", "PREPARING", "READY", "SERVED"] } }, select: { id: true } });
         if (occupied) throw new ConflictError("Table already has an active order.");
@@ -146,7 +147,8 @@ async function POSTHandler(request: NextRequest) {
         const existingInvoiceSequence = await tx.$queryRaw<Array<{ maxSequence: number | null }>>`
           SELECT MAX(substring("invoiceNumber" from '-([0-9]+)$')::integer) AS "maxSequence"
           FROM "bills"
-          WHERE "outletId" = ${outletId}
+          WHERE "tenantId" = ${access.tenantId}
+            AND "outletId" = ${outletId}
             AND "issuedAt" >= ${financialYearStart}
             AND "issuedAt" < ${nextFinancialYearStart}
             AND "invoiceNumber" ~ '-[0-9]+$'
@@ -209,9 +211,9 @@ async function POSTHandler(request: NextRequest) {
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     if (error instanceof ReferenceError) return NextResponse.json({ error: error.message }, { status: 404 });
-    if (typeof error === "object" && error && "code" in error && (error.code === "P2002" || error.code === "P2034")) {
+    if ((typeof error === "object" && error && "code" in error && error.code === "P2002") || isTransactionConflict(error)) {
       if (retryOutletId && retryKey) {
-        const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId: retryOutletId, idempotencyKey: retryKey } }, include: { items: true, bill: { include: { payments: true } }, kots: { include: { items: true } } } }).catch(() => null);
+        const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId: retryOutletId, idempotencyKey: retryKey } }, include: { items: true, bill: { include: { payments: { include: { reversals: true } } } }, kots: { include: { items: true } } } }).catch(() => null);
         if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
       }
       return NextResponse.json({ error: "A conflicting order already exists. Retry with its original clientMutationId." }, { status: 409 });

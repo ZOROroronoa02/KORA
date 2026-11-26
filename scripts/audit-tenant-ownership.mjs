@@ -87,6 +87,19 @@ WITH violations(issue) AS (
     LEFT JOIN public.shifts s ON s.id = p."shiftId"
     WHERE p."shiftId" IS NOT NULL AND b."outletId" IS DISTINCT FROM s."outletId"
   UNION ALL
+  SELECT 'payment_reversals.ownership' FROM public.payment_reversals r
+    LEFT JOIN public.payments p ON p.id = r."paymentId"
+    LEFT JOIN public.bills b ON b.id = p."billId"
+    LEFT JOIN public.outlets o ON o.id = r."outletId"
+    LEFT JOIN public.users u ON u.id = r."createdById"
+    LEFT JOIN public.shifts s ON s.id = r."shiftId"
+    WHERE r."tenantId" IS DISTINCT FROM b."tenantId"
+       OR r."outletId" IS DISTINCT FROM b."outletId"
+       OR r."tenantId" IS DISTINCT FROM o."tenantId"
+       OR r."tenantId" IS DISTINCT FROM u."tenantId"
+       OR (r."shiftId" IS NOT NULL AND r."outletId" IS DISTINCT FROM s."outletId")
+       OR r.method IS DISTINCT FROM p.method
+  UNION ALL
   SELECT 'bill_split_items.order' FROM public.bill_split_items i
     LEFT JOIN public.bill_splits s ON s.id = i."splitId"
     LEFT JOIN public.bills b ON b.id = s."billId"

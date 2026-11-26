@@ -3,9 +3,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, PaymentStatus, Prisma } from "@prisma/client";
 import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
-import { allocatePaise, calculateSale, paymentStatus } from "@/lib/billing";
+import { allocatePaise, calculateSale, paymentStatusAfterRefund } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
+import { isTransactionConflict } from "@/lib/db-conflicts";
 
 export const runtime = "nodejs";
 class KdsOrderConflict extends Error { constructor(message: string) { super(message); this.name = "KdsOrderConflict"; } }
@@ -68,7 +69,10 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
       const lineDiscounts = lines.map(() => 0n);
       const additions = calculateSale(lines.map((line, index) => ({ quantity: line.input.quantity, unitPricePaise: line.pricePaise, gstBps: line.product.gstBps, discountPaise: Number(lineDiscounts[index]) })), { serviceChargeBps: order.type === "DINE_IN" ? outlet.serviceChargeBps : 0 });
       const oldTotal = Number(order.totalPaise);
-      const paid = order.bill?.payments.filter((payment) => payment.status === PaymentStatus.PAID).reduce((sum, payment) => sum + Number(payment.amountPaise), 0) ?? 0;
+      const grossPaidPaise = order.bill?.payments.filter((payment) => payment.status === PaymentStatus.PAID).reduce((sum, payment) => sum + payment.amountPaise, 0n) ?? 0n;
+      const refundAggregate = order.bill ? await tx.paymentReversal.aggregate({ where: { payment: { billId: order.bill.id } }, _sum: { amountPaise: true } }) : null;
+      const refundedPaise = refundAggregate?._sum.amountPaise ?? 0n;
+      if (grossPaidPaise > BigInt(Number.MAX_SAFE_INTEGER) || refundedPaise > grossPaidPaise) throw new RangeError("Payment balance exceeds the supported range.");
       const newTotal = oldTotal + additions.totalPaise;
       if (!Number.isSafeInteger(newTotal)) throw new RangeError("Updated order total exceeds the supported range.");
       const addedOrderItems = [];
@@ -114,7 +118,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
           subtotalPaise: { increment: BigInt(additions.subtotalPaise) }, discountPaise: { increment: BigInt(additions.discountPaise) },
           taxablePaise: { increment: BigInt(additions.taxablePaise) }, cgstPaise: { increment: BigInt(Math.floor(additions.taxPaise / 2)) },
           sgstPaise: { increment: BigInt(additions.taxPaise - Math.floor(additions.taxPaise / 2)) }, serviceChargePaise: { increment: BigInt(additions.serviceChargePaise) },
-          totalPaise: { increment: BigInt(additions.totalPaise) }, paymentStatus: paymentStatus(newTotal, paid),
+          totalPaise: { increment: BigInt(additions.totalPaise) }, paymentStatus: paymentStatusAfterRefund(newTotal, Number(grossPaidPaise), Number(refundedPaise)) as PaymentStatus,
         } });
       }
       const response = safeJson({ orderId: updatedOrder.id, orderStatus: updatedOrder.status, kotIds: createdKots.map((kot) => kot.id), kotNumbers: createdKots.map((kot) => kot.kotNumber) });
@@ -136,7 +140,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
       }
       return NextResponse.json({ error: "The clientMutationId was already used for another request." }, { status: 409 });
     }
-    if (typeof error === "object" && error && "code" in error && error.code === "P2034") return NextResponse.json({ error: "Order changed while items were being added. Refresh and retry." }, { status: 409 });
+    if (isTransactionConflict(error)) return NextResponse.json({ error: "Order changed while items were being added. Refresh and retry." }, { status: 409 });
     console.error("KORA order item append failed", error instanceof Error ? error.message : "unknown error");
     return NextResponse.json({ error: "Could not add items to the order." }, { status: 500 });
   }

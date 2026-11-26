@@ -70,6 +70,10 @@ const policies: Record<string, ScopePolicy> = {
   },
   Bill: { direct: (scope) => ({ tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }) },
   Payment: { related: (scope) => ({ bill: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) } }) },
+  PaymentReversal: {
+    direct: (scope) => ({ tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }),
+    related: (scope) => ({ payment: { bill: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) } } }),
+  },
   BillSplit: { related: (scope) => ({ bill: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) } }) },
   BillSplitItem: {
     related: (scope) => ({ split: { bill: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) } } }),

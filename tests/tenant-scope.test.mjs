@@ -27,6 +27,19 @@ test('tenant scope preserves existing unique filters while adding relation owner
   });
 });
 
+test('refund ledger reads and writes are scoped to both tenant and outlet', () => {
+  assert.deepEqual(applyPrismaTenantScope('PaymentReversal', 'findMany', {
+    where: { outletId: 'outlet-b', id: 'refund-1' },
+  }, scope), {
+    where: { outletId: 'outlet-a', tenantId: 'tenant-a', id: 'refund-1', AND: [{ payment: { bill: { tenantId: 'tenant-a', outletId: 'outlet-a' } } }] },
+  });
+  assert.deepEqual(applyPrismaTenantScope('PaymentReversal', 'create', {
+    data: { paymentId: 'payment-1', amountPaise: 500n },
+  }, scope), {
+    data: { paymentId: 'payment-1', amountPaise: 500n, tenantId: 'tenant-a', outletId: 'outlet-a' },
+  });
+});
+
 test('tenant scope injects server-owned ownership fields on creates', () => {
   const args = applyPrismaTenantScope('Order', 'create', {
     data: { outletId: 'outlet-a', type: 'TAKEAWAY' },

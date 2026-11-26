@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addPaymentWithinBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, indianFinancialYear, parseRupeesToPaise, paymentStatus, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
+import { addPaymentWithinBalance, addRefundWithinPaidBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, indianFinancialYear, parseRupeesToPaise, paymentStatus, paymentStatusAfterRefund, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
 
 test('rupee parsing uses integer paise and rejects precision loss', () => {
   assert.equal(parseRupeesToPaise('0'), 0);
@@ -83,8 +83,20 @@ test('payment recording cannot exceed the bill balance', () => {
   assert.throws(() => addPaymentWithinBalance(Number.MAX_SAFE_INTEGER + 1, 0, 1), /safe integer/);
 });
 
+test('refunds are bounded by captured funds and update net payment state', () => {
+  assert.equal(addRefundWithinPaidBalance(1000, 0, 400), 400);
+  assert.equal(addRefundWithinPaidBalance(1000, 400, 600), 1000);
+  assert.throws(() => addRefundWithinPaidBalance(1000, 400, 601), /unrefunded payment balance/);
+  assert.throws(() => addRefundWithinPaidBalance(1000, 1001, 1), /unrefunded payment balance/);
+  assert.equal(paymentStatusAfterRefund(1000, 1000, 0), 'PAID');
+  assert.equal(paymentStatusAfterRefund(1000, 1000, 400), 'PARTIAL');
+  assert.equal(paymentStatusAfterRefund(1000, 1000, 1000), 'REFUNDED');
+  assert.throws(() => paymentStatusAfterRefund(1000, 1000, 1001), /Invalid refunded payment balance/);
+});
+
 test('cash reconciliation accounts for opening float and reports over/short variance', () => {
   assert.deepEqual(reconcileCash(50000, [25000, 10000], 85000), { expectedCashPaise: 85000, countedCashPaise: 85000, variancePaise: 0 });
+  assert.deepEqual(reconcileCash(50000, [25000, 10000], 80000, 5000), { expectedCashPaise: 80000, countedCashPaise: 80000, variancePaise: 0 });
   assert.equal(reconcileCash(50000, [25000], 74000).variancePaise, -1000);
 });
 

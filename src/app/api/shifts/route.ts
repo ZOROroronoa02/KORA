@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { reconcileCash } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
+import { isTransactionConflict } from "@/lib/db-conflicts";
 
 export const runtime = "nodejs";
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
@@ -46,10 +47,12 @@ async function POSTHandler(request: NextRequest) {
       const active = await tx.shift.findFirst({ where: { tenantId: access.tenantId, outletId, userId: access.user.id, status: ShiftStatus.OPEN }, orderBy: { openedAt: "desc" } });
       if (!active) throw new ShiftConflictError("No open shift to close.");
       const cashTotal = await tx.payment.aggregate({ where: { shiftId: active.id, method: "CASH", status: "PAID" }, _sum: { amountPaise: true } });
+      const cashRefundTotal = await tx.paymentReversal.aggregate({ where: { shiftId: active.id, method: "CASH" }, _sum: { amountPaise: true } });
       const opening = active.openingCashPaise;
       const paid = cashTotal._sum.amountPaise ?? 0n;
-      if (opening > BigInt(Number.MAX_SAFE_INTEGER) || paid > BigInt(Number.MAX_SAFE_INTEGER) || opening + paid > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Cash total exceeds supported reconciliation range.");
-      const totals = reconcileCash(Number(opening), [Number(paid)], countedCashPaise);
+      const refunded = cashRefundTotal._sum.amountPaise ?? 0n;
+      if (opening > BigInt(Number.MAX_SAFE_INTEGER) || paid > BigInt(Number.MAX_SAFE_INTEGER) || refunded > BigInt(Number.MAX_SAFE_INTEGER) || opening + paid - refunded > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Cash total exceeds supported reconciliation range.");
+      const totals = reconcileCash(Number(opening), [Number(paid)], countedCashPaise, Number(refunded));
       const closedAt = new Date();
       const result = await tx.shift.updateMany({ where: { id: active.id, status: ShiftStatus.OPEN, activeKey: "OPEN" }, data: { status: ShiftStatus.CLOSED, activeKey: null, expectedCashPaise: BigInt(totals.expectedCashPaise), countedCashPaise: BigInt(totals.countedCashPaise), variancePaise: BigInt(totals.variancePaise), closedAt } });
       if (result.count !== 1) throw new ShiftConflictError("Shift was closed by another request.");
@@ -63,7 +66,7 @@ async function POSTHandler(request: NextRequest) {
     if (error instanceof ShiftConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
-    if (typeof error === "object" && error && "code" in error && (error.code === "P2002" || error.code === "P2034")) return NextResponse.json({ error: "Shift changed concurrently. Reload and retry." }, { status: 409 });
+    if ((typeof error === "object" && error && "code" in error && error.code === "P2002") || isTransactionConflict(error)) return NextResponse.json({ error: "Shift changed concurrently. Reload and retry." }, { status: 409 });
     console.error("KORA shift update failed", error);
     return NextResponse.json({ error: "Could not update shift." }, { status: 500 });
   }

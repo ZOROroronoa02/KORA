@@ -9,7 +9,7 @@ const api = process.env.KORA_SECURITY_TEST_URL;
 const enabled = Boolean(api && process.env.DATABASE_URL);
 const testIp = `2001:db8:${randomUUID().slice(0, 4)}:${randomUUID().slice(4, 8)}::1`;
 
-test('API security integration: outlet customer isolation and concurrent bill splits', { skip: !enabled, timeout: 60000 }, async () => {
+test('API security integration: tenant isolation, concurrent billing, and payment reversals', { skip: !enabled, timeout: 60000 }, async () => {
   const prisma = new PrismaClient();
   let tenantId;
   let foreignTenantId;
@@ -32,6 +32,8 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     for (const tableName of ['customer_outlets', 'orders', 'order_items', 'kots', 'bills', 'payments', 'shifts', 'raw_materials', 'purchases', 'audit_logs']) {
       assert.ok(guardedTables.has(tableName), `database ownership trigger missing for ${tableName}`);
     }
+    const ledgerTriggers = await prisma.$queryRaw`SELECT tgname FROM pg_trigger WHERE tgname IN ('kora_payment_reversals_ownership', 'kora_payment_reversals_append_only', 'kora_payments_append_only') AND NOT tgisinternal`;
+    assert.equal(ledgerTriggers.length, 3, 'captured payments and refunds need database ownership/append-only triggers');
     const suffix = randomUUID().replaceAll('-', '').slice(0, 10);
     const registerResponse = await fetch(api + '/api/auth/register', {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
@@ -153,6 +155,90 @@ test('API security integration: outlet customer isolation and concurrent bill sp
     assert.equal(statuses.filter((status) => status === 409).length, 7);
     assert.equal(splits.length, 2);
     assert.equal(splits.reduce((sum, split) => sum + split.totalPaise, 0n), total);
+
+    const refundOrder = await readJson(await fetch(api + '/api/orders', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, clientMutationId: `security-refund-order-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    }));
+    const refundTotal = Number(refundOrder.bill.totalPaise);
+    const sourcePayment = await readJson(await fetch(api + `/api/orders/${refundOrder.order.id}/payments`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, deviceId: `security-device-${suffix}`, clientMutationId: `security-refund-pay-${suffix}`, amountPaise: refundTotal, method: 'UPI' }),
+    }));
+    await assert.rejects(
+      prisma.payment.update({ where: { id: sourcePayment.payment.id }, data: { amountPaise: 1n } }),
+      (error) => /payments_append_only|append-only/i.test(JSON.stringify({ code: error.code, meta: error.meta, message: error.message })),
+      'captured payments cannot be edited to evade the refund ledger',
+    );
+    const refundUrl = api + `/api/orders/${refundOrder.order.id}/payments/${sourcePayment.payment.id}/refunds`;
+    const firstRefundBody = { outletId: registered.outlet.id, deviceId: `security-device-${suffix}`, clientMutationId: `security-refund-${suffix}-001`, amountPaise: Math.floor(refundTotal / 2), reason: 'Guest requested refund' };
+    const firstRefundResponse = await fetch(refundUrl, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken }, body: JSON.stringify(firstRefundBody) });
+    assert.equal(firstRefundResponse.status, 201);
+    const firstRefund = await firstRefundResponse.json();
+    assert.equal((await prisma.bill.findUniqueOrThrow({ where: { id: refundOrder.bill.id } })).paymentStatus, 'PARTIAL');
+    const deniedRefund = await fetch(refundUrl, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + waiterLogin.accessToken }, body: JSON.stringify({ ...firstRefundBody, clientMutationId: `security-refund-denied-${suffix}-1` }) });
+    assert.equal(deniedRefund.status, 403, 'waiters must not record refunds');
+    const crossTenantRefund = await fetch(refundUrl, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken }, body: JSON.stringify({ ...firstRefundBody, outletId: foreignOutlet.id, clientMutationId: `security-refund-cross-${suffix}-1` }) });
+    assert.equal(crossTenantRefund.status, 403, 'a refund cannot be routed through another tenant outlet');
+    const replayResponse = await fetch(refundUrl, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken }, body: JSON.stringify(firstRefundBody) });
+    assert.equal(replayResponse.status, 200, 'retrying the same mutation must replay the original refund');
+    assert.equal((await replayResponse.json()).reversal.id, firstRefund.reversal.id);
+    assert.equal(await prisma.paymentReversal.count({ where: { paymentId: sourcePayment.payment.id } }), 1);
+    const refusedVoid = await fetch(api + `/api/orders/${refundOrder.order.id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, action: 'void', reason: 'Refund incomplete' }),
+    });
+    assert.equal(refusedVoid.status, 409, 'an order with remaining captured funds must not be voided');
+    const overRefund = await fetch(refundUrl, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken }, body: JSON.stringify({ ...firstRefundBody, clientMutationId: `security-refund-over-${suffix}-1`, amountPaise: refundTotal }) });
+    assert.equal(overRefund.status, 409, 'refunds above the source payment balance must fail');
+    const remainingRefundPaise = refundTotal - firstRefundBody.amountPaise;
+    const competingRefunds = await Promise.all([2, 3].map((index) => fetch(refundUrl, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ ...firstRefundBody, clientMutationId: `security-refund-${suffix}-00${index}`, amountPaise: remainingRefundPaise }),
+    })));
+    const competingStatuses = competingRefunds.map((response) => response.status).sort((a, b) => a - b);
+    assert.deepEqual(competingStatuses, [201, 409], 'only one concurrent refund may consume the remaining captured balance');
+    assert.equal((await prisma.bill.findUniqueOrThrow({ where: { id: refundOrder.bill.id } })).paymentStatus, 'REFUNDED');
+    const reversedTotal = await prisma.paymentReversal.aggregate({ where: { paymentId: sourcePayment.payment.id }, _sum: { amountPaise: true } });
+    assert.equal(reversedTotal._sum.amountPaise, BigInt(refundTotal), 'concurrent retries must never reverse more than the captured payment');
+    const voidAfterRefund = await fetch(api + `/api/orders/${refundOrder.order.id}`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, action: 'void', reason: 'Fully refunded order' }),
+    });
+    assert.equal(voidAfterRefund.status, 200, 'fully refunded orders can be voided with an audit trail');
+    assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: refundOrder.order.id } })).status, 'CANCELLED');
+    await assert.rejects(
+      prisma.paymentReversal.update({ where: { id: firstRefund.reversal.id }, data: { amountPaise: 1n } }),
+      (error) => /payment_reversals_append_only|append-only/i.test(JSON.stringify({ code: error.code, meta: error.meta, message: error.message })),
+      'refund ledger entries must not be editable through direct database access',
+    );
+
+    const openedShift = await readJson(await fetch(api + '/api/shifts', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, action: 'open', openingCashPaise: 100000 }),
+    }));
+    const cashOrder = await readJson(await fetch(api + '/api/orders', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, clientMutationId: `security-cash-order-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    }));
+    const cashAmount = Number(cashOrder.bill.totalPaise);
+    const cashPayment = await readJson(await fetch(api + `/api/orders/${cashOrder.order.id}/payments`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, deviceId: `security-device-${suffix}`, clientMutationId: `security-cash-pay-${suffix}`, amountPaise: cashAmount, method: 'Cash' }),
+    }));
+    const cashRefund = await fetch(api + `/api/orders/${cashOrder.order.id}/payments/${cashPayment.payment.id}/refunds`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, deviceId: `security-device-${suffix}`, clientMutationId: `security-cash-refund-${suffix}-1`, amountPaise: cashAmount, reason: 'Cash order reversal' }),
+    });
+    assert.equal(cashRefund.status, 201, 'cash reversal should be recorded against an open shift');
+    const cashRefundBody = await cashRefund.json();
+    assert.equal(cashRefundBody.reversal.shiftId, openedShift.shift.id);
+    const closedShift = await readJson(await fetch(api + '/api/shifts', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, action: 'close', countedCashPaise: 100000 }),
+    }));
+    assert.equal(closedShift.reconciliation.expectedCashPaise, 100000, 'cash refund must reduce expected shift cash');
+    assert.equal(closedShift.reconciliation.variancePaise, 0);
   } finally {
     if (foreignTenantId) await prisma.tenant.deleteMany({ where: { id: foreignTenantId } }).catch(() => undefined);
     if (tenantId) await prisma.tenant.deleteMany({ where: { id: tenantId } }).catch(() => undefined);

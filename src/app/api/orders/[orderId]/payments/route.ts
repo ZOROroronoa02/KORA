@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { addPaymentWithinBalance, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
+import { isTransactionConflict } from "@/lib/db-conflicts";
 
 export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI };
@@ -44,12 +45,19 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
     }
 
     const saved = await prisma.$transaction(async (tx) => {
+      const billLock = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "bills" WHERE "id" = ${order.bill!.id} AND "tenantId" = ${access.tenantId} AND "outletId" = ${outletId} FOR UPDATE`;
+      if (!billLock.length) throw new ReferenceError("Order bill not found.");
+      const currentOrder = await tx.order.findFirst({ where: { id: orderId, outletId, tenantId: access.tenantId }, select: { status: true } });
+      if (!currentOrder || currentOrder.status === "CANCELLED") throw new RangeError("A cancelled order cannot accept payment.");
       const bill = await tx.bill.findFirst({ where: { id: order.bill!.id, tenantId: access.tenantId, outletId, orderId } });
       if (!bill) throw new ReferenceError("Order bill not found.");
       const paid = await tx.payment.aggregate({ where: { billId: bill.id, status: PaymentStatus.PAID }, _sum: { amountPaise: true } });
-      const paidPaise = paid._sum.amountPaise ?? 0n;
-      if (bill.totalPaise > BigInt(Number.MAX_SAFE_INTEGER) || paidPaise > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Bill amount exceeds supported payment range.");
-      const nextPaid = addPaymentWithinBalance(Number(bill.totalPaise), Number(paidPaise), amountPaise);
+      const refunded = await tx.paymentReversal.aggregate({ where: { payment: { billId: bill.id } }, _sum: { amountPaise: true } });
+      const grossPaidPaise = paid._sum.amountPaise ?? 0n;
+      const refundedPaise = refunded._sum.amountPaise ?? 0n;
+      if (bill.totalPaise > BigInt(Number.MAX_SAFE_INTEGER) || grossPaidPaise > BigInt(Number.MAX_SAFE_INTEGER) || refundedPaise > grossPaidPaise) throw new RangeError("Bill amount exceeds supported payment range.");
+      const netPaidPaise = grossPaidPaise - refundedPaise;
+      const nextPaid = addPaymentWithinBalance(Number(bill.totalPaise), Number(netPaidPaise), amountPaise);
       const nextStatus = paymentStatus(Number(bill.totalPaise), nextPaid) as PaymentStatus;
       let shiftId: string | undefined;
       if (method === PaymentMethod.CASH) {
@@ -61,7 +69,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
       const payment = await tx.payment.create({ data: { billId: bill.id, shiftId, method, amountPaise: BigInt(amountPaise), status: PaymentStatus.PAID } });
       await tx.bill.update({ where: { id: bill.id }, data: { paymentStatus: nextStatus } });
       await tx.syncMutation.update({ where: { deviceId_clientMutationId: { deviceId, clientMutationId } }, data: { status: "APPLIED", appliedAt: new Date(), result: { paymentId: payment.id } } });
-      await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "PAYMENT_RECORDED", entityType: "Bill", entityId: bill.id, before: { paymentStatus: bill.paymentStatus }, after: { amountPaise, method, paymentStatus: nextStatus } } });
+      await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "PAYMENT_RECORDED", entityType: "Bill", entityId: bill.id, before: { paymentStatus: bill.paymentStatus, netPaidPaise: Number(netPaidPaise) }, after: { amountPaise, method, paymentStatus: nextStatus } } });
       return payment;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     void publishOutletEvent(access.tenantId, outletId, "order:updated", { orderId, action: "payment-recorded" });
@@ -70,7 +78,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof ReferenceError) return NextResponse.json({ error: error.message }, { status: 404 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
-    if (typeof error === "object" && error && "code" in error && (error.code === "P2002" || error.code === "P2034")) {
+    if ((typeof error === "object" && error && "code" in error && error.code === "P2002") || isTransactionConflict(error)) {
       if (deviceId && clientMutationId) {
         const prior = await prisma.syncMutation.findUnique({ where: { deviceId_clientMutationId: { deviceId, clientMutationId } } }).catch(() => null);
         const result = prior?.result as { paymentId?: string } | null;

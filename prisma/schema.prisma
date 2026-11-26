@@ -87,70 +87,72 @@ enum DiscountKind {
 }
 
 model Tenant {
-  id            String         @id @default(cuid())
-  name          String
-  slug          String         @unique
-  plan          Plan           @default(FREE)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
-  outlets       Outlet[]
-  users         User[]
-  roles         Role[]
-  customers     Customer[]
-  categories    MenuCategory[]
-  items         MenuItem[]
-  coupons       Coupon[]
-  vendors       Vendor[]
-  materials     RawMaterial[]
-  recipes       Recipe[]
-  purchases     Purchase[]
-  orders        Order[]
-  bills         Bill[]
-  shifts        Shift[]
-  syncMutations SyncMutation[]
-  auditLogs     AuditLog[]
+  id               String            @id @default(cuid())
+  name             String
+  slug             String            @unique
+  plan             Plan              @default(FREE)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  outlets          Outlet[]
+  users            User[]
+  roles            Role[]
+  customers        Customer[]
+  categories       MenuCategory[]
+  items            MenuItem[]
+  coupons          Coupon[]
+  vendors          Vendor[]
+  materials        RawMaterial[]
+  recipes          Recipe[]
+  purchases        Purchase[]
+  orders           Order[]
+  bills            Bill[]
+  paymentReversals PaymentReversal[]
+  shifts           Shift[]
+  syncMutations    SyncMutation[]
+  auditLogs        AuditLog[]
 
   @@map("tenants")
 }
 
 model Outlet {
-  id                String            @id @default(cuid())
-  tenantId          String
-  name              String
-  code              String
-  timezone          String            @default("Asia/Kolkata")
-  currency          String            @default("INR")
-  gstin             String?
-  fssaiLicense      String?
-  address           Json?
-  invoicePrefix     String            @default("K")
-  invoiceNextNumber Int               @default(1)
+  id                   String            @id @default(cuid())
+  tenantId             String
+  name                 String
+  code                 String
+  timezone             String            @default("Asia/Kolkata")
+  currency             String            @default("INR")
+  gstin                String?
+  fssaiLicense         String?
+  address              Json?
+  invoicePrefix        String            @default("K")
+  invoiceNextNumber    Int               @default(1)
   invoiceFinancialYear String?
-  orderNextNumber   Int               @default(1)
-  kotNextNumber     Int               @default(1)
-  serviceChargeBps  Int               @default(0)
-  createdAt         DateTime          @default(now())
-  tenant            Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  settings          OutletSettings?
-  tables            RestaurantTable[]
-  categories        MenuCategory[]
-  itemPrices        OutletMenuItem[]
-  stations          Station[]
-  kots              KOT[]
-  kotMutations      KOTMutation[]
-  orders            Order[]
-  bills             Bill[]
-  shifts            Shift[]
-  customers         CustomerOutlet[]
-  materials         RawMaterial[]
-  stockMovements    StockMovement[]
-  purchases         Purchase[]
-  wastage           Wastage[]
-  feedback          Feedback[]
-  assignments       UserOutletRole[]
-  roles             Role[]
-  syncMutations     SyncMutation[]
-  auditLogs         AuditLog[]
+  orderNextNumber      Int               @default(1)
+  kotNextNumber        Int               @default(1)
+  serviceChargeBps     Int               @default(0)
+  createdAt            DateTime          @default(now())
+  tenant               Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  settings             OutletSettings?
+  tables               RestaurantTable[]
+  categories           MenuCategory[]
+  itemPrices           OutletMenuItem[]
+  stations             Station[]
+  kots                 KOT[]
+  kotMutations         KOTMutation[]
+  orders               Order[]
+  bills                Bill[]
+  paymentReversals     PaymentReversal[]
+  shifts               Shift[]
+  customers            CustomerOutlet[]
+  materials            RawMaterial[]
+  stockMovements       StockMovement[]
+  purchases            Purchase[]
+  wastage              Wastage[]
+  feedback             Feedback[]
+  assignments          UserOutletRole[]
+  roles                Role[]
+  syncMutations        SyncMutation[]
+  auditLogs            AuditLog[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -177,6 +179,7 @@ model User {
   auditLogs         AuditLog[]         @relation("AuditActor")
   approvalAuditLogs AuditLog[]         @relation("AuditApprover")
   platformRoles     UserPlatformRole[]
+  paymentReversals  PaymentReversal[]  @relation("PaymentReversalActor")
 
   @@unique([tenantId, email])
   @@index([tenantId, active])
@@ -583,20 +586,47 @@ model Bill {
 }
 
 model Payment {
-  id          String        @id @default(cuid())
+  id          String            @id @default(cuid())
   billId      String
   shiftId     String?
   method      PaymentMethod
-  status      PaymentStatus @default(PAID)
+  status      PaymentStatus     @default(PAID)
   amountPaise BigInt
   reference   String?
-  recordedAt  DateTime      @default(now())
-  bill        Bill          @relation(fields: [billId], references: [id], onDelete: Cascade)
-  shift       Shift?        @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  recordedAt  DateTime          @default(now())
+  bill        Bill              @relation(fields: [billId], references: [id], onDelete: Cascade)
+  shift       Shift?            @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  reversals   PaymentReversal[]
 
   @@index([billId, recordedAt])
   @@index([shiftId, method, status, recordedAt])
   @@map("payments")
+}
+
+/// Append-only record of a refund/reversal. This records the business event;
+/// it does not initiate a card, UPI, or cash transfer through an external provider.
+model PaymentReversal {
+  id          String        @id @default(cuid())
+  tenantId    String
+  outletId    String
+  paymentId   String
+  shiftId     String?
+  createdById String
+  method      PaymentMethod
+  amountPaise BigInt
+  reference   String?
+  reason      String
+  recordedAt  DateTime      @default(now())
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet      Outlet        @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  payment     Payment       @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  shift       Shift?        @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  createdBy   User          @relation("PaymentReversalActor", fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, outletId, recordedAt])
+  @@index([paymentId, recordedAt])
+  @@index([shiftId, method, recordedAt])
+  @@map("payment_reversals")
 }
 
 model BillSplit {
@@ -644,22 +674,23 @@ model Coupon {
 }
 
 model Shift {
-  id                String      @id @default(cuid())
+  id                String            @id @default(cuid())
   tenantId          String
   outletId          String
   userId            String
   activeKey         String?
-  status            ShiftStatus @default(OPEN)
+  status            ShiftStatus       @default(OPEN)
   openingCashPaise  BigInt
   expectedCashPaise BigInt?
   countedCashPaise  BigInt?
   variancePaise     BigInt?
-  openedAt          DateTime    @default(now())
+  openedAt          DateTime          @default(now())
   closedAt          DateTime?
-  tenant            Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  outlet            Outlet      @relation(fields: [outletId], references: [id], onDelete: Cascade)
-  user              User        @relation(fields: [userId], references: [id])
+  tenant            Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet            Outlet            @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  user              User              @relation(fields: [userId], references: [id])
   payments          Payment[]
+  paymentReversals  PaymentReversal[]
 
   @@unique([outletId, userId, activeKey])
   @@index([outletId, status, openedAt])

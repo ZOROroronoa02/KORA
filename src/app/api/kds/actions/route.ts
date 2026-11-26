@@ -6,6 +6,7 @@ import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
+import { isTransactionConflict } from "@/lib/db-conflicts";
 
 export const runtime = "nodejs";
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
@@ -135,7 +136,7 @@ async function POSTHandler(request: NextRequest) {
       }
       return NextResponse.json({ error: "A matching kitchen action was submitted already. Refresh the ticket." }, { status: 409 });
     }
-    if (typeof error === "object" && error && "code" in error && error.code === "P2034") return NextResponse.json({ error: "Ticket changed while this action was saving. Refresh and retry." }, { status: 409 });
+    if (isTransactionConflict(error)) return NextResponse.json({ error: "Ticket changed while this action was saving. Refresh and retry." }, { status: 409 });
     console.error("KORA KDS action failed", error instanceof Error ? error.message : "unknown error");
     return NextResponse.json({ error: "Could not update kitchen ticket." }, { status: 500 });
   }

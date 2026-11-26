@@ -89,6 +89,23 @@ export function paymentStatus(totalPaise: number, paidPaise: number): "PENDING" 
   return "PAID";
 }
 
+/** Validate a positive refund against the remaining unrefunded amount of its source payment. */
+export function addRefundWithinPaidBalance(grossPaidPaise: number, refundedPaise: number, amountPaise: number): number {
+  for (const [value, label] of [[grossPaidPaise, "gross paid"], [refundedPaise, "refunded amount"], [amountPaise, "refund amount"]] as const) safeInteger(value, label);
+  if (grossPaidPaise < 0 || refundedPaise < 0 || amountPaise <= 0) throw new RangeError("Paid and refunded amounts must be non-negative, and refund must be positive");
+  if (refundedPaise > grossPaidPaise || amountPaise > grossPaidPaise - refundedPaise) throw new RangeError("Refund exceeds the unrefunded payment balance");
+  return refundedPaise + amountPaise;
+}
+
+/** Compute bill status after netting immutable refunds against successful payments. */
+export function paymentStatusAfterRefund(totalPaise: number, grossPaidPaise: number, refundedPaise: number): "PENDING" | "PARTIAL" | "PAID" | "REFUNDED" {
+  safeInteger(totalPaise, "total"); safeInteger(grossPaidPaise, "gross paid"); safeInteger(refundedPaise, "refunded amount");
+  if (totalPaise < 0 || grossPaidPaise < 0 || refundedPaise < 0 || refundedPaise > grossPaidPaise) throw new RangeError("Invalid refunded payment balance");
+  const netPaidPaise = grossPaidPaise - refundedPaise;
+  if (refundedPaise > 0 && netPaidPaise === 0) return "REFUNDED";
+  return paymentStatus(totalPaise, netPaidPaise);
+}
+
 /** Return the new settled amount only when this payment fits the remaining balance. */
 export function addPaymentWithinBalance(totalPaise: number, paidPaise: number, amountPaise: number): number {
   safeInteger(totalPaise, "bill total");
@@ -103,11 +120,12 @@ export function addPaymentWithinBalance(totalPaise: number, paidPaise: number, a
   return paidPaise + amountPaise;
 }
 
-export function reconcileCash(openingCashPaise: number, cashPayments: number[], countedCashPaise: number) {
-  for (const value of [openingCashPaise, countedCashPaise, ...cashPayments]) {
+export function reconcileCash(openingCashPaise: number, cashPayments: number[], countedCashPaise: number, cashRefundsPaise = 0) {
+  for (const value of [openingCashPaise, countedCashPaise, cashRefundsPaise, ...cashPayments]) {
     safeInteger(value, "cash amount"); if (value < 0) throw new RangeError("Cash amounts cannot be negative");
   }
-  const expectedCashPaise = openingCashPaise + cashPayments.reduce((a, b) => a + b, 0);
+  const expectedCashPaise = openingCashPaise + cashPayments.reduce((a, b) => a + b, 0) - cashRefundsPaise;
+  safeInteger(expectedCashPaise, "expected cash");
   return { expectedCashPaise, countedCashPaise, variancePaise: countedCashPaise - expectedCashPaise };
 }
 
