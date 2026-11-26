@@ -13,5 +13,5 @@
 - Normalized Prisma serialization/deadlock failures from raw SQL locks into retryable 409 conflicts instead of internal-server errors.
 - Made the Orders “New order” action open POS only for roles with `orders.create`, and changed the production start command to launch the configured standalone server.
 - Tightened the mobile POS top bar so sync, role, and connect controls fit without hiding the sync label from assistive technology.
-- Verified seven local migrations, the production Next.js build, the live suite (51 passed, 0 failed, 1 realtime integration skipped because local Redis is unavailable), and production dependency audit (0 advisories).
+- Verified seven local migrations, the production Next.js build, and the live suite (52 passed, 0 failed, 0 skipped). Realtime security ran against the development in-memory adapter; production Redis fan-out remains unverified. Full dependency audit reported 0 advisories.
 - Production Docker targets and the GitHub Actions workflow still need execution in a clean Linux/GitHub environment.
