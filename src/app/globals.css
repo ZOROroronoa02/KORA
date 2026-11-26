@@ -38,3 +38,13 @@
   .demo-role-switch select{max-width:82px;padding:0 5px}
   .topbar-actions>.secondary-button{height:32px;padding:0 8px;font-size:9px}
 }
+
+.payment-history{display:grid;gap:10px;margin:16px 0;padding:14px;border:1px solid var(--line);border-radius:10px;background:#fbfcf8}
+.payment-history h3{margin:0;color:var(--ink);font-size:13px}
+.payment-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding-top:9px;border-top:1px solid var(--line)}
+.payment-history-row>div:first-child{display:grid;gap:3px}
+.payment-history-row small,.refund-entry>small{color:var(--muted);font-size:11px;line-height:1.45}
+.refund-entry{grid-column:1/-1;display:grid;gap:9px;padding:12px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.refund-entry label{display:grid;gap:4px;color:var(--ink);font-size:11px;font-weight:600}
+.refund-entry input{min-height:40px;padding:8px 10px;border:1px solid var(--line);border-radius:7px;font:inherit}
+.refund-entry>div{display:flex;justify-content:flex-end;gap:8px}
