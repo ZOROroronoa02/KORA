@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
 import { authorizeAnyOutletPermission, requirePermission, verifyManagerApprovalPin, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
-import { allocatePaise, calculateSale, paymentStatus } from "@/lib/billing";
+import { allocatePaise, calculateSale, indianFinancialYear, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { requiresDiscountApproval, settingsForOutlet } from "@/lib/domain/discount-approval";
@@ -136,9 +136,28 @@ async function POSTHandler(request: NextRequest) {
       if (paidPaise > 0 && method === PaymentMethod.CASH && !activeShift) throw new ConflictError("Open a cashier shift before recording cash payment.");
       const stationRows = await tx.station.findMany({ where: { outletId, active: true }, orderBy: { sortOrder: "asc" }, select: { id: true, name: true } });
       const defaultStation = stationRows.find((station) => station.name === "General") ?? stationRows[0] ?? null;
-      const sequence = await tx.outlet.update({ where: { id: outletId }, data: { orderNextNumber: { increment: 1 } }, select: { orderNextNumber: true, invoiceNextNumber: true, invoicePrefix: true } });
-      const invoiceSequence = await tx.outlet.update({ where: { id: outletId }, data: { invoiceNextNumber: { increment: 1 } }, select: { invoiceNextNumber: true } });
-      const invoiceNumber = `${sequence.invoicePrefix}-${new Date().getFullYear()}-${String(invoiceSequence.invoiceNextNumber - 1).padStart(6, "0")}`;
+      const sequence = await tx.outlet.update({ where: { id: outletId }, data: { orderNextNumber: { increment: 1 } }, select: { orderNextNumber: true, invoicePrefix: true } });
+      const fiscalYear = indianFinancialYear(new Date());
+      const invoiceCounter = await tx.outlet.findUniqueOrThrow({ where: { id: outletId }, select: { invoiceFinancialYear: true, invoiceNextNumber: true } });
+      let invoiceSequenceNumber = invoiceCounter.invoiceNextNumber;
+      if (invoiceCounter.invoiceFinancialYear !== fiscalYear.label) {
+        const financialYearStart = new Date(Date.UTC(fiscalYear.startYear, 3, 1) - 330 * 60 * 1000);
+        const nextFinancialYearStart = new Date(Date.UTC(fiscalYear.startYear + 1, 3, 1) - 330 * 60 * 1000);
+        const existingInvoiceSequence = await tx.$queryRaw<Array<{ maxSequence: number | null }>>`
+          SELECT MAX(substring("invoiceNumber" from '-([0-9]+)$')::integer) AS "maxSequence"
+          FROM "bills"
+          WHERE "outletId" = ${outletId}
+            AND "issuedAt" >= ${financialYearStart}
+            AND "issuedAt" < ${nextFinancialYearStart}
+            AND "invoiceNumber" ~ '-[0-9]+$'
+        `;
+        invoiceSequenceNumber = (existingInvoiceSequence[0]?.maxSequence ?? 0) + 1;
+      }
+      if (!Number.isSafeInteger(invoiceSequenceNumber) || invoiceSequenceNumber < 1 || invoiceSequenceNumber >= 2_147_483_647) {
+        throw new RangeError("Invoice sequence is outside the supported range.");
+      }
+      await tx.outlet.update({ where: { id: outletId }, data: { invoiceFinancialYear: fiscalYear.label, invoiceNextNumber: invoiceSequenceNumber + 1 } });
+      const invoiceNumber = `${sequence.invoicePrefix}-FY${fiscalYear.label}-${String(invoiceSequenceNumber).padStart(6, "0")}`;
       const order = await tx.order.create({ data: {
         tenantId: access.tenantId, outletId, orderNumber: sequence.orderNextNumber - 1, type, status: "PREPARING", customerId, tableId, createdById: access.user.id,
         deviceId, idempotencyKey, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),

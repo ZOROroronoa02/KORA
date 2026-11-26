@@ -11,6 +11,17 @@ export function parseRupeesToPaise(value: string): number {
   return Number(paise);
 }
 
+/** Return the Indian financial-year label for a timestamp interpreted in Asia/Kolkata. */
+export function indianFinancialYear(date: Date): { label: string; startYear: number } {
+  if (Number.isNaN(date.getTime())) throw new RangeError("A valid date is required");
+  const parts = new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", year: "numeric", month: "numeric" }).formatToParts(date);
+  const year = Number(parts.find((part) => part.type === "year")?.value);
+  const month = Number(parts.find((part) => part.type === "month")?.value);
+  if (!Number.isInteger(year) || !Number.isInteger(month)) throw new RangeError("Could not determine Indian financial year");
+  const startYear = month >= 4 ? year : year - 1;
+  return { startYear, label: `${startYear}-${String((startYear + 1) % 100).padStart(2, "0")}` };
+}
+
 export type OrderWorkflowStatus = "OPEN" | "SENT" | "PREPARING" | "READY" | "SERVED" | "COMPLETED" | "CANCELLED";
 export type OrderWorkflowAction = "kot-ready" | "kot-served" | "void";
 export function transitionOrder(current: OrderWorkflowStatus, action: OrderWorkflowAction) {
@@ -26,6 +37,16 @@ export function transitionOrder(current: OrderWorkflowStatus, action: OrderWorkf
 function safeInteger(value: number, label: string): number {
   if (!Number.isSafeInteger(value)) throw new RangeError(`${label} must be a safe integer`);
   return value;
+}
+
+/** Apply a non-negative basis-point rate with exact paise precision and half-up rounding. */
+function applyBasisPoints(amountPaise: number, basisPoints: number, label: string): number {
+  safeInteger(amountPaise, label);
+  safeInteger(basisPoints, `${label} rate`);
+  if (amountPaise < 0 || basisPoints < 0) throw new RangeError(`${label} and its rate cannot be negative`);
+  const rounded = (BigInt(amountPaise) * BigInt(basisPoints) + 5_000n) / 10_000n;
+  if (rounded > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError(`${label} exceeds supported range`);
+  return Number(rounded);
 }
 
 export function calculateSale(lines: SaleLine[], options: { discountPaise?: number; serviceChargeBps?: number } = {}): SaleTotals {
@@ -51,10 +72,10 @@ export function calculateSale(lines: SaleLine[], options: { discountPaise?: numb
   const taxableLines = checked.map((line, index) => line.netBeforeOrderDiscount - Number(discountShares[index]));
   const discountPaise = itemDiscountTotal + orderDiscount;
   const taxablePaise = safeInteger(taxableLines.reduce((sum, amount) => sum + amount, 0), "taxable subtotal");
-  const taxPaise = safeInteger(checked.reduce((sum, line, index) => sum + Math.round(taxableLines[index] * line.rate / 10000), 0), "GST total");
+  const taxPaise = safeInteger(checked.reduce((sum, line, index) => sum + applyBasisPoints(taxableLines[index], line.rate, "GST"), 0), "GST total");
   const serviceChargeBps = safeInteger(options.serviceChargeBps ?? 0, "service charge rate");
   if (serviceChargeBps < 0 || serviceChargeBps > 10000) throw new RangeError("Service charge rate must be between 0 and 10000 basis points");
-  const serviceChargePaise = Math.round(taxablePaise * serviceChargeBps / 10000);
+  const serviceChargePaise = applyBasisPoints(taxablePaise, serviceChargeBps, "Service charge");
   const totalPaise = safeInteger(taxablePaise + taxPaise + serviceChargePaise, "total");
   return { subtotalPaise, discountPaise, taxablePaise, taxPaise, serviceChargePaise, totalPaise };
 }

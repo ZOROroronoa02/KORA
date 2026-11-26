@@ -125,6 +125,7 @@ model Outlet {
   address           Json?
   invoicePrefix     String            @default("K")
   invoiceNextNumber Int               @default(1)
+  invoiceFinancialYear String?
   orderNextNumber   Int               @default(1)
   kotNextNumber     Int               @default(1)
   serviceChargeBps  Int               @default(0)

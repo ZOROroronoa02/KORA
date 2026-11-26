@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
 import { hash } from 'bcryptjs';
+import { indianFinancialYear } from '../src/lib/billing.ts';
 
 const api = process.env.KORA_SECURITY_TEST_URL;
 const enabled = Boolean(api && process.env.DATABASE_URL);
@@ -133,6 +134,13 @@ test('API security integration: outlet customer isolation and concurrent bill sp
       method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
       body: JSON.stringify({ outletId: registered.outlet.id, clientMutationId: 'security-split-' + suffix, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
     }));
+    assert.ok(order.bill.invoiceNumber.includes(`-FY${indianFinancialYear(new Date()).label}-`), 'invoice number must use the current India financial year');
+    const concurrentOrders = await Promise.all([1, 2].map(async (index) => readJson(await fetch(api + '/api/orders', {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
+      body: JSON.stringify({ outletId: registered.outlet.id, clientMutationId: `security-invoice-${suffix}-${index}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    }))));
+    const invoiceSequences = [order.bill, ...concurrentOrders.map((entry) => entry.bill)].map((bill) => Number(bill.invoiceNumber.match(/-(\d{6})$/)?.[1]));
+    assert.deepEqual(invoiceSequences.sort((a, b) => a - b), [1, 2, 3], 'concurrent orders must each receive the next unique invoice sequence');
     const total = BigInt(order.bill.totalPaise);
     const half = Number(total / 2n);
     const splitBody = JSON.stringify({ outletId: registered.outlet.id, mode: 'amount', amounts: [half, Number(total) - half] });

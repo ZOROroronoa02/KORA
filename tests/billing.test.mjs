@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addPaymentWithinBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, parseRupeesToPaise, paymentStatus, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
+import { addPaymentWithinBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, indianFinancialYear, parseRupeesToPaise, paymentStatus, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
 
 test('rupee parsing uses integer paise and rejects precision loss', () => {
   assert.equal(parseRupeesToPaise('0'), 0);
@@ -9,6 +9,12 @@ test('rupee parsing uses integer paise and rejects precision loss', () => {
   assert.throws(() => parseRupeesToPaise('1.001'), /two decimal places/);
   assert.throws(() => parseRupeesToPaise('-1'), /two decimal places/);
   assert.throws(() => parseRupeesToPaise('9007199254740992'), /supported range/);
+});
+
+test('Indian invoice financial year changes at midnight IST on 1 April', () => {
+  assert.deepEqual(indianFinancialYear(new Date('2026-03-31T18:29:59.999Z')), { startYear: 2025, label: '2025-26' });
+  assert.deepEqual(indianFinancialYear(new Date('2026-03-31T18:30:00.000Z')), { startYear: 2026, label: '2026-27' });
+  assert.throws(() => indianFinancialYear(new Date(Number.NaN)), /valid date/);
 });
 
 test('order workflow rejects cancelled-order revival and out-of-order kitchen actions', () => {
@@ -23,6 +29,18 @@ test('order workflow rejects cancelled-order revival and out-of-order kitchen ac
 test('GST rounds per item in paise and preserves the taxable base', () => {
   const result = calculateSale([{ quantity: 2, unitPricePaise: 18000, gstBps: 500 }]);
   assert.deepEqual(result, { subtotalPaise: 36000, discountPaise: 0, taxablePaise: 36000, taxPaise: 1800, serviceChargePaise: 0, totalPaise: 37800 });
+});
+
+test('GST and service charge retain exact paise rounding near the safe-integer limit', () => {
+  const result = calculateSale([{ quantity: 1, unitPricePaise: 8000000000000149, gstBps: 500 }], { serviceChargeBps: 500 });
+  assert.deepEqual(result, {
+    subtotalPaise: 8000000000000149,
+    discountPaise: 0,
+    taxablePaise: 8000000000000149,
+    taxPaise: 400000000000007,
+    serviceChargePaise: 400000000000007,
+    totalPaise: 8800000000000163,
+  });
 });
 
 test('discount is capped at subtotal; service charge is calculated on discounted amount', () => {
