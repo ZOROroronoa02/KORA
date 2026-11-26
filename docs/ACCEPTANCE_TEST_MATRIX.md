@@ -38,6 +38,7 @@ This is an execution checklist, not evidence that the cases have passed. Run aga
 | POS-16 | Refresh, lose network, and reopen local POS | Local demo data is recovered; the UI labels it local demo data and never claims server sync |
 | POS-17 | Print to available ESC/POS printer and printer disconnected | Correct receipt prints when connected; disconnection produces actionable retry/fallback state without marking a duplicate sale |
 | POS-18 | Keyboard-only and Android touch operation at 360px, 768px, and 1280px | Primary order/pay actions are keyboard reachable; controls meet touch target size; no clipped cart/payment actions |
+| POS-19 | Refund part of a payment, retry its mutation ID, race two refunds for the remaining balance, and void after full reversal | One immutable refund ledger entry per committed mutation; duplicate retries replay; total reversals never exceed captured payment; partial funds block void; full reversal updates bill/shift state and allows audited void |
 
 ## Cross-tenant, security, and reliability workflows
 
@@ -65,4 +66,4 @@ This is an execution checklist, not evidence that the cases have passed. Run aga
 
 ## Current execution status
 
-As of 2026-11-27, the current local checkout passed TypeScript checking, production build, Prisma validation, and the live `npm test` suite (48 passed, 0 failed, 0 skipped). The suite exercised PostgreSQL-backed API/security and Socket.IO scenarios against the configured local services, including financial-year invoice IDs and dependency readiness. A rendered 390px browser pass confirmed the mobile header fits and the cashier cart totals are correct; the cart remains below the menu, so settlement requires scrolling. This does not cover the complete browser/device matrix above. Docker is unavailable on the local host, so production image builds and GitHub Actions have not been verified. See `docs/EXECUTION_STATUS.md` for exact release blockers.
+As of 2026-11-27, the current local checkout passed typecheck/lint, production build, Prisma validation, migration deploy, and the live `npm test` suite (51 passed, 0 failed, 0 skipped) after the refund ledger changes. The suite exercises refund idempotency, over-refund rejection, concurrent balance protection, tenant/RBAC denial, append-only database triggers, cash reconciliation, plus existing POS/KDS/Socket.IO workflows. A rendered 390px browser pass confirmed the mobile header fits and cashier totals are correct; the complete browser/device matrix is still open. Docker is unavailable on the local host, so production image builds and GitHub Actions have not been verified. See `docs/EXECUTION_STATUS.md` for exact release blockers.
