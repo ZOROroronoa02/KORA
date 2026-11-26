@@ -118,12 +118,15 @@ const navItems: { label: Page; icon: typeof House; group: string }[] = [
   { label: "Settings", icon: Settings, group: "Insights" },
 ];
 const initials = (s: string) => s.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
+const offlineQueueReadError = "Offline orders could not be read from this device. Keep this browser profile and retry; do not clear site storage.";
+const cloudOrdersRefreshError = "Cloud orders could not be refreshed. Check the connection; saved orders remain on the server or this device.";
 
 export default function Home() {
   const [data, setData] = useState<AppData>(seed);
   const latestData = useRef(data);
   latestData.current = data;
   const demoSnapshot = useRef<AppData | null>(null);
+  const offlineQueueWarningNotified = useRef(false);
   const [cloudSession, setCloudSession] = useState<AuthenticatedSession | null>(null);
   const [offlineOnly, setOfflineOnly] = useState(false);
   const [selectedOutletId, setSelectedOutletId] = useState("");
@@ -157,6 +160,11 @@ export default function Home() {
   const cloudMode = Boolean(cloudSession && selectedOutletId);
   const currentOutlet = cloudSession?.outlets.find((outlet) => outlet.id === selectedOutletId);
   const effectivePermissions = cloudMode ? currentOutlet?.permissions ?? [] : systemRolePermissions[demoRole];
+  const syncLabel = cloudMode
+    ? (cloudError
+      ? (online ? "Cloud · sync attention" : "Offline · attention")
+      : (online ? `Cloud · ${pendingCount ? `${pendingCount} pending` : "synced"}` : `Offline · ${pendingCount} queued`))
+    : (online ? "Local demo mode" : "Working offline");
   const canSettleBills = effectivePermissions.includes("bills.settle");
   const canRefundBills = effectivePermissions.includes("bills.refund");
   const canEditMenu = effectivePermissions.includes("menu.edit");
@@ -190,14 +198,33 @@ export default function Home() {
   useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(""), 2800); return () => clearTimeout(t); }, [notice]);
 
   const notify = (text: string) => setNotice(text);
+  const readPendingOrders = async (outletId: string) => {
+    try {
+      const orders = await getPendingOrders(outletId);
+      offlineQueueWarningNotified.current = false;
+      setCloudError((current) => current === offlineQueueReadError ? "" : current);
+      return orders;
+    } catch {
+      setCloudError(offlineQueueReadError);
+      if (!offlineQueueWarningNotified.current) notify(offlineQueueReadError);
+      offlineQueueWarningNotified.current = true;
+      throw new Error(offlineQueueReadError);
+    }
+  };
   const refreshCloudOrders = async (outletId: string) => {
-    const [rawOrders, pendingOrders] = await Promise.all([
+    try {
+      const [rawOrders, pendingOrders] = await Promise.all([
         readJson<Array<Record<string, unknown>>>(`/api/orders?outletId=${encodeURIComponent(outletId)}`),
-      getPendingOrders(outletId),
-    ]);
-    const queued = pendingOrders.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const }));
-    setPendingCount(pendingOrders.length);
-    setData((current) => ({ ...current, orders: [...queued, ...rawOrders.map(mapCloudOrder)] }));
+        readPendingOrders(outletId),
+      ]);
+      const queued = pendingOrders.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const }));
+      setPendingCount(pendingOrders.length);
+      setData((current) => ({ ...current, orders: [...queued, ...rawOrders.map(mapCloudOrder)] }));
+      setCloudError((current) => current === cloudOrdersRefreshError ? "" : current);
+    } catch (error) {
+      if (!(error instanceof Error && error.message === offlineQueueReadError)) setCloudError(cloudOrdersRefreshError);
+      throw error;
+    }
   };
   const loadCloudOutlet = async (outletId: string, permissions: string[]) => {
     if (!outletId) return;
@@ -205,14 +232,18 @@ export default function Home() {
     try {
       const cached = await readCachedMenu(outletId).catch(() => undefined);
       if (offlineOnly && !navigator.onLine) {
-        const pending = await getPendingOrders(outletId).catch(() => []);
-        if (cached?.categories) setData((current) => ({
+        let pending: Awaited<ReturnType<typeof getPendingOrders>> | null = null;
+        try { pending = await readPendingOrders(outletId); } catch { /* The queue warning is visible; cached menu browsing can continue. */ }
+        if (!cached?.categories) setCloudError("This outlet menu is not available in this device's offline cache. Reconnect before taking orders.");
+        setData((current) => ({
           ...current,
-          products: mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>),
-          serviceChargeBps: cached.serviceChargeBps ?? 0, customers: [], shiftOpen: false,
-          orders: pending.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const })),
+          products: cached?.categories ? mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>) : [],
+          serviceChargeBps: cached?.serviceChargeBps ?? 0, customers: [], shiftOpen: false,
+          orders: pending?.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const })) ?? [],
         }));
-        setCloudTables(cached?.tables ?? []); setPendingCount(pending.length); setCloudLoading(false); return;
+        setCloudTables(cached?.tables ?? []);
+        if (pending) setPendingCount(pending.length);
+        setCloudLoading(false); return;
       }
       if (cached?.categories) setData((current) => ({ ...current, products: mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>) }));
       const jobs = await Promise.allSettled([
@@ -257,7 +288,9 @@ export default function Home() {
   };
   const syncPendingOrders = async (outletId: string) => {
     if (!navigator.onLine || !outletId) return;
-    const pending = await getPendingOrders(outletId).catch(() => []);
+    let pending;
+    try { pending = await readPendingOrders(outletId); }
+    catch { return; }
     let synced = 0;
     for (const entry of pending) {
       if (entry.nextAttemptAt && entry.nextAttemptAt > Date.now()) continue;
@@ -278,7 +311,9 @@ export default function Home() {
     await refreshCloudOrders(outletId).catch(() => undefined);
   };
   const retryPendingOrder = async (order: Order) => {
-    const pending = await getPendingOrders(selectedOutletId).catch(() => []);
+    let pending;
+    try { pending = await readPendingOrders(selectedOutletId); }
+    catch { return; }
     const entry = pending.find((item) => item.displayOrder.id === order.id);
     if (!entry) return;
     await updatePendingOrderError(entry.clientMutationId, "", entry.retryCount ?? 0, 0);
@@ -391,8 +426,14 @@ export default function Home() {
       const displayOrder: Order = { id: `OFFLINE-${clientMutationId.slice(0, 6).toUpperCase()}`, items: cart, type: orderType, table: orderType === "Dine in" ? table : "—", total, status: "Preparing", time: new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" }), payment: received === 0 ? "Pending" : received < total ? "Partial" : method, paidAmount: received, customer: "Walk-in", syncState: "queued" };
       try {
         if (!navigator.onLine) throw new TypeError("offline");
-        await readJson("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
-        await refreshCloudOrders(selectedOutletId);
+        const result = await readJson<{ order: Record<string, unknown>; bill?: Record<string, unknown>; kot?: Record<string, unknown> }>("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+        const createdOrder = mapCloudOrder({
+          ...result.order,
+          ...(result.kot?.tableLabel ? { table: { label: result.kot.tableLabel } } : {}),
+          ...(result.bill ? { bill: result.bill } : {}),
+        });
+        setData((current) => ({ ...current, orders: [createdOrder, ...current.orders.filter((order) => order.serverId !== createdOrder.serverId)] }));
+        void refreshCloudOrders(selectedOutletId).catch(() => setCloudError(cloudOrdersRefreshError));
         notify("Order saved to KORA cloud and kitchen ticket created");
       } catch (error) {
         if (!(error instanceof TypeError) && navigator.onLine) { notify(error instanceof Error ? error.message : "Order could not be saved."); setCloudSaving(false); return; }
@@ -573,7 +614,7 @@ export default function Home() {
       </aside>
 
       <section className="main-area">
-        <header className="topbar"><div className="crumbs"><span>Workspace</span><ChevronRight size={13} /><strong>{page === "POS" ? "Point of sale" : page}</strong></div><div className="topbar-actions">{effectivePermissions.includes("shift.open") && <button className={`shift-pill ${data.shiftOpen ? "shift-open" : "shift-closed"}`} onClick={() => { if (data.shiftOpen) { setCashCounted(""); setModal("shift"); } else { setOpeningCash(""); setModal("openShift"); } }}><Clock3 size={13}/>{data.shiftOpen ? "Shift open" : "Open shift"}</button>}<span className={`sync-pill ${online ? "online" : "offline"}`}>{online ? <Wifi size={13} /> : <WifiOff size={13} />}{cloudMode ? (online ? `Cloud · ${pendingCount ? `${pendingCount} pending` : "synced"}` : `Offline · ${pendingCount} queued`) : online ? "Local demo mode" : "Working offline"}</span>{cloudMode ? <button className="secondary-button" onClick={() => setModal("outlet")}>{currentOutlet?.name ?? "Outlet"}</button> : <label className="demo-role-switch"><span className="sr-only">Demo role</span><select aria-label="Demo role" value={demoRole} onChange={(event) => setDemoRole(event.target.value as keyof typeof systemRolePermissions)}>{Object.keys(systemRolePermissions).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></label>} {cloudMode ? null : <button className="secondary-button" onClick={() => setModal("connect")}>Connect cloud</button>}<button className="icon-button notification-button" aria-label="Notifications" onClick={() => notify("You’re all caught up")}><Bell size={17} /><i /></button><span className="top-divider" /><button className="avatar avatar-small avatar-moss" onClick={() => cloudMode ? void disconnectCloud() : setPage("Settings")}>{initials(cloudSession?.user.name ?? "Arjun Sharma")}</button></div></header>
+        <header className="topbar"><div className="crumbs"><span>Workspace</span><ChevronRight size={13} /><strong>{page === "POS" ? "Point of sale" : page}</strong></div><div className="topbar-actions">{effectivePermissions.includes("shift.open") && <button className={`shift-pill ${data.shiftOpen ? "shift-open" : "shift-closed"}`} onClick={() => { if (data.shiftOpen) { setCashCounted(""); setModal("shift"); } else { setOpeningCash(""); setModal("openShift"); } }}><Clock3 size={13}/>{data.shiftOpen ? "Shift open" : "Open shift"}</button>}<span className={`sync-pill ${online ? "online" : "offline"}`}>{online ? <Wifi size={13} /> : <WifiOff size={13} />}{syncLabel}</span>{cloudMode ? <button className="secondary-button" onClick={() => setModal("outlet")}>{currentOutlet?.name ?? "Outlet"}</button> : <label className="demo-role-switch"><span className="sr-only">Demo role</span><select aria-label="Demo role" value={demoRole} onChange={(event) => setDemoRole(event.target.value as keyof typeof systemRolePermissions)}>{Object.keys(systemRolePermissions).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></label>} {cloudMode ? null : <button className="secondary-button" onClick={() => setModal("connect")}>Connect cloud</button>}<button className="icon-button notification-button" aria-label="Notifications" onClick={() => notify("You’re all caught up")}><Bell size={17} /><i /></button><span className="top-divider" /><button className="avatar avatar-small avatar-moss" onClick={() => cloudMode ? void disconnectCloud() : setPage("Settings")}>{initials(cloudSession?.user.name ?? "Arjun Sharma")}</button></div></header>
         <div className="page-content">
           {!canAccessPage(page) ? <div className="empty-state no-access"><ShieldCheck size={25}/><b>You don’t have access to this area</b><span>Ask an owner to assign the required outlet role.</span><button className="secondary-button" onClick={() => setPage("Overview")}>Back to overview</button></div> : <>
           {page === "Overview" && <Overview data={data} todayOrders={todayOrders} todaySales={todaySales} role={cloudMode ? currentOutlet?.role ?? "" : demoRole} canCreateOrders={effectivePermissions.includes("orders.create")} cloudMode={cloudMode} outletName={currentOutlet?.name ?? "Outlet"} pendingCount={pendingCount} cloudLoading={cloudLoading} cloudError={cloudError} canManageTeam={effectivePermissions.includes("staff.manage") || effectivePermissions.includes("roles.manage")} canViewReports={effectivePermissions.includes("reports.view.sales")} onNavigate={setPage} onNotify={notify} />}
