@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { calculateSale, parseRupeesToPaise } from "@/lib/billing";
 import { io } from "socket.io-client";
-import { ApiError, getAccessToken, readJson, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
+import { ApiError, getAccessToken, hasPendingLogout, readJson, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
 import { cacheMenu, cacheOfflineWorkspace, cacheTables, clearOfflineWorkspace, getDeviceId, getPendingOrders, queueOrder, readCachedMenu, readOfflineWorkspace, removePendingOrder, updatePendingOrderError, type CachedDisplayOrder, type CloudOrderPayload } from "@/lib/pos-offline";
 import { systemRolePermissions, type PermissionKey } from "@/lib/permissions";
 import { RoleAdministration } from "@/components/RoleAdministration";
@@ -324,6 +324,11 @@ export default function Home() {
     let active = true;
     const restore = async () => {
       if (!navigator.onLine) {
+        if (hasPendingLogout()) {
+          setCloudError("A previous sign-out is waiting for a network connection. Reconnect before using this outlet.");
+          setModal("connect");
+          return;
+        }
         const cached = await readOfflineWorkspace().catch(() => undefined);
         if (!active || !cached) return;
         demoSnapshot.current = latestData.current;

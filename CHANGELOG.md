@@ -4,6 +4,7 @@
 
 - Replaced hardcoded cloud restaurant settings with an outlet profile editor backed by outlet name, GSTIN, FSSAI license, and structured address fields; server-side `settings.manage` checks, outlet scoping, format validation, and before/after audit logging are covered by a live API integration test.
 - Made accepted cloud POS orders independent of the follow-up list refresh: the API response is shown immediately, refresh failures surface as sync attention, and IndexedDB queue read failures no longer appear as an empty/synced queue.
+- Persisted offline logout intent before network logout, blocked cached workspace restoration while sign-out is pending, and require that pending logout to flush before a new sign-in or restaurant registration.
 - Added a read-only tenant/outlet ownership audit command and separated migration credentials from runtime database credentials.
 - Added standalone web output, production Docker targets for web/realtime/migrations, and GitHub Actions verification.
 - Required Redis for production realtime fan-out and added realtime dependency readiness checks.

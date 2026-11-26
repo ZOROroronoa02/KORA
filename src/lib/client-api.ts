@@ -7,7 +7,8 @@ export type AuthenticatedSession = {
 };
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) { super(message); this.name = "ApiError"; }
+  readonly status: number;
+  constructor(message: string, status: number) { super(message); this.name = "ApiError"; this.status = status; }
 }
 
 // Access tokens deliberately live only in memory. The refresh token stays in the
@@ -15,6 +16,30 @@ export class ApiError extends Error {
 let accessToken: string | null = null;
 let refreshInFlight: Promise<string | null> | null = null;
 const PENDING_LOGOUT_KEY = "kora-cloud-logout-pending";
+
+export function hasPendingLogout() {
+  try { return localStorage.getItem(PENDING_LOGOUT_KEY) === "1"; }
+  catch { return true; }
+}
+
+function markPendingLogout() {
+  try { localStorage.setItem(PENDING_LOGOUT_KEY, "1"); }
+  catch { /* Storage failures are treated as pending by hasPendingLogout when storage is inaccessible. */ }
+}
+
+async function flushPendingLogout() {
+  if (!hasPendingLogout()) return;
+  accessToken = null;
+  let response: Response;
+  try {
+    response = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", cache: "no-store" });
+  } catch {
+    throw new ApiError("A previous sign-out is waiting for a network connection.", 503);
+  }
+  if (!response.ok) throw new ApiError("A previous sign-out could not be confirmed. Connect and try again.", response.status);
+  try { localStorage.removeItem(PENDING_LOGOUT_KEY); }
+  catch { throw new ApiError("Could not clear the pending sign-out state. Enable browser storage and try again.", 503); }
+}
 
 async function refreshAccessToken() {
   if (!refreshInFlight) {
@@ -50,6 +75,7 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
 }
 
 export async function signIn(input: { tenantSlug: string; email: string; password: string }) {
+  await flushPendingLogout();
   const response = await fetch("/api/auth/login", {
     method: "POST", credentials: "same-origin", cache: "no-store",
     headers: { "content-type": "application/json" }, body: JSON.stringify(input),
@@ -61,6 +87,7 @@ export async function signIn(input: { tenantSlug: string; email: string; passwor
 }
 
 export async function registerRestaurant(input: { tenantName: string; outletName: string; name: string; email: string; password: string }) {
+  await flushPendingLogout();
   const response = await fetch("/api/auth/register", {
     method: "POST", credentials: "same-origin", cache: "no-store",
     headers: { "content-type": "application/json" }, body: JSON.stringify(input),
@@ -78,11 +105,9 @@ export async function readSession() {
 }
 
 export async function restoreSession() {
-  if (localStorage.getItem(PENDING_LOGOUT_KEY) === "1") {
-    try {
-      const response = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", cache: "no-store" });
-      if (response.ok) localStorage.removeItem(PENDING_LOGOUT_KEY);
-    } catch { return null; }
+  if (hasPendingLogout()) {
+    try { await flushPendingLogout(); }
+    catch { accessToken = null; return null; }
     accessToken = null;
     return null;
   }
@@ -93,11 +118,12 @@ export async function restoreSession() {
 }
 
 export async function signOut() {
-  try {
-    const response = await apiFetch("/api/auth/logout", { method: "POST" });
-    if (response.ok) localStorage.removeItem(PENDING_LOGOUT_KEY);
-    else localStorage.setItem(PENDING_LOGOUT_KEY, "1");
-  } catch { localStorage.setItem(PENDING_LOGOUT_KEY, "1"); }
+  // Persist the local sign-out intent before the network call. Keep this latch
+  // until a later online restore or sign-in confirms server logout; offline
+  // workspace restore must never resurrect a signed-out user.
+  markPendingLogout();
+  try { await apiFetch("/api/auth/logout", { method: "POST" }); }
+  catch { /* The durable latch causes a later online session to retry logout. */ }
   finally { accessToken = null; }
 }
 
