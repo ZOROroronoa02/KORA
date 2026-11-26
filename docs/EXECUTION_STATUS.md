@@ -1,42 +1,49 @@
 # KORA implementation status
 
-This document records verified implementation state for continuing the KORA build. It is not a production-readiness claim.
+Updated: 2026-11-27. This records locally verified work; it is not a production-readiness claim.
 
-## Completed in the current work session
+## Verified implementation
 
-- Added architecture, implementation, database, API, security, offline sync, deployment, and testing design documents under `docs/`.
-- Initialized the local Git repository; no commits have been made.
-- Added strict rupee-to-paise parsing and order state transition helpers, with unit tests.
-- Hardened order creation with tenant/outlet/table validation, idempotency replay, serializable transaction handling, and cash-shift checks.
-- Hardened order status, KOT, transfer, void, and shift APIs with conditional updates and transactional audit records.
-- Added register-time starter categories, tables, and sample menu data; removed shared default seed credentials.
-- Added bounded JSON request parsing to selected API routes.
-- Added liveness/readiness endpoints; readiness checks PostgreSQL and production Redis.
-- Updated local demo UI to clearly identify demo/offline mode, use paise-safe payment inputs, persist before confirming, and surface browser storage errors.
-- Regenerated Prisma Client after finding a stale generated model broke `Shift.activeKey`; verified the isolated database schema has no drift from `schema.prisma`.
-- Added authenticated client session handling: access token memory only, refresh cookie session restoration, registration/sign-in/sign-out, and outlet selection.
-- Connected cloud POS menu, table occupancy, order list/create, payment collection, shift open/close, customer create/link, menu availability/create, table transfer, and KOT transitions.
-- Added a Dexie IndexedDB menu cache and order outbox with stable idempotency IDs, sequential replay, bounded retry backoff, conflict retention, and manual retry.
-- Added authenticated Socket.IO event listeners with a polling recovery path.
-- Fixed guest metrics so profile creation does not count as a visit; completed idempotent orders update visit/spend once.
-- Added a PostgreSQL-backed end-to-end API flow covering account setup/login, menu/tables, shift, order replay, payment replay, KOT, transfer, availability, guest metrics, and reconciliation.
+- Next.js App Router app, PostgreSQL/Prisma schema and migrations, Socket.IO realtime service, RBAC, online POS flows, and IndexedDB order outbox are present.
+- Tenant/outlet query scope wraps protected API routes. PostgreSQL triggers validate tenant/outlet ownership for related writes and block ownership-key reassignment.
+- `npm run db:audit-tenant-ownership` is a read-only historical-data scan. It reported zero mismatches in the current local database.
+- Runtime and migration database URLs are separated in Prisma CLI configuration. CI provisions a non-owner runtime role and verifies it cannot disable tenant triggers.
+- GitHub Actions CI and production Docker targets for web, realtime, and one-shot migrations are configured.
+- Billing amounts use integer paise. Server-side payment recording rejects amounts above the unpaid bill balance.
+- GST and service-charge rates now use `BigInt` basis-point arithmetic; a near-safe-integer regression test proves exact paise rounding.
+- Realtime production startup now fails closed without Redis; `/health/ready` checks PostgreSQL and Redis while `/health/live` stays independent for liveness probes.
+- Invoice numbers now use `prefix-FYyyyy-yy-sequence`, allocated under the serializable order transaction. On first use in a financial year, the allocator continues from the highest existing invoice suffix issued within that year.
+- SQL migration history includes `20261127153000_invoice_financial_year_sequence` after the tenant ownership guard migration.
+- Local preview is available at `http://localhost:3000`; `/api/health/live` returned 200.
 
-## Verified checks
+## Latest verification
 
-- TypeScript check passes after the cloud integration edits.
-- `npx prisma validate` passes when `DATABASE_URL` is set; the isolated PostgreSQL schema matches the Prisma model.
-- Static billing/security suite and opt-in PostgreSQL/realtime integration tests pass individually; the latest full run exposed a serializable order conflict, now addressed with bounded transaction retries. Full rerun is required.
-- Browser automation could not initialize in this environment (`trusted Node process exited unexpectedly`); rendered browser QA remains unverified.
-- Production migration history, CI/CD, deployment rollback, monitoring, and physical ESC/POS testing remain unverified or missing.
+- `npm run typecheck`: passed after the money and realtime readiness changes.
+- `npx prisma validate`: passed.
+- `npx prisma migrate status`: all five migrations applied locally.
+- `npm run build`: passed after the current schema and API updates.
+- Full live unit/API/PostgreSQL/realtime suite: 48 passed, 0 failed, 0 skipped. The direct tenant-ownership suite also passed against the final migration.
+- Production realtime startup test: missing Redis causes the process to fail closed. The local dev server reports liveness and readiness healthy with PostgreSQL; Redis is optional in local single-instance mode.
+- Rendered 390px check: the top-bar controls now fit; a cashier can add a menu item and sees ₹180 + ₹9 GST = ₹189. Cart settlement is below the menu and requires a scroll. A Next.js dev overlay reported one `unhandledRejection: undefined` once, cleared after reload, and did not recur; its cause remains unverified.
+- Git commits for the current security work: `c75eb1d`, `90d9842`, `a9abe8b`.
 
-## Remaining work — do not mark complete
+## Production blockers
 
-1. Complete the full test rerun and production build, then restore the local preview.
-2. Create and verify a reviewed initial PostgreSQL migration; `db push` is currently development-only.
-3. Audit/fix cross-tenant composite reference constraints and remaining API authorization gaps.
-4. Add offline tests for browser reload, replay, conflict repair, duplicate tabs, and connectivity transitions; complete rendered accessibility/mobile QA.
-5. Finish incremental KOT additions, void/refund approval, split-bill settlement, menu variants/add-ons, and printer flows.
-6. Implement inventory/recipes/purchasing, reporting/GST export, customer loyalty, subscriptions, aggregator adapters, and owner multi-outlet command center.
-7. Complete deployment/rollback, monitoring, backup/restore, and acceptance checklist.
+1. Production data has not yet been scanned with `npm run db:audit-tenant-ownership`; the local zero-mismatch result does not say anything about customer production data.
+2. CI and production container targets exist, but the workflow has not yet run on GitHub and no production deployment manifest exists. Runtime and migration role separation still needs staging verification. Docker was unavailable on the local host.
+3. Backups, restore, rollback, observability, TLS, trusted-edge HMAC, and production Redis behavior need staging verification.
+4. Cloud UI coverage is partial. POS actions such as refunds/reversals, split-bill settlement, full menu variants/add-ons, and several admin workflows remain incomplete.
+5. Offline cloud mode queues order creation only. Payment, KOT, conflict recovery, and printer queues are not fully offline-first or validated through browser restart/quota failures.
+6. Inventory/recipes/purchasing, reporting/GST exports, subscription plan gating, aggregator operations, and owner multi-outlet analytics are incomplete.
+7. Rendered browser/accessibility/device QA and physical ESC/POS printer testing remain outstanding.
+8. Tax prices are intended to be exclusive and multiple GST profiles are required, but the profile model and regime-specific rules are not implemented.
 
-Production launch remains blocked until the remaining work is completed and verified in a configured PostgreSQL/Redis deployment environment.
+## Next engineering order
+
+1. Run the historical ownership scan on a production-like data clone and verify the restricted runtime PostgreSQL role.
+2. Run the GitHub CI workflow and build all three Docker targets in a clean Linux environment.
+3. Finish tax-profile rules and document the accounting assumptions before changing invoice calculations.
+4. Close POS settlement/refund and offline recovery gaps, then continue operations/reporting modules.
+5. Complete staging, browser/accessibility, printer, load, backup/restore and incident rollback acceptance.
+
+KORA remains in active development and must not be represented as production-ready until these blockers are completed and verified in the target deployment environment.

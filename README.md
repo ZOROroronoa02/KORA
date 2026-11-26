@@ -16,11 +16,11 @@ To run PostgreSQL and Redis locally, copy `.env.example` to `.env`, then run:
 ```powershell
 docker compose up -d
 npm run db:generate
-npx prisma db push
+npm run db:migrate:deploy
 npm run db:seed
 ```
 
-The seed creates a demo tenant/outlet, Owner/Manager/Cashier/Waiter/Kitchen roles, permissions, ten tables, five menu categories, and ten Indian menu items. Set `SEED_OWNER_EMAIL` and `SEED_OWNER_PASSWORD` before seeding if you need a demo login; the seed refuses to use shared default credentials. This repository still has no committed migration history: `db push` is for local development only, and production deployment remains blocked on reviewed migrations.
+The seed creates a demo tenant/outlet, Owner/Manager/Cashier/Waiter/Kitchen roles, permissions, ten tables, five menu categories, and ten Indian menu items. Set `SEED_OWNER_EMAIL` and `SEED_OWNER_PASSWORD` before seeding if you need a demo login; the seed refuses to use shared default credentials. SQL migrations are committed under `prisma/migrations`; production uses `prisma migrate deploy`, never `db push`.
 
 ## What works
 
@@ -31,18 +31,18 @@ The seed creates a demo tenant/outlet, Owner/Manager/Cashier/Waiter/Kitchen role
 
 ## Architecture and production integration
 
-The Prisma schema covers tenant/outlet ownership, users and RBAC, menu/pricing, orders/KOTs/bills/payments, shift and audit records, offline sync mutations, customers/loyalty/feedback, inventory/recipes/purchases/wastage, and coupons. Monetary values are stored as integer paise. The browser is connected to core cloud endpoints; inventory, recipes, purchasing, reports, subscriptions, aggregator integrations, and several settings screens are still prototype surfaces. The offline workspace hint is not an authorization credential: the server revalidates every queued order after reconnection. Offline orders are repriced by the server at sync time, so staff must resolve changed-price conflicts before settlement. Production rollout still needs committed SQL migrations, deployment/rollback automation, hardware printer validation, and invoice-series review for offline terminals.
+The Prisma schema covers tenant/outlet ownership, users and RBAC, menu/pricing, orders/KOTs/bills/payments, shift and audit records, offline sync mutations, customers/loyalty/feedback, inventory/recipes/purchases/wastage, and coupons. Monetary values are stored as integer paise. GST and service-charge rounding use integer arithmetic. The browser is connected to core cloud endpoints; inventory, recipes, purchasing, reports, subscriptions, aggregator integrations, and several settings screens are still incomplete. The offline workspace hint is not an authorization credential: the server revalidates every queued order after reconnection. Offline orders are repriced by the server at sync time, so staff must resolve changed-price conflicts before settlement. GitHub Actions CI and web/realtime/migrator Docker targets are configured but have not yet been run in GitHub or a clean Linux Docker host. Production rollout still needs deployment/rollback automation, backup/restore verification, hardware printer validation, and invoice-series review for offline terminals.
 
 ## API and realtime services
 
-Configure `DATABASE_URL`, a fresh 32-byte base64url `JWT_ACCESS_SECRET`, `KORA_APP_ORIGIN`, and `KORA_PROXY_SHARED_SECRET` in `.env`. Production also requires Redis and a trusted edge that signs the client IP headers as described in `docs/DEPLOYMENT.md`. Refresh tokens are random opaque tokens stored as hashes, so no refresh-token signing secret is used. Redis is optional for local development; API auth throttling uses an in-memory fallback, while realtime fan-out uses Redis when configured.
+Configure `DATABASE_URL` with a restricted runtime database account, `MIGRATION_DATABASE_URL` only in the deploy job, a fresh 32-byte base64url `JWT_ACCESS_SECRET`, `KORA_APP_ORIGIN`, and `KORA_PROXY_SHARED_SECRET` in the appropriate secret stores. Production also requires Redis and a trusted edge that signs the client IP headers as described in `docs/DEPLOYMENT.md`. Refresh tokens are random opaque tokens stored as hashes, so no refresh-token signing secret is used. Redis is optional for local development; production auth throttling and realtime fan-out require shared Redis.
 
 ```powershell
 npm run dev
 npm run realtime:dev
 ```
 
-The API surface includes register/login/refresh/logout/me, outlet-scoped menu/orders/payments/KOT/table transfer, shifts, customers, inventory reads, and bill splitting. Configure the same access-token secret for the Next.js app and realtime service. Use `/api/health` and `http://localhost:4000/health` for process health; neither endpoint proves database connectivity.
+The API surface includes register/login/refresh/logout/me, outlet-scoped menu/orders/payments/KOT/table transfer, shifts, customers, inventory reads, and bill splitting. Configure the same access-token secret for the Next.js app and realtime service. Use `/api/health/live` and `/health/live` for process liveness, and `/api/health/ready` and `/health/ready` for dependency readiness. Production realtime startup requires Redis; its readiness check verifies PostgreSQL and Redis fan-out connectivity.
 
 ## Checks
 
@@ -50,7 +50,8 @@ The API surface includes register/login/refresh/logout/me, outlet-scoped menu/or
 npm run lint
 npm test
 npm run build
+npm run db:audit-tenant-ownership
 $env:DATABASE_URL='postgresql://postgres:postgres@localhost:5432/kora?schema=public'; npx prisma validate
 ```
 
-To enable PostgreSQL API tests, also set `KORA_SECURITY_TEST_URL=http://localhost:3000` and `KORA_SECURITY_TEST_REALTIME_URL=http://localhost:4000` in the same shell before `npm test`. Without these values, database and Socket.IO integration tests are reported as skipped. The isolated development run covers auth, outlet isolation, idempotent orders/payments, KOT transitions, table transfer, menu availability, customer metrics, and shift reconciliation. A rendered browser QA pass and physical ESC/POS printer test are still outstanding.
+To enable PostgreSQL API tests, also set `KORA_SECURITY_TEST_URL=http://localhost:3000` and `KORA_SECURITY_TEST_REALTIME_URL=http://localhost:4000` in the same shell before `npm test`. Without these values, database and Socket.IO integration tests are reported as skipped. The integration suite covers auth, cross-tenant/outlet isolation, database ownership triggers, idempotent orders/payments, KOT transitions, table transfer, menu availability, customer metrics, bill splits, and shift reconciliation. The `lint` script currently runs TypeScript checking only; it is not a separate ESLint pass. A rendered browser QA pass and physical ESC/POS printer test are still outstanding.

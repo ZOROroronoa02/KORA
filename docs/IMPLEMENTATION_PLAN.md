@@ -4,12 +4,13 @@ Status: active. `[x]` means implemented and locally verified; `[~]` means partia
 
 ## Milestone 1 — stabilize the foundation
 
-- [ ] Enforce cross-tenant/outlet reference ownership and database constraints.
+- [x] Enforce cross-tenant/outlet reference ownership and database constraints.
 - [x] Guard order/KOT transitions against invalid or concurrent changes.
 - [x] Make idempotent retries return the original committed order.
-- [ ] Keep all payment input and aggregation in integer paise; add reversal ledger.
+- [~] Keep payment input and aggregation in integer paise; payment reversals/refunds still need an immutable reversal ledger.
+- [x] Use exact `BigInt` rounding for GST/service charge and allocate outlet invoices by Indian financial year.
 - [x] Link cash payments to cashier shifts; make open/close transactional and exclusive.
-- [ ] Commit an initial migration and add PostgreSQL integration/concurrency tests.
+- [x] Commit SQL migrations and PostgreSQL integration/concurrency tests.
 
 ## Milestone 2 — make the SaaS real
 
@@ -37,11 +38,12 @@ Status: active. `[x]` means implemented and locally verified; `[~]` means partia
 ## Milestone 6 — production quality
 
 - [ ] Complete accessibility/mobile testing, printers and external adapters.
-- [ ] Add CI, migrations deploy, observability, backups/restore and rollback.
+- [~] Add CI and migrations deploy; GitHub execution, production deployment, observability, backups/restore and rollback still need verification.
 - [ ] Run staging acceptance, security, load and launch checks.
 
 ## Current verified baseline
 
-- [x] TypeScript typecheck, 13 existing billing/security unit tests, Next production build and Prisma schema validation passed in the local environment.
+- [x] TypeScript typecheck, Prisma validation, migration status, and Next production build passed locally.
+- [x] Full live PostgreSQL/realtime suite passed 48/48; the tenant-ownership migration and direct-write adversarial checks passed.
 - [~] Browser demo order/payment/KOT/menu/shift flows were exercised previously; they are not proof of cloud persistence.
-- [ ] PostgreSQL-backed integration/concurrency tests are blocked until a database service is available.
+- [~] `npm run db:audit-tenant-ownership` found no mismatches in the current local database; production data still needs the same scan before migration rollout.

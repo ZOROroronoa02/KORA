@@ -65,4 +65,4 @@ This is an execution checklist, not evidence that the cases have passed. Run aga
 
 ## Current execution status
 
-The workspace process runner is failing before command startup in this continuation, so none of these newly listed cases has been run here. Previously reported typecheck and build passes apply only to the revisions stated in `docs/EXECUTION_STATUS.md`; rerun after the latest edits before accepting a release.
+As of 2026-11-27, the current local checkout passed TypeScript checking, production build, Prisma validation, and the live `npm test` suite (48 passed, 0 failed, 0 skipped). The suite exercised PostgreSQL-backed API/security and Socket.IO scenarios against the configured local services, including financial-year invoice IDs and dependency readiness. A rendered 390px browser pass confirmed the mobile header fits and the cashier cart totals are correct; the cart remains below the menu, so settlement requires scrolling. This does not cover the complete browser/device matrix above. Docker is unavailable on the local host, so production image builds and GitHub Actions have not been verified. See `docs/EXECUTION_STATUS.md` for exact release blockers.
