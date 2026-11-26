@@ -11,6 +11,8 @@ npm run dev
 
 Open `http://localhost:3000`. The local demo works without a database. Use **Connect cloud** to sign in or create a restaurant account when PostgreSQL and a JWT secret are configured.
 
+For a production-mode smoke check, run `npm run build` and then `npm run start`. The start script launches Next.js's generated standalone server, matching the repository's `output: "standalone"` configuration.
+
 To run PostgreSQL and Redis locally, copy `.env.example` to `.env`, then run:
 
 ```powershell
