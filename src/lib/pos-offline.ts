@@ -97,7 +97,8 @@ export async function removePendingOrder(clientMutationId: string) {
 }
 
 export async function updatePendingOrderError(clientMutationId: string, lastError: string, retryCount = 0, nextAttemptAt = 0) {
-  await database.pendingOrders.update(clientMutationId, { lastError, retryCount, nextAttemptAt });
+  const updated = await database.pendingOrders.update(clientMutationId, { lastError, retryCount, nextAttemptAt });
+  if (updated !== 1) throw new Error("The queued order sync state could not be saved because the order is missing.");
 }
 
 export async function cacheMenu(outletId: string, categories: unknown[]) {

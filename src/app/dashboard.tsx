@@ -134,6 +134,7 @@ const navItems: { label: Page; icon: typeof House; group: string }[] = [
 const initials = (s: string) => s.split(" ").map((p) => p[0]).slice(0, 2).join("").toUpperCase();
 const offlineQueueReadError = "Offline orders could not be read from this device. Keep this browser profile and retry; do not clear site storage.";
 const cloudOrdersRefreshError = "Cloud orders could not be refreshed. Check the connection; saved orders remain on the server or this device.";
+const offlineSyncStateWriteError = "KORA could not save an order's sync status on this device. Keep this browser data and review the queued order before retrying.";
 
 export default function Home() {
   const [data, setData] = useState<AppData>(seed);
@@ -151,6 +152,7 @@ export default function Home() {
   const [pendingCount, setPendingCount] = useState(0);
   const [cloudError, setCloudError] = useState("");
   const syncInFlight = useRef(new Set<string>());
+  const syncStateWriteBlocked = useRef(new Set<string>());
   const [offlinePermissionExpiresAt, setOfflinePermissionExpiresAt] = useState<number | null>(null);
   const [invoiceDocument, setInvoiceDocument] = useState<InvoicePrintData | null>(null);
   const [offlinePrint, setOfflinePrint] = useState<{ order: Order; mode: "receipt" | "kot" } | null>(null);
@@ -272,7 +274,7 @@ export default function Home() {
         readJson<Array<Record<string, unknown>>>(`/api/orders?outletId=${encodeURIComponent(outletId)}`),
         readPendingOrders(outletId),
       ]);
-      const queued = pendingOrders.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const }));
+      const queued = pendingOrders.map((item) => ({ ...item.displayOrder, syncState: item.lastError || syncStateWriteBlocked.current.has(item.clientMutationId) ? "needs-attention" as const : "queued" as const }));
       setPendingCount(pendingOrders.length);
       setData((current) => ({ ...current, orders: [...queued, ...rawOrders.map(mapCloudOrder)] }));
       setCloudError((current) => current === cloudOrdersRefreshError ? "" : current);
@@ -297,7 +299,7 @@ export default function Home() {
           ...current,
           products: cached?.categories ? mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>) : [],
           serviceChargeBps: cached?.serviceChargeBps ?? 0, customers: [], shiftOpen: cachedCashShiftOpen, cashOpen: 0,
-          orders: pending?.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const })) ?? [],
+          orders: pending?.map((item) => ({ ...item.displayOrder, syncState: item.lastError || syncStateWriteBlocked.current.has(item.clientMutationId) ? "needs-attention" as const : "queued" as const })) ?? [],
         }));
         setCloudTables(cached?.tables ?? []);
         if (pending) setPendingCount(pending.length);
@@ -354,25 +356,40 @@ export default function Home() {
       try { pending = await readPendingOrders(outletId); }
       catch { return; }
       let synced = 0;
+      let syncStateWriteFailed = false;
       for (const entry of pending) {
+        if (syncStateWriteBlocked.current.has(entry.clientMutationId)) break;
         // Preserve queue order when an earlier command is waiting for backoff
         // or operator review. A later sale must not leapfrog it.
         if (entry.nextAttemptAt && entry.nextAttemptAt > Date.now()) break;
         try {
           await readJson("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(entry.payload) });
+          syncStateWriteBlocked.current.delete(entry.clientMutationId);
           await removePendingOrder(entry.clientMutationId); synced++;
         } catch (error) {
           const message = error instanceof Error ? error.message : "Sync failed.";
           const permanent = error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
           const retryCount = (entry.retryCount ?? 0) + 1;
           const nextAttemptAt = permanent ? Number.MAX_SAFE_INTEGER : Date.now() + Math.min(300000, 2000 * (2 ** Math.min(retryCount - 1, 7)));
-          await updatePendingOrderError(entry.clientMutationId, message, retryCount, nextAttemptAt).catch(() => undefined);
+          try {
+            await updatePendingOrderError(entry.clientMutationId, message, retryCount, nextAttemptAt);
+          } catch {
+            syncStateWriteBlocked.current.add(entry.clientMutationId);
+            syncStateWriteFailed = true;
+            setData((current) => ({ ...current, orders: current.orders.map((order) => order.id === entry.displayOrder.id ? { ...order, syncState: "needs-attention" } : order) }));
+            setCloudError(offlineSyncStateWriteError);
+            notify(`${entry.displayOrder.id}: ${offlineSyncStateWriteError}`);
+            break;
+          }
           if (permanent) notify(`Offline order ${entry.displayOrder.id} needs attention: ${message}`);
           break;
         }
       }
       if (synced) notify(`${synced} offline ${synced === 1 ? "order" : "orders"} synced`);
-      await refreshCloudOrders(outletId).catch(() => undefined);
+      if (!syncStateWriteFailed) {
+        await refreshCloudOrders(outletId).catch(() => undefined);
+        if (synced) setCloudError((current) => current === offlineSyncStateWriteError ? "" : current);
+      }
     } finally {
       syncInFlight.current.delete(outletId);
     }
@@ -383,7 +400,15 @@ export default function Home() {
     catch { return; }
     const entry = pending.find((item) => item.displayOrder.id === order.id);
     if (!entry) return;
-    await updatePendingOrderError(entry.clientMutationId, "", entry.retryCount ?? 0, 0);
+    syncStateWriteBlocked.current.delete(entry.clientMutationId);
+    try {
+      await updatePendingOrderError(entry.clientMutationId, "", entry.retryCount ?? 0, 0);
+    } catch {
+      syncStateWriteBlocked.current.add(entry.clientMutationId);
+      setCloudError(offlineSyncStateWriteError);
+      notify(`${entry.displayOrder.id}: ${offlineSyncStateWriteError}`);
+      return;
+    }
     await syncPendingOrders(selectedOutletId);
   };
 
