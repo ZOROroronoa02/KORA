@@ -5,7 +5,8 @@ import { Activity, BellRing, Check, ChevronDown, Clock3, Flame, Maximize, Pause,
 import { ApiError, apiFetch, getAccessToken, readJson, restoreSession, type AuthenticatedSession } from "@/lib/client-api";
 import { connectKoraRealtime } from "@/lib/realtime-client";
 import { aggregateKdsTicketState, nextKdsItemState, slaBand, slaElapsedSeconds, type KdsItemState } from "@/lib/domain/kds";
-import { cacheKdsTickets, cacheOfflineWorkspace, getPendingKdsActions, queueKdsAction, readKdsTickets, readOfflineWorkspace, removeKdsAction, updateKdsActionError, type PendingKdsAction } from "@/lib/pos-offline";
+import { reconcileKdsActionQueue } from "@/lib/domain/kds-sync";
+import { cacheKdsTickets, cacheOfflineWorkspace, getPendingKdsActions, queueKdsAction, readKdsTickets, readOfflineWorkspace, removeKdsAction, updateKdsActionError, updateKdsActionVersion, type PendingKdsAction } from "@/lib/pos-offline";
 import { allPermissionKeys } from "@/lib/permissions";
 import { hasFreshOfflinePermissionSnapshot, offlinePermissionsForSnapshot } from "@/lib/offline-permissions";
 import css from "./KdsBoard.module.css";
@@ -22,12 +23,14 @@ type Station = { id: string; name: string; sortOrder: number };
 type KdsSettings = { slaMinutesPerOrderType: Record<string, number>; kdsSoundEnabled: boolean; kdsColumnsByStation: Record<string, unknown> };
 type KdsSnapshot = { outlet: { id: string; name: string }; stations: Station[]; tickets: Ticket[]; settings: KdsSettings; serverTimestamp: string };
 type KdsFilter = "ALL" | "DINE_IN" | "TAKEAWAY" | "DELIVERY" | "RUSH";
+type KdsQueueError = { kind: "read" | "enqueue" | "status" | "snapshot"; message: string };
 type Metrics = { sampleSize: number; capped: boolean; stations: Array<{ station: string; tickets: number; avgPrepSeconds: number | null; avgHandoffSeconds: number | null; slaBreaches: number }>; items: Array<{ item: string; tickets: number; avgPrepSeconds: number | null }>; hourly: Array<{ hour: number; tickets: number }> };
 
 const filters: Array<{ id: KdsFilter; label: string }> = [
   { id: "ALL", label: "All tickets" }, { id: "DINE_IN", label: "Dine-in" }, { id: "TAKEAWAY", label: "Takeaway" }, { id: "DELIVERY", label: "Delivery" }, { id: "RUSH", label: "Rush" },
 ];
 const defaultKdsColumns: KdsLaneState[] = ["QUEUED", "PREPARING", "READY"];
+const kdsQueueStatusError = "KORA could not save a kitchen action's sync status. Keep this browser data and review the queued action before retrying.";
 const kdsLaneLabels: Record<string, string> = { QUEUED: "QUEUED", PREPARING: "PREPARING", READY: "READY TO SERVE" };
 function configuredKdsColumns(settings: KdsSettings | null, stationKey: string): KdsLaneState[] {
   const byStation = settings?.kdsColumnsByStation ?? {};
@@ -118,6 +121,7 @@ export default function KdsBoard() {
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState("");
+  const [queueError, setQueueError] = useState<KdsQueueError | null>(null);
   const [notice, setNotice] = useState("");
   const [pendingActions, setPendingActions] = useState<PendingKdsAction[]>([]);
   const [selectedTicketId, setSelectedTicketId] = useState("");
@@ -138,6 +142,10 @@ export default function KdsBoard() {
   const [clock, setClock] = useState<Date | null>(null);
   const [visibleCount, setVisibleCount] = useState(100);
   const socketRef = useRef<ReturnType<typeof connectKoraRealtime> | null>(null);
+  const queueStateWriteBlocked = useRef(new Set<string>());
+  const reloadSequence = useRef(0);
+  const activeOutletId = useRef(outletId);
+  activeOutletId.current = outletId;
   const soundConfigured = useRef(false);
   const recallActionRef = useRef<() => Promise<void>>(async () => undefined);
   const reloadRef = useRef<() => Promise<void>>(async () => undefined);
@@ -179,8 +187,18 @@ export default function KdsBoard() {
   }, []);
 
   const reload = useCallback(async () => {
+    const sequence = ++reloadSequence.current;
+    const isCurrent = () => sequence === reloadSequence.current && activeOutletId.current === outletId;
     if (!outletId || !navigator.onLine || !getAccessToken()) {
-      const cached = outletId ? await readKdsTickets(outletId).catch(() => undefined) : undefined;
+      let cached: Awaited<ReturnType<typeof readKdsTickets>>;
+      try { cached = outletId ? await readKdsTickets(outletId) : undefined; }
+      catch {
+        if (!isCurrent()) return;
+        setQueueError({ kind: "snapshot", message: "Saved kitchen tickets could not be read from this device. Keep this browser profile and retry; do not clear site storage." });
+        setLoading(false);
+        return;
+      }
+      if (!isCurrent()) return;
       if (cached && Date.now() - cached.savedAt <= 24 * 60 * 60_000) {
         setTickets(cached.tickets as Ticket[]);
         if (cached.stations && cached.settings && cached.outlet) setSnapshot({ tickets: cached.tickets as Ticket[], stations: cached.stations as Station[], settings: cached.settings as KdsSettings, outlet: cached.outlet as KdsSnapshot["outlet"], serverTimestamp: new Date(cached.savedAt).toISOString() });
@@ -190,19 +208,36 @@ export default function KdsBoard() {
     }
     try {
       const value = await readJson<KdsSnapshot>(`/api/kds?outletId=${encodeURIComponent(outletId)}`);
+      if (!isCurrent()) return;
       setSnapshot(value);
       setTickets(value.tickets);
       setError("");
       if (!soundConfigured.current) { soundConfigured.current = true; setSoundEnabled(value.settings.kdsSoundEnabled); }
-      await cacheKdsTickets(outletId, value.tickets, { stations: value.stations, settings: value.settings, outlet: value.outlet }).catch(() => undefined);
+      try {
+        await cacheKdsTickets(outletId, value.tickets, { stations: value.stations, settings: value.settings, outlet: value.outlet });
+        if (!isCurrent()) return;
+        setQueueError((current) => current?.kind === "snapshot" ? null : current);
+      } catch {
+        if (!isCurrent()) return;
+        setQueueError({ kind: "snapshot", message: "Kitchen tickets loaded, but this device could not refresh the offline ticket cache." });
+      }
     } catch (loadError) {
-      const cached = await readKdsTickets(outletId).catch(() => undefined);
+      if (!isCurrent()) return;
+      let cached: Awaited<ReturnType<typeof readKdsTickets>>;
+      try { cached = await readKdsTickets(outletId); }
+      catch {
+        if (!isCurrent()) return;
+        setQueueError({ kind: "snapshot", message: "Saved kitchen tickets could not be read from this device. Keep this browser profile and retry; do not clear site storage." });
+        setError(loadError instanceof Error ? loadError.message : "Kitchen tickets could not be loaded.");
+        return;
+      }
+      if (!isCurrent()) return;
       if (cached && Date.now() - cached.savedAt <= 24 * 60 * 60_000) {
         setTickets(cached.tickets as Ticket[]);
         if (cached.stations && cached.settings && cached.outlet) setSnapshot({ tickets: cached.tickets as Ticket[], stations: cached.stations as Station[], settings: cached.settings as KdsSettings, outlet: cached.outlet as KdsSnapshot["outlet"], serverTimestamp: new Date(cached.savedAt).toISOString() });
       }
       else setError(loadError instanceof Error ? loadError.message : "Kitchen tickets could not be loaded.");
-    } finally { setLoading(false); }
+    } finally { if (isCurrent()) setLoading(false); }
   }, [outletId, stationId]);
   useEffect(() => { reloadRef.current = reload; }, [reload]);
 
@@ -213,7 +248,14 @@ export default function KdsBoard() {
     };
     const queueOffline = !navigator.onLine || !socketConnected;
     if (queueOffline) {
-      await queueKdsAction(mutation);
+      try { await queueKdsAction(mutation); }
+      catch {
+        const message = "Kitchen action was not queued on this device. No ticket change was applied; free device storage and retry.";
+        setQueueError({ kind: "enqueue", message });
+        notify(message);
+        return;
+      }
+      setQueueError((current) => current?.kind === "enqueue" ? null : current);
       setPendingActions((current) => [...current.filter((entry) => entry.clientMutationId !== mutation.clientMutationId), mutation]);
       setTickets((current) => {
         const next = current.map((entry) => {
@@ -221,7 +263,9 @@ export default function KdsBoard() {
           const updatedItems = item && (action === "item-cycle" || action === "item-86") ? entry.items.map((line) => line.id === item.id ? { ...line, state: action === "item-86" ? "OUT_OF_STOCK" as const : (nextKdsItemState(line.state) ?? line.state), updatedAt: new Date().toISOString() } : line) : action === "start-all" ? entry.items.map((line) => line.state === "QUEUED" ? { ...line, state: "COOKING" as const, updatedAt: new Date().toISOString() } : line) : action === "bump-ticket" ? entry.items.map((line) => line.state === "READY" ? { ...line, state: "BUMPED" as const, updatedAt: new Date().toISOString() } : line) : action === "undo-bump" || action === "recall" ? entry.items.map((line) => line.state === "BUMPED" ? { ...line, state: "READY" as const, updatedAt: new Date().toISOString() } : line) : entry.items;
           return { ...entry, items: updatedItems, heldAt: action === "hold" ? new Date().toISOString() : action === "resume" ? null : entry.heldAt, holdReason: action === "hold" ? reason ?? null : action === "resume" ? null : entry.holdReason, status: aggregateKdsTicketState(updatedItems.map((line) => line.state)), servedAt: action === "bump-ticket" ? new Date().toISOString() : action === "undo-bump" || action === "recall" ? null : entry.servedAt };
         });
-        void cacheKdsTickets(outletId, next);
+        void cacheKdsTickets(outletId, next).then(() => {
+          setQueueError((error) => error?.kind === "snapshot" ? null : error);
+        }).catch(() => setQueueError({ kind: "snapshot", message: "Kitchen action is queued, but the updated ticket snapshot could not be saved for offline use." }));
         return next;
       });
       if (action === "bump-ticket") { setUndoTicketId(ticket.id); setUndoTicketData(ticket); window.setTimeout(() => { setUndoTicketId(""); setUndoTicketData(null); }, 5_000); }
@@ -242,33 +286,42 @@ export default function KdsBoard() {
 
   const flushPending = useCallback(async () => {
     if (!navigator.onLine || !socketConnected || !getAccessToken() || !outletId) return;
-    const queued = await getPendingKdsActions(outletId).catch(() => []);
-    const unresolved: PendingKdsAction[] = [];
-    const latestItemVersion = new Map<string, string>();
-    for (let index = 0; index < queued.length; index++) {
-      const action = queued[index];
-      try {
-        const versionedAction = action.itemId && latestItemVersion.has(action.itemId) ? { ...action, expectedUpdatedAt: latestItemVersion.get(action.itemId) } : action;
-        const response = await apiFetch("/api/kds/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(versionedAction) });
-        if (response.ok) {
-          const result = await response.json().catch(() => ({})) as { items?: Array<{ id: string; updatedAt: string }> };
-          for (const item of result.items ?? []) latestItemVersion.set(item.id, item.updatedAt);
-          await removeKdsAction(action.clientMutationId);
-        }
-        else {
-          const body = await response.json().catch(() => ({})) as { error?: string };
-          await updateKdsActionError(action.clientMutationId, body.error ?? `Sync failed (${response.status}).`);
-          unresolved.push({ ...action, lastError: body.error ?? `Sync failed (${response.status}).` });
-        }
-      } catch {
-        await updateKdsActionError(action.clientMutationId, "Connection interrupted before sync.");
-        unresolved.push({ ...action, lastError: "Connection interrupted before sync." });
-        unresolved.push(...queued.slice(index + 1).map((pending) => ({ ...pending, lastError: "Waiting for the previous offline action to sync." })));
-        break;
-      }
+    let queued: PendingKdsAction[];
+    try {
+      queued = await getPendingKdsActions(outletId);
+      if (activeOutletId.current !== outletId) return;
+      setQueueError((current) => current?.kind === "read" ? null : current);
+    } catch {
+      setQueueError({ kind: "read", message: "Kitchen actions could not be read from this device. Keep this browser profile and retry; do not clear site storage." });
+      notify("The kitchen action queue could not be read. No queued action was discarded.");
+      return;
     }
-    setPendingActions(unresolved);
-    if (queued.length > 0 && unresolved.length === 0) { notify("Kitchen actions synced."); await reloadRef.current(); }
+    const replay = await reconcileKdsActionQueue(queued, {
+      isBlocked: (clientMutationId) => queueStateWriteBlocked.current.has(clientMutationId),
+      remove: removeKdsAction,
+      prepare: (action) => updateKdsActionVersion(action.clientMutationId, action.expectedUpdatedAt!),
+      recordError: updateKdsActionError,
+      send: async (action) => {
+        const response = await apiFetch("/api/kds/actions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(action) });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({})) as { error?: string };
+          return { ok: false as const, error: body.error ?? `Sync failed (${response.status}).` };
+        }
+        const result = await response.json().catch(() => ({})) as { items?: Array<{ id: string; updatedAt: string }> };
+        return { ok: true as const, items: result.items };
+      },
+    });
+    if (activeOutletId.current !== outletId) return;
+    if (replay.statusWriteFailedFor) {
+      queueStateWriteBlocked.current.add(replay.statusWriteFailedFor);
+      setQueueError({ kind: "status", message: kdsQueueStatusError });
+    }
+    setPendingActions(replay.unresolved as PendingKdsAction[]);
+    if (queued.length > 0 && replay.unresolved.length === 0) {
+      setQueueError((current) => current?.kind === "status" ? null : current);
+      notify("Kitchen actions synced.");
+      await reloadRef.current();
+    }
   }, [outletId, socketConnected, notify]);
 
   useEffect(() => {
@@ -279,7 +332,9 @@ export default function KdsBoard() {
       const restored = await restoreSession();
       if (cancelled) return;
       if (restored) setSession(restored);
-      const savedOutlet = typeof localStorage !== "undefined" ? localStorage.getItem("kora-kds-outlet") : null;
+      let savedOutlet: string | null = null;
+      try { savedOutlet = typeof localStorage !== "undefined" ? localStorage.getItem("kora-kds-outlet") : null; }
+      catch { /* Keep the session outlet selection in memory when browser storage is blocked. */ }
       const fallbackOutlet = restored?.outlets.find((entry) => entry.id === savedOutlet)?.id ?? restored?.outlets[0]?.id ?? cached?.outletId ?? "";
       setOutletId(fallbackOutlet);
       if (restored) {
@@ -292,9 +347,16 @@ export default function KdsBoard() {
 
   useEffect(() => {
     if (!outletId) return;
-    localStorage.setItem("kora-kds-outlet", outletId);
+    try { localStorage.setItem("kora-kds-outlet", outletId); }
+    catch { /* The selected outlet remains usable for this page session. */ }
     void reload();
-    void getPendingKdsActions(outletId).then(setPendingActions).catch(() => undefined);
+    void getPendingKdsActions(outletId).then((actions) => {
+      if (activeOutletId.current !== outletId) return;
+      setPendingActions(actions);
+      setQueueError((current) => current?.kind === "read" ? null : current);
+    }).catch(() => {
+      if (activeOutletId.current === outletId) setQueueError({ kind: "read", message: "Kitchen actions could not be read from this device. Keep this browser profile and retry; do not clear site storage." });
+    });
   }, [outletId, reload]);
 
   useEffect(() => {
@@ -486,13 +548,48 @@ export default function KdsBoard() {
   const newTicketCount = tickets.filter((ticket) => !ticket.startedAt && ticketLane(ticket) === "QUEUED").length;
   const targetMinutes = (ticket: Ticket) => Number(snapshot?.settings.slaMinutesPerOrderType[ticket.orderType] ?? 10);
   const connectionGood = online && socketConnected;
-  const queueConflicts = pendingActions.filter((action) => action.lastError).length;
+  const queueConflicts = pendingActions.filter((action) => (action.lastError && !action.waitingForPrevious) || queueStateWriteBlocked.current.has(action.clientMutationId)).length;
+  const retryConflicts = useCallback(async () => {
+    if (activeOutletId.current !== outletId) return;
+    let queued: PendingKdsAction[];
+    try { queued = await getPendingKdsActions(outletId); }
+    catch {
+      setQueueError({ kind: "read", message: "Kitchen actions could not be read from this device. Keep this browser profile and retry; do not clear site storage." });
+      return;
+    }
+    if (activeOutletId.current !== outletId) return;
+    setPendingActions(queued);
+    for (const action of queued) {
+      if ((!action.lastError || action.waitingForPrevious) && !queueStateWriteBlocked.current.has(action.clientMutationId)) continue;
+      try { await updateKdsActionError(action.clientMutationId, ""); }
+      catch {
+        queueStateWriteBlocked.current.add(action.clientMutationId);
+        setQueueError({ kind: "status", message: "KORA still cannot save this kitchen action's sync state. Check device storage and retry." });
+        return;
+      }
+      queueStateWriteBlocked.current.delete(action.clientMutationId);
+    }
+    setPendingActions(queued.map(({ lastError: _lastError, ...action }) => action));
+    setQueueError((current) => current?.kind === "read" || current?.kind === "status" ? null : current);
+    await flushPending();
+  }, [outletId, flushPending]);
   const discardConflicts = useCallback(async () => {
-    const conflicts = pendingActions.filter((action) => action.lastError);
-    for (const action of conflicts) await removeKdsAction(action.clientMutationId);
-    setPendingActions((current) => current.filter((action) => !action.lastError));
+    const conflicts = pendingActions.filter((action) => (action.lastError && !action.waitingForPrevious) || queueStateWriteBlocked.current.has(action.clientMutationId));
+    const conflictIds = new Set(conflicts.map((action) => action.clientMutationId));
+    try {
+      for (const action of conflicts) {
+        await removeKdsAction(action.clientMutationId);
+        queueStateWriteBlocked.current.delete(action.clientMutationId);
+      }
+    } catch {
+      setQueueError({ kind: "status", message: "Conflicted kitchen actions could not be removed from this device. They remain queued." });
+      return;
+    }
+    setPendingActions((current) => current.filter((action) => !conflictIds.has(action.clientMutationId)));
+    setQueueError((current) => current?.kind === "status" ? null : current);
     notify("Conflicted offline actions discarded. Reload the board to verify ticket state.");
-  }, [pendingActions, notify]);
+    await flushPending();
+  }, [pendingActions, notify, flushPending]);
 
   const maxHourlyTickets = metrics ? Math.max(1, ...metrics.hourly.map((hour) => hour.tickets)) : 1;
 
@@ -524,8 +621,14 @@ export default function KdsBoard() {
     {(!connectionGood || pendingActions.length > 0) && <div className={`${css.statusBanner} ${queueConflicts ? css.conflictBanner : ""}`} role="status">
       {!connectionGood ? <><WifiOff size={17}/><span>{online ? "Kitchen connection is reconnecting. Cached tickets remain available; actions will sync when the connection returns." : offlineSnapshotFresh ? "Offline mode. Cached tickets and kitchen actions are available provisionally; the server rechecks permissions when they sync." : "Offline permission snapshot expired. Kitchen access and actions are disabled until the outlet is revalidated online."}</span></> : <><Wifi size={17}/><span>{pendingActions.length} queued kitchen action{pendingActions.length === 1 ? "" : "s"} awaiting sync.</span></>}
       {queueConflicts > 0 && <span className={css.conflictCount}>{queueConflicts} need review</span>}
+      {pendingActions.length > 0 && connectionGood && <button className={css.discardButton} onClick={() => void retryConflicts()}>Retry queued actions</button>}
       {queueConflicts > 0 && <button className={css.discardButton} onClick={() => void discardConflicts()}>Discard conflicted actions</button>}
     </div>}
+    {queueError && <div className={css.errorBanner} role="alert">{queueError.message}<button onClick={() => {
+      if (queueError.kind === "enqueue") setQueueError(null);
+      else if (queueError.kind === "snapshot") void reload();
+      else void retryConflicts();
+    }}>{queueError.kind === "enqueue" ? "Dismiss" : queueError.kind === "snapshot" ? "Refresh tickets" : "Retry queue"}</button></div>}
     {error && <div className={css.errorBanner} role="alert">{error}<button onClick={() => void reload()}><RotateCcw size={14}/> Retry</button></div>}
     {notice && <div className={css.toast} role="status">{notice}</div>}
     {undoTicketData && <div className={css.undoToast} role="status"><span>KOT #{undoTicketData.kotNumber} bumped</span><button onClick={() => executeCardAction(undoTicketData, "undo-bump")}><RotateCcw size={15}/> Undo · 5s</button></div>}

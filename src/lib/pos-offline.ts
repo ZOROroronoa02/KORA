@@ -2,6 +2,7 @@
 
 import Dexie, { type Table } from "dexie";
 import { resolveOfflinePermissionSnapshot } from "./offline-permissions";
+import { nextOfflineQueueTimestamp } from "./domain/offline-queue";
 
 export type CloudOrderPayload = {
   outletId: string;
@@ -59,6 +60,7 @@ export type PendingKdsAction = {
   reason?: string;
   createdAt: number;
   lastError?: string;
+  waitingForPrevious?: boolean;
 };
 
 class KoraPosDatabase extends Dexie {
@@ -72,6 +74,8 @@ class KoraPosDatabase extends Dexie {
     this.version(1).stores({ pendingOrders: "clientMutationId, outletId, createdAt", menuSnapshots: "outletId" });
     this.version(2).stores({ pendingOrders: "clientMutationId, outletId, createdAt", menuSnapshots: "outletId", offlineWorkspace: "id" });
     this.version(3).stores({ pendingOrders: "clientMutationId, outletId, createdAt", menuSnapshots: "outletId", offlineWorkspace: "id", kdsSnapshots: "outletId,savedAt", kdsActions: "clientMutationId,outletId,createdAt" });
+    // v4 adds per-outlet ordered indexes so offline queues never sort by random mutation IDs on timestamp ties.
+    this.version(4).stores({ pendingOrders: "clientMutationId,outletId,createdAt,[outletId+createdAt]", menuSnapshots: "outletId", offlineWorkspace: "id", kdsSnapshots: "outletId,savedAt", kdsActions: "clientMutationId,outletId,createdAt,[outletId+createdAt]" });
   }
 }
 
@@ -85,7 +89,10 @@ export function getDeviceId() {
 }
 
 export async function queueOrder(order: PendingOrder) {
-  await database.pendingOrders.put(order);
+  await database.transaction("rw", database.pendingOrders, async () => {
+    const latest = await database.pendingOrders.where("[outletId+createdAt]").between([order.outletId, 0], [order.outletId, Number.MAX_SAFE_INTEGER]).last();
+    await database.pendingOrders.put({ ...order, createdAt: nextOfflineQueueTimestamp(order.createdAt, latest?.createdAt) });
+  });
 }
 
 export async function getPendingOrders(outletId: string) {
@@ -140,7 +147,10 @@ export async function readKdsTickets(outletId: string) {
 }
 
 export async function queueKdsAction(action: PendingKdsAction) {
-  await database.kdsActions.put(action);
+  await database.transaction("rw", database.kdsActions, async () => {
+    const latest = await database.kdsActions.where("[outletId+createdAt]").between([action.outletId, 0], [action.outletId, Number.MAX_SAFE_INTEGER]).last();
+    await database.kdsActions.put({ ...action, createdAt: nextOfflineQueueTimestamp(action.createdAt, latest?.createdAt) });
+  });
 }
 
 export async function getPendingKdsActions(outletId: string) {
@@ -152,7 +162,13 @@ export async function removeKdsAction(clientMutationId: string) {
 }
 
 export async function updateKdsActionError(clientMutationId: string, lastError: string) {
-  await database.kdsActions.update(clientMutationId, { lastError });
+  const updated = await database.kdsActions.update(clientMutationId, { lastError });
+  if (updated !== 1) throw new Error("The queued kitchen action sync state could not be saved because the action is missing.");
+}
+
+export async function updateKdsActionVersion(clientMutationId: string, expectedUpdatedAt: string) {
+  const updated = await database.kdsActions.update(clientMutationId, { expectedUpdatedAt });
+  if (updated !== 1) throw new Error("The queued kitchen action version could not be saved because the action is missing.");
 }
 
 export async function readOfflineWorkspace() {
