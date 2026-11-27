@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { calculateSale, parseRupeesToPaise } from "@/lib/billing";
 import { io } from "socket.io-client";
-import { ApiError, getAccessToken, hasPendingLogout, readJson, readSession, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
+import { ApiError, getAccessToken, hasPendingLogout, NetworkUnavailableError, readJson, readSession, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
 import { cacheMenu, cacheOfflineWorkspace, cacheTables, clearOfflineWorkspace, getDeviceId, getPendingOrders, queueOrder, readCachedMenu, readOfflineWorkspace, removePendingOrder, updatePendingOrderError, type CachedDisplayOrder, type CloudOrderPayload } from "@/lib/pos-offline";
 import { allPermissionKeys, systemRolePermissions, type PermissionKey } from "@/lib/permissions";
 import { canUseOfflineCashShift, filterOfflinePermissions, hasFreshOfflinePermissionSnapshot, OFFLINE_PERMISSION_TTL_MS } from "@/lib/offline-permissions";
@@ -149,6 +149,7 @@ export default function Home() {
   const [cloudSaving, setCloudSaving] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const [cloudError, setCloudError] = useState("");
+  const syncInFlight = useRef(new Set<string>());
   const [offlinePermissionExpiresAt, setOfflinePermissionExpiresAt] = useState<number | null>(null);
   const [invoiceDocument, setInvoiceDocument] = useState<InvoicePrintData | null>(null);
   const [offlinePrint, setOfflinePrint] = useState<{ order: Order; mode: "receipt" | "kot" } | null>(null);
@@ -220,7 +221,22 @@ export default function Home() {
     return () => { window.removeEventListener("online", update); window.removeEventListener("offline", update); };
   }, []);
   useEffect(() => { if (!cloudMode) try { localStorage.setItem("kora-demo-v1", JSON.stringify(data)); } catch { setNotice("This device could not save the latest demo changes. Free storage before continuing."); } }, [data, cloudMode]);
-  useEffect(() => { if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => setNotice("Offline app-shell caching is unavailable in this browser.")); }, []);
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    if (process.env.NODE_ENV !== "production") {
+      let active = true;
+      void navigator.serviceWorker.getRegistrations().then(async (registrations) => {
+        const controlled = Boolean(navigator.serviceWorker.controller);
+        await Promise.all(registrations.map((registration) => registration.unregister()));
+        await Promise.all((await caches.keys()).filter((key) => key.startsWith("kora-shell-")).map((key) => caches.delete(key)));
+        // Dev chunk URLs are stable while their contents change. Force one
+        // network reload after removing an old worker that could replay stale JS.
+        if (active && controlled) window.location.reload();
+      }).catch(() => setNotice("Could not remove a stale development offline cache."));
+      return () => { active = false; };
+    }
+    navigator.serviceWorker.register("/sw.js").catch(() => setNotice("Offline app-shell caching is unavailable in this browser."));
+  }, []);
   useEffect(() => { if (!notice) return; const t = setTimeout(() => setNotice(""), 2800); return () => clearTimeout(t); }, [notice]);
 
   const notify = (text: string) => setNotice(text);
@@ -261,7 +277,7 @@ export default function Home() {
     setCloudLoading(true); setCloudError("");
     try {
       const cached = await readCachedMenu(outletId).catch(() => undefined);
-      if (offlineOnly && !navigator.onLine) {
+      if (offlineOnly) {
         const cachedWorkspace = await readOfflineWorkspace().catch(() => undefined);
         const cachedCashShiftOpen = Boolean(cachedWorkspace && cloudSession && cachedWorkspace.userId === cloudSession.user.id
           && cachedWorkspace.outletId === outletId && canUseOfflineCashShift(cachedWorkspace.cashShiftOpen, cachedWorkspace.cashShiftSnapshotAt));
@@ -322,28 +338,35 @@ export default function Home() {
     } finally { setCloudLoading(false); }
   };
   const syncPendingOrders = async (outletId: string) => {
-    if (!navigator.onLine || !outletId) return;
-    let pending;
-    try { pending = await readPendingOrders(outletId); }
-    catch { return; }
-    let synced = 0;
-    for (const entry of pending) {
-      if (entry.nextAttemptAt && entry.nextAttemptAt > Date.now()) continue;
-      try {
-        await readJson("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(entry.payload) });
-        await removePendingOrder(entry.clientMutationId); synced++;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Sync failed.";
-        const permanent = error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
-        const retryCount = (entry.retryCount ?? 0) + 1;
-        const nextAttemptAt = permanent ? Number.MAX_SAFE_INTEGER : Date.now() + Math.min(300000, 2000 * (2 ** Math.min(retryCount - 1, 7)));
-        await updatePendingOrderError(entry.clientMutationId, message, retryCount, nextAttemptAt).catch(() => undefined);
-        if (permanent) notify(`Offline order ${entry.displayOrder.id} needs attention: ${message}`);
-        break;
+    if (!navigator.onLine || !outletId || syncInFlight.current.has(outletId)) return;
+    syncInFlight.current.add(outletId);
+    try {
+      let pending;
+      try { pending = await readPendingOrders(outletId); }
+      catch { return; }
+      let synced = 0;
+      for (const entry of pending) {
+        // Preserve queue order when an earlier command is waiting for backoff
+        // or operator review. A later sale must not leapfrog it.
+        if (entry.nextAttemptAt && entry.nextAttemptAt > Date.now()) break;
+        try {
+          await readJson("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(entry.payload) });
+          await removePendingOrder(entry.clientMutationId); synced++;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Sync failed.";
+          const permanent = error instanceof ApiError && error.status >= 400 && error.status < 500 && ![408, 425, 429].includes(error.status);
+          const retryCount = (entry.retryCount ?? 0) + 1;
+          const nextAttemptAt = permanent ? Number.MAX_SAFE_INTEGER : Date.now() + Math.min(300000, 2000 * (2 ** Math.min(retryCount - 1, 7)));
+          await updatePendingOrderError(entry.clientMutationId, message, retryCount, nextAttemptAt).catch(() => undefined);
+          if (permanent) notify(`Offline order ${entry.displayOrder.id} needs attention: ${message}`);
+          break;
+        }
       }
+      if (synced) notify(`${synced} offline ${synced === 1 ? "order" : "orders"} synced`);
+      await refreshCloudOrders(outletId).catch(() => undefined);
+    } finally {
+      syncInFlight.current.delete(outletId);
     }
-    if (synced) notify(`${synced} offline ${synced === 1 ? "order" : "orders"} synced`);
-    await refreshCloudOrders(outletId).catch(() => undefined);
   };
   const retryPendingOrder = async (order: Order) => {
     let pending;
@@ -357,25 +380,46 @@ export default function Home() {
 
   useEffect(() => {
     let active = true;
+    const restoreOfflineWorkspace = async () => {
+      if (hasPendingLogout()) {
+        setCloudError("A previous sign-out is waiting for a network connection. Reconnect before using this outlet.");
+        setModal("connect");
+        return;
+      }
+      const cached = await readOfflineWorkspace().catch(() => undefined);
+      if (!active) return;
+      if (!cached) {
+        setCloudError("This device has no saved cloud workspace. Reconnect and sign in before taking orders.");
+        setModal("connect");
+        return;
+      }
+      const permissionSnapshotFresh = hasFreshOfflinePermissionSnapshot(cached.savedAt);
+      const offlinePermissions = permissionSnapshotFresh ? cachedOfflinePermissions(cached.permissions) : [];
+      setOfflinePermissionExpiresAt(permissionSnapshotFresh ? cached.savedAt + OFFLINE_PERMISSION_TTL_MS : null);
+      setCloudError(permissionSnapshotFresh ? "" : "Offline billing access expired. Reconnect and sign in to settle bills; new orders remain provisional until server authorization.");
+      demoSnapshot.current = latestData.current;
+      setCloudSession({ user: { id: cached.userId, name: cached.userName, email: "" }, outlets: [{ id: cached.outletId, name: cached.outletName, role: cached.role, permissions: offlinePermissions }] });
+      setSelectedOutletId(cached.outletId); setOfflineOnly(true); setOnline(false); setPage("POS");
+    };
     const restore = async () => {
       if (!navigator.onLine) {
-        if (hasPendingLogout()) {
-          setCloudError("A previous sign-out is waiting for a network connection. Reconnect before using this outlet.");
-          setModal("connect");
+        await restoreOfflineWorkspace(); return;
+      }
+      let session: AuthenticatedSession | null;
+      try { session = await restoreSession(); }
+      catch (error) {
+        if (!active) return;
+        if (error instanceof NetworkUnavailableError) {
+          await restoreOfflineWorkspace();
           return;
         }
-        const cached = await readOfflineWorkspace().catch(() => undefined);
-        if (!active || !cached) return;
-        const permissionSnapshotFresh = hasFreshOfflinePermissionSnapshot(cached.savedAt);
-        const offlinePermissions = permissionSnapshotFresh ? cachedOfflinePermissions(cached.permissions) : [];
-        setOfflinePermissionExpiresAt(permissionSnapshotFresh ? cached.savedAt + OFFLINE_PERMISSION_TTL_MS : null);
-        setCloudError(permissionSnapshotFresh ? "" : "Offline billing access expired. Reconnect and sign in to settle bills; new orders remain provisional until server authorization.");
-        demoSnapshot.current = latestData.current;
-        setCloudSession({ user: { id: cached.userId, name: cached.userName, email: "" }, outlets: [{ id: cached.outletId, name: cached.outletName, role: cached.role, permissions: offlinePermissions }] });
-        setSelectedOutletId(cached.outletId); setOfflineOnly(true); setPage("POS"); return;
+        return;
       }
-      const session = await restoreSession();
-      if (!active || !session || !session.outlets.length) return;
+      if (!active) return;
+      if (!session || !session.outlets.length) {
+        if (!navigator.onLine) await restoreOfflineWorkspace();
+        return;
+      }
       demoSnapshot.current = latestData.current;
       setOfflinePermissionExpiresAt(Date.now() + OFFLINE_PERMISSION_TTL_MS);
       setCloudError("");
@@ -386,7 +430,9 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (!cloudMode || !currentOutlet) return;
-    void loadCloudOutlet(selectedOutletId, currentOutlet.permissions);
+    void loadCloudOutlet(selectedOutletId, currentOutlet.permissions).then(() => {
+      if (!offlineOnly && navigator.onLine) void syncPendingOrders(selectedOutletId);
+    });
     const handleOffline = () => setOfflineOnly(true);
     const refresh = () => {
       if (!navigator.onLine) return;
@@ -399,7 +445,10 @@ export default function Home() {
         }
         setCloudSession(session); setOfflineOnly(false); setCloudError("");
         void saveOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: outlet.id, outletName: outlet.name, role: outlet.role, permissions: outlet.permissions }).catch(() => undefined);
-      }).catch(() => setCloudError("Session could not be revalidated. Offline actions remain provisional; sign in again when connected."));
+      }).catch((error: unknown) => {
+        if (error instanceof NetworkUnavailableError) { setOnline(false); setOfflineOnly(true); }
+        setCloudError("Session could not be revalidated. Offline actions remain provisional; sign in again when connected.");
+      });
       void syncPendingOrders(selectedOutletId);
       void refreshCloudOrders(selectedOutletId).catch(() => undefined);
     };

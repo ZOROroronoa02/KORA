@@ -11,6 +11,14 @@ export class ApiError extends Error {
   constructor(message: string, status: number) { super(message); this.name = "ApiError"; this.status = status; }
 }
 
+export class NetworkUnavailableError extends TypeError {
+  constructor(message = "The KORA server could not be reached.") { super(message); this.name = "NetworkUnavailableError"; }
+}
+
+function asNetworkUnavailableError(error: TypeError): NetworkUnavailableError {
+  return error instanceof NetworkUnavailableError ? error : new NetworkUnavailableError(error.message);
+}
+
 // Access tokens deliberately live only in memory. The refresh token stays in the
 // server-set HttpOnly cookie and is never exposed to browser JavaScript.
 let accessToken: string | null = null;
@@ -45,11 +53,19 @@ async function refreshAccessToken() {
   if (!refreshInFlight) {
     refreshInFlight = fetch("/api/auth/refresh", { method: "POST", credentials: "same-origin", cache: "no-store" })
       .then(async (response) => {
-        if (!response.ok) return null;
+        if (!response.ok) {
+          if (response.status >= 500 || response.status === 408 || response.status === 429) {
+            throw new NetworkUnavailableError(`The KORA server is temporarily unavailable (${response.status}).`);
+          }
+          return null;
+        }
         const body = await response.json() as { accessToken?: unknown };
         return typeof body.accessToken === "string" ? body.accessToken : null;
       })
-      .catch(() => null)
+      .catch((error: unknown) => {
+        if (error instanceof TypeError) throw asNetworkUnavailableError(error);
+        return null;
+      })
       .then((token) => { accessToken = token; return token; })
       .finally(() => { refreshInFlight = null; });
   }
@@ -64,7 +80,10 @@ export async function apiFetch(path: string, init: RequestInit = {}) {
   const send = (token: string | null) => {
     const headers = new Headers(init.headers);
     if (token) headers.set("authorization", `Bearer ${token}`);
-    return fetch(path, { ...init, headers, credentials: "same-origin", cache: "no-store" });
+    return fetch(path, { ...init, headers, credentials: "same-origin", cache: "no-store" }).catch((error: unknown) => {
+      if (error instanceof TypeError) throw asNetworkUnavailableError(error);
+      throw error;
+    });
   };
   let response = await send(accessToken);
   if (response.status === 401 && !path.startsWith("/api/auth/")) {
@@ -111,10 +130,20 @@ export async function restoreSession() {
     accessToken = null;
     return null;
   }
-  const token = await refreshAccessToken();
+  let token: string | null;
+  try { token = await refreshAccessToken(); }
+  catch (error) {
+    accessToken = null;
+    if (error instanceof NetworkUnavailableError) throw error;
+    return null;
+  }
   if (!token) return null;
   try { return await readSession(); }
-  catch { accessToken = null; return null; }
+  catch (error) {
+    accessToken = null;
+    if (error instanceof NetworkUnavailableError) throw error;
+    return null;
+  }
 }
 
 export async function signOut() {

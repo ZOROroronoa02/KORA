@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getAccessToken, hasPendingLogout, restoreSession, setAccessToken, signIn, signOut } from '../src/lib/client-api.ts';
+import { getAccessToken, hasPendingLogout, NetworkUnavailableError, restoreSession, setAccessToken, signIn, signOut } from '../src/lib/client-api.ts';
 
 function installBrowserStorage(values = new Map()) {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
@@ -30,6 +30,46 @@ test('offline session restore fails closed while a logout is pending', async () 
     assert.equal(await restoreSession(), null);
     assert.equal(getAccessToken(), null);
     assert.equal(logoutCalls, 1, 'restore attempts only the pending logout, never a refresh');
+  } finally {
+    setAccessToken(null);
+    globalThis.fetch = originalFetch;
+    browser.restore();
+  }
+});
+
+test('session restoration distinguishes network loss from an invalid refresh session', async () => {
+  const browser = installBrowserStorage();
+  const originalFetch = globalThis.fetch;
+  try {
+    setAccessToken(null);
+    globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+    await assert.rejects(restoreSession(), NetworkUnavailableError);
+
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
+    assert.equal(await restoreSession(), null, 'an explicit auth rejection must not restore cached permissions');
+
+    globalThis.fetch = async () => new Response('temporarily unavailable', { status: 503 });
+    await assert.rejects(restoreSession(), NetworkUnavailableError, 'a server outage may restore the bounded offline workspace');
+  } finally {
+    setAccessToken(null);
+    globalThis.fetch = originalFetch;
+    browser.restore();
+  }
+});
+
+test('session restoration preserves a network failure after refresh succeeds', async () => {
+  const browser = installBrowserStorage();
+  const originalFetch = globalThis.fetch;
+  try {
+    setAccessToken(null);
+    globalThis.fetch = async (input) => {
+      const path = typeof input === 'string' ? input : input.url;
+      if (path === '/api/auth/refresh') return new Response(JSON.stringify({ accessToken: 'fresh-access-token' }), { status: 200, headers: { 'content-type': 'application/json' } });
+      if (path === '/api/auth/me') throw new TypeError('Failed to fetch');
+      throw new Error(`Unexpected request: ${path}`);
+    };
+    await assert.rejects(restoreSession(), NetworkUnavailableError);
+    assert.equal(getAccessToken(), null, 'a failed session read must not leave a bearer token active');
   } finally {
     setAccessToken(null);
     globalThis.fetch = originalFetch;
