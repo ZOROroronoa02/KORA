@@ -15,7 +15,9 @@ Authenticated APIs accept a bearer access token. Tenant identity comes only from
 | `/api/bills/:id/split` | Amount/item allocation | Atomic uniqueness and split payment settlement |
 | `/api/shifts` | Open/close cash reconciliation | Exclusive open, linked payments, atomic close and event audit |
 | `/api/customers` | Customer read/create | Pagination, consent, outlet ownership, visit/loyalty updates |
-| `/api/inventory` | Stock read and adjustment/purchase/wastage movement | Recipe/purchase workflows, request schema, transactional valuation |
+| `/api/inventory` | Outlet stock read, ingredient creation, adjustment and wastage | Controlled unit catalog, offline inventory commands |
+| `/api/inventory/purchases` | Paginated receipt history; idempotent received-goods intake; atomic stock movement, weighted-average landed cost and audit | Purchase orders, supplier invoice/tax-credit accounting, payments/returns, offline receipts |
+| `/api/inventory/vendors` | Tenant-shared vendor directory with outlet authorization | Verified supplier GSTIN lookup and vendor import |
 | `/api/health` | Process response | Liveness/readiness separation and dependency checks |
 
 ## Idempotency
