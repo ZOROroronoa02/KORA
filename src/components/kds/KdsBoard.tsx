@@ -146,11 +146,12 @@ export default function KdsBoard() {
 
   const selectedOutlet = session?.outlets.find((outlet) => outlet.id === outletId) ?? null;
   const offlineWorkspaceMatches = offlineWorkspace?.outletId === outletId;
-  const offlineSnapshotFresh = Boolean(offlineWorkspaceMatches && hasFreshOfflinePermissionSnapshot(offlineWorkspace.savedAt, permissionClock));
+  const permissionSnapshotAt = offlineWorkspace?.permissionSnapshotAt;
+  const offlineSnapshotFresh = Boolean(offlineWorkspaceMatches && permissionSnapshotAt !== undefined && hasFreshOfflinePermissionSnapshot(permissionSnapshotAt, permissionClock));
   const permissions = online && selectedOutlet
     ? selectedOutlet.permissions
-    : offlineWorkspaceMatches
-      ? offlinePermissionsForSnapshot(offlineWorkspace.savedAt, offlineWorkspace.permissions, new Set<string>(allPermissionKeys), permissionClock)
+    : offlineWorkspaceMatches && permissionSnapshotAt !== undefined
+      ? offlinePermissionsForSnapshot(permissionSnapshotAt, offlineWorkspace.permissions, new Set<string>(allPermissionKeys), permissionClock)
       : [];
   const hasKdsAccess = permissions.includes("kds.view");
   const outletName = selectedOutlet?.name ?? (offlineWorkspace?.outletId === outletId ? offlineWorkspace.outletName : snapshot?.outlet.name) ?? "Kitchen";

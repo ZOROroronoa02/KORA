@@ -17,7 +17,7 @@ import { io } from "socket.io-client";
 import { ApiError, getAccessToken, hasPendingLogout, NetworkUnavailableError, readJson, readSession, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
 import { cacheMenu, cacheOfflineWorkspace, cacheTables, clearOfflineWorkspace, getDeviceId, getPendingOrders, queueOrder, readCachedMenu, readOfflineWorkspace, removePendingOrder, updatePendingOrderError, type CachedDisplayOrder, type CloudOrderPayload } from "@/lib/pos-offline";
 import { allPermissionKeys, systemRolePermissions, type PermissionKey } from "@/lib/permissions";
-import { canUseOfflineCashShift, filterOfflinePermissions, hasFreshOfflinePermissionSnapshot, OFFLINE_PERMISSION_TTL_MS } from "@/lib/offline-permissions";
+import { canUseOfflineCashShift, filterOfflinePermissions, hasFreshOfflinePermissionSnapshot, hasUnexpiredOfflinePermissionDeadline, OFFLINE_PERMISSION_TTL_MS } from "@/lib/offline-permissions";
 import { RoleAdministration } from "@/components/RoleAdministration";
 import { AuditLogViewer } from "@/components/AuditLogViewer";
 import { OutletApprovalSettings } from "@/components/OutletApprovalSettings";
@@ -142,6 +142,7 @@ export default function Home() {
   const demoSnapshot = useRef<AppData | null>(null);
   const offlineQueueWarningNotified = useRef(false);
   const [cloudSession, setCloudSession] = useState<AuthenticatedSession | null>(null);
+  const permissionSessionVerifiedAt = useRef<number | null>(null);
   const [offlineOnly, setOfflineOnly] = useState(false);
   const [selectedOutletId, setSelectedOutletId] = useState("");
   const [cloudTables, setCloudTables] = useState<RestaurantTable[]>([]);
@@ -179,7 +180,10 @@ export default function Home() {
   const [range, setRange] = useState("Today");
   const cloudMode = Boolean(cloudSession && selectedOutletId);
   const currentOutlet = cloudSession?.outlets.find((outlet) => outlet.id === selectedOutletId);
-  const effectivePermissions = cloudMode ? currentOutlet?.permissions ?? [] : systemRolePermissions[demoRole];
+  const offlinePermissionSnapshotActive = hasUnexpiredOfflinePermissionDeadline(offlinePermissionExpiresAt);
+  const effectivePermissions = cloudMode
+    ? offlineOnly && !offlinePermissionSnapshotActive ? [] : currentOutlet?.permissions ?? []
+    : systemRolePermissions[demoRole];
   const syncLabel = cloudMode
     ? (cloudError
       ? (online ? "Cloud · sync attention" : "Offline · attention")
@@ -241,8 +245,13 @@ export default function Home() {
 
   const notify = (text: string) => setNotice(text);
   const saveOfflineWorkspace = async (workspace: Parameters<typeof cacheOfflineWorkspace>[0]) => {
-    await cacheOfflineWorkspace(workspace);
-    setOfflinePermissionExpiresAt(Date.now() + OFFLINE_PERMISSION_TTL_MS);
+    const verifiedAt = permissionSessionVerifiedAt.current ?? undefined;
+    await cacheOfflineWorkspace(workspace, verifiedAt);
+    const cached = await readOfflineWorkspace().catch(() => undefined);
+    const cachedAt = cached?.permissionSnapshotAt;
+    setOfflinePermissionExpiresAt(typeof cachedAt === "number" && Number.isSafeInteger(cachedAt) && cachedAt <= Date.now()
+      ? cachedAt + OFFLINE_PERMISSION_TTL_MS
+      : null);
   };
   const readPendingOrders = async (outletId: string) => {
     try {
@@ -393,9 +402,9 @@ export default function Home() {
         setModal("connect");
         return;
       }
-      const permissionSnapshotFresh = hasFreshOfflinePermissionSnapshot(cached.savedAt);
+      const permissionSnapshotFresh = cached.permissionSnapshotAt !== undefined && hasFreshOfflinePermissionSnapshot(cached.permissionSnapshotAt);
       const offlinePermissions = permissionSnapshotFresh ? cachedOfflinePermissions(cached.permissions) : [];
-      setOfflinePermissionExpiresAt(permissionSnapshotFresh ? cached.savedAt + OFFLINE_PERMISSION_TTL_MS : null);
+      setOfflinePermissionExpiresAt(permissionSnapshotFresh ? cached.permissionSnapshotAt! + OFFLINE_PERMISSION_TTL_MS : null);
       setCloudError(permissionSnapshotFresh ? "" : "Offline billing access expired. Reconnect and sign in to settle bills; new orders remain provisional until server authorization.");
       demoSnapshot.current = latestData.current;
       setCloudSession({ user: { id: cached.userId, name: cached.userName, email: "" }, outlets: [{ id: cached.outletId, name: cached.outletName, role: cached.role, permissions: offlinePermissions }] });
@@ -420,8 +429,9 @@ export default function Home() {
         if (!navigator.onLine) await restoreOfflineWorkspace();
         return;
       }
+      permissionSessionVerifiedAt.current = Date.now();
       demoSnapshot.current = latestData.current;
-      setOfflinePermissionExpiresAt(Date.now() + OFFLINE_PERMISSION_TTL_MS);
+      setOfflinePermissionExpiresAt(permissionSessionVerifiedAt.current + OFFLINE_PERMISSION_TTL_MS);
       setCloudError("");
       setCloudSession(session); setSelectedOutletId(session.outlets[0].id); setOfflineOnly(false); setPage("POS");
     };
@@ -443,6 +453,7 @@ export default function Home() {
           setCloudError("This session or outlet access is no longer valid. Sign in again to continue."); setModal("connect");
           return;
         }
+        permissionSessionVerifiedAt.current = Date.now();
         setCloudSession(session); setOfflineOnly(false); setCloudError("");
         void saveOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: outlet.id, outletName: outlet.name, role: outlet.role, permissions: outlet.permissions }).catch(() => undefined);
       }).catch((error: unknown) => {
@@ -474,7 +485,11 @@ export default function Home() {
       if (refreshingSocketSession || !/access token|authentication and outlet context/i.test(error.message)) return;
       refreshingSocketSession = true;
       void restoreSession().then((session) => {
-        if (session && session.user.id === cloudSession?.user.id && session.outlets.some((outlet) => outlet.id === selectedOutletId)) {
+        const outlet = session?.outlets.find((item) => item.id === selectedOutletId);
+        if (session && session.user.id === cloudSession?.user.id && outlet) {
+          permissionSessionVerifiedAt.current = Date.now();
+          setCloudSession(session);
+          void saveOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: outlet.id, outletName: outlet.name, role: outlet.role, permissions: outlet.permissions }).catch(() => undefined);
           socket.auth = { accessToken: getAccessToken(), outletId: selectedOutletId };
           socket.connect();
         } else {
@@ -488,10 +503,10 @@ export default function Home() {
   }, [cloudMode, selectedOutletId, currentOutlet?.id, offlineOnly]);
 
   useEffect(() => {
-    if (!cloudMode || !offlineOnly || online || offlinePermissionExpiresAt === null) return;
+    if (!cloudMode || !offlineOnly || online) return;
     const expiresAt = offlinePermissionExpiresAt;
     const expirePermissions = () => {
-      if (Date.now() < expiresAt) return;
+      if (expiresAt !== null && Date.now() <= expiresAt) return;
       setCloudSession((session) => session ? {
         ...session,
         outlets: session.outlets.map((outlet) => outlet.id === selectedOutletId ? { ...outlet, permissions: [] } : outlet),
@@ -499,6 +514,10 @@ export default function Home() {
       setOfflinePermissionExpiresAt(null);
       setCloudError("Offline permission snapshot expired. Reconnect and sign in before continuing protected work.");
     };
+    if (expiresAt === null) {
+      expirePermissions();
+      return;
+    }
     expirePermissions();
     const timer = window.setInterval(expirePermissions, 5000);
     document.addEventListener("visibilitychange", expirePermissions);
@@ -536,7 +555,7 @@ export default function Home() {
       if (offlineOnly && method === "Cash" && receivedPaise > 0) {
         const cached = await readOfflineWorkspace().catch(() => undefined);
         const eligible = Boolean(cached && cloudSession && cached.userId === cloudSession.user.id && cached.outletId === selectedOutletId
-          && hasFreshOfflinePermissionSnapshot(cached.savedAt)
+          && cached.permissionSnapshotAt !== undefined && hasFreshOfflinePermissionSnapshot(cached.permissionSnapshotAt)
           && canUseOfflineCashShift(cached.cashShiftOpen, cached.cashShiftSnapshotAt)
           && cached.permissions?.includes("bills.settle") === true);
         if (!eligible) { notify("Offline cash requires a recent server-verified open shift and billing access. Record the bill as pending, then settle it after reconnecting."); return; }
@@ -592,6 +611,7 @@ export default function Home() {
     try {
       const session = await signIn(loginInput);
       if (!session.outlets.length) throw new Error("This account has no assigned outlets.");
+      permissionSessionVerifiedAt.current = Date.now();
       demoSnapshot.current = latestData.current;
       setCloudSession(session); setSelectedOutletId(session.outlets[0].id); setOfflineOnly(false); setModal("");
       void saveOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: session.outlets[0].id, outletName: session.outlets[0].name, role: session.outlets[0].role, permissions: session.outlets[0].permissions }).catch(() => undefined);
@@ -606,6 +626,7 @@ export default function Home() {
     try {
       const session = await registerRestaurant(registerInput);
       if (!session.outlets.length) throw new Error("Restaurant account was created without an outlet assignment.");
+      permissionSessionVerifiedAt.current = Date.now();
       demoSnapshot.current = latestData.current;
       setCloudSession(session); setSelectedOutletId(session.outlets[0].id); setOfflineOnly(false); setPage("POS"); setModal("");
       void saveOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: session.outlets[0].id, outletName: session.outlets[0].name, role: session.outlets[0].role, permissions: session.outlets[0].permissions }).catch(() => undefined);
@@ -618,6 +639,7 @@ export default function Home() {
     await signOut();
     setCloudSession(null); setSelectedOutletId(""); setCloudTables([]); setPendingCount(0); setCart([]); setOfflineOnly(false); setOfflinePermissionExpiresAt(null);
     await clearOfflineWorkspace().catch(() => undefined);
+    permissionSessionVerifiedAt.current = null;
     setData(demoSnapshot.current ?? seed); demoSnapshot.current = null; setModal("");
     notify("Signed out of the restaurant account");
   };
@@ -625,6 +647,7 @@ export default function Home() {
     const session = await readSession();
     const outlet = session.outlets.find((item) => item.id === outletId);
     if (!outlet) throw new Error("Outlet was created, but your new access could not be loaded. Refresh your session.");
+    permissionSessionVerifiedAt.current = Date.now();
     setCloudSession(session);
     setSelectedOutletId(outlet.id);
     setModal("");
