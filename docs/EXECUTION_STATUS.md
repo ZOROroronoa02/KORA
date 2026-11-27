@@ -30,6 +30,7 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 - Production start launches `.next/standalone/server.js`, matching `output: "standalone"`. The build copies `.next/static` and `public` into the standalone runtime; this fixes missing CSS/JavaScript asset 404s that made the local production UI unstyled and noninteractive.
 - `/api/health` now reports liveness and links to the liveness/readiness probes without falsely describing the cloud platform as a browser-local demo.
 - Local preview is available at `http://localhost:3000`; `/` and `/api/health/live` returned 200. `/api/health/ready` returned 503 because local Redis is unavailable, as production readiness requires Redis.
+- The current manual-testing preview runs Next.js development mode on port 3000 with the realtime development service on port 4000; the cloud POS order-to-invoice flow passed against this running preview. Production mode remains unready without Redis.
 
 ## Latest verification
 
@@ -40,7 +41,7 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 - Production HTTP smoke on `http://localhost:3000`: `/` and `/api/health/live` returned 200; all 9 HTML-linked JavaScript/CSS assets returned 200. `/api/health/ready` returned 503 because Redis is unavailable locally, correctly keeping the service unready.
 - A production-mode registration attempt returned 503 (`Account setup is temporarily unavailable`) while local Redis was down; the auth path fails closed, so the order-to-invoice flow was verified against the development API rather than by bypassing production auth controls.
 - GST bill creation and invoice print-data retrieval passed live assertions for tax profiles, buyer snapshots, HSN/SAC snapshots, tax grouping, invoice reconciliation, the 16-character serial limit, and wrong-outlet denial. Browser printer rendering, physical ESC/POS output and GST reporting/export remain unverified.
-- `npm audit --omit=dev --audit-level=high`: zero production dependency advisories. `npm run db:audit-tenant-ownership` reported zero ownership mismatches in the local database; this does not verify production customer data.
+- `npm run db:audit-tenant-ownership` reported zero ownership mismatches in the local database; this does not verify production customer data.
 
 ## Production blockers
 
