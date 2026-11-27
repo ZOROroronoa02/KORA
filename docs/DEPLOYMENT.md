@@ -47,6 +47,34 @@ ALTER DEFAULT PRIVILEGES FOR ROLE kora_migrator IN SCHEMA public
 9. Monitor error rate, DB connections, sync backlog, Redis and order latency.
 10. Roll back application code first when compatible; use forward migrations for data changes. Restore a backup only through a tested incident procedure.
 
+## Manual PostgreSQL backup and restore drill
+
+Run this only against staging data or a production-like clone. The `kora_restore` libpq service entry and `RESTORE_TARGET_URL` must point to the same empty database on an isolated recovery environment; never point either at the source database or a live production database. Provision a dedicated read-only backup credential and a separate restore credential through the secret manager. Supply libpq service/password files using `PGSERVICEFILE` and `PGPASSFILE` with owner-only permissions; do not put credential URLs on command lines or enable shell tracing. The example service names below contain connection settings but no passwords.
+
+```sh
+set -euo pipefail
+: "${PGSERVICEFILE:?Set a protected libpq service file}"
+: "${PGPASSFILE:?Set a protected libpq password file}"
+: "${RESTORE_TARGET_URL:?Set the isolated empty restore database URL for Prisma checks}"
+umask 077
+dump_file="$(mktemp "${TMPDIR:-/tmp}/kora-restore-drill.XXXXXX.dump")"
+trap 'rm -f "$dump_file"' EXIT
+
+pg_dump --dbname="service=kora_backup" --format=custom \
+  --no-owner --no-privileges --file="$dump_file"
+sha256sum "$dump_file"
+pg_restore --list "$dump_file" >/dev/null
+pg_restore --dbname="service=kora_restore" --exit-on-error \
+  --single-transaction --no-owner --no-privileges "$dump_file"
+psql "service=kora_restore" -X -v ON_ERROR_STOP=1 -Atc \
+  "SELECT count(*) FROM public._prisma_migrations WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL"
+psql "service=kora_restore" -X -v ON_ERROR_STOP=1 -Atc \
+  "SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'kora_tenant_guard_%' AND NOT tgisinternal"
+DATABASE_URL="$RESTORE_TARGET_URL" npm run db:audit-tenant-ownership
+```
+
+The two count queries must return the expected applied-migration count for the build and a nonzero tenant-guard count; the ownership audit must return no mismatches. Record the source build SHA, PostgreSQL major version, dump checksum, restore target, duration, and audit result without recording credentials or customer rows. Destroy only the named disposable restore database after the drill. The temporary dump is unencrypted, so keep it on an encrypted ephemeral volume and let the trap remove it. This verifies the database dump/restore procedure only: production still needs provider-managed encryption, retention, off-site copies, point-in-time recovery where required, and a scheduled recovery drill.
+
 ## Current limitations
 
-CI and Docker image targets are defined in the repository. There is no production deployment manifest, observability provider or tested backup/restore procedure. CI verifies migrations, build, live PostgreSQL/Redis tests, and that the runtime role cannot disable a tenant trigger; the target cloud role split, trusted-edge contract, TLS, backups, and deployment rollback still require staging verification.
+CI and Docker image targets are defined in the repository. The local checkout has verified a fresh migration replay, but there is no production deployment manifest, observability provider, or executed backup/restore drill. CI verifies migrations, build, live PostgreSQL/Redis tests, and that the runtime role cannot disable a tenant trigger; the target cloud role split, trusted-edge contract, TLS, backups, and deployment rollback still require staging verification.
