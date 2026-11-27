@@ -5,6 +5,8 @@ export function proxy(request: NextRequest) {
   const nonce = randomBytes(16).toString("base64");
   const isDev = process.env.NODE_ENV === "development";
   const imageSources = ["'self'", "blob:", "data:"];
+  const styleSources = ["'self'", `'nonce-${nonce}'`, "https://fonts.googleapis.com"];
+  const fontSources = ["'self'", "data:", "https://fonts.gstatic.com"];
   if (process.env.NEXT_PUBLIC_ASSET_ORIGIN) {
     try { imageSources.push(new URL(process.env.NEXT_PUBLIC_ASSET_ORIGIN).origin); }
     catch { /* Invalid asset origins stay blocked by the default policy. */ }
@@ -22,9 +24,10 @@ export function proxy(request: NextRequest) {
   const policy = [
     "default-src 'self'",
     `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ""}`,
-    `style-src 'self' 'nonce-${nonce}' 'unsafe-inline'`,
+    "style-src " + styleSources.join(" "),
+    ...(isDev ? ["style-src-attr 'unsafe-inline'"] : []),
     "img-src " + imageSources.join(" "),
-    "font-src 'self' data:",
+    "font-src " + fontSources.join(" "),
     "connect-src " + connectSources.join(" "),
     "media-src 'self' blob:",
     "worker-src 'self' blob:",
