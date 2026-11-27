@@ -20,7 +20,7 @@ Authenticated APIs accept a bearer access token. Tenant identity comes only from
 
 ## Idempotency
 
-Every retryable financial mutation carries a stable client mutation ID. The API persists the mutation result and returns that same result on replay. Conflicting reuse with a different payload is rejected. Provider webhooks are verified against raw request bytes and deduplicated by provider event ID.
+Every retryable financial mutation carries a stable client mutation ID. The order API persists a server-computed canonical request hash and returns the original result only for an exact replay. Reusing an order mutation ID with a different payload returns `409`. Older orders without a stored hash keep the legacy replay behavior for rollout compatibility. Provider webhooks are verified against raw request bytes and deduplicated by provider event ID.
 
 ## Current limitations
 

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
+import { createOrderRequestHash } from "@/lib/order-idempotency";
 import { authorizeAnyOutletPermission, requirePermission, verifyManagerApprovalPin, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { allocatePaise, calculateSale, formatInvoiceNumber, indianFinancialYear, paymentStatus } from "@/lib/billing";
@@ -14,9 +15,15 @@ export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI, Other: PaymentMethod.OTHER };
 const types: Record<string, OrderType> = { "Dine in": OrderType.DINE_IN, Takeaway: OrderType.TAKEAWAY, Delivery: OrderType.DELIVERY, QR: OrderType.QR, Aggregator: OrderType.AGGREGATOR };
 const jsonSafe = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
-function redactOrder<T extends { subtotalPaise: unknown; items?: Array<Record<string, unknown>>; bill?: unknown }>(order: T) {
+const orderReplayInclude = { items: true, bill: { include: { payments: { include: { reversals: true } } } }, kots: { include: { items: true } } } satisfies Prisma.OrderInclude;
+type OrderReplay = Prisma.OrderGetPayload<{ include: typeof orderReplayInclude }>;
+function withoutOrderRequestHash<T extends { idempotencyPayloadHash?: string | null }>(order: T) {
+  const { idempotencyPayloadHash: _requestHash, ...publicOrder } = order;
+  return publicOrder;
+}
+function redactOrder<T extends { subtotalPaise: unknown; idempotencyPayloadHash?: string | null; items?: Array<Record<string, unknown>>; bill?: unknown }>(order: T) {
   return {
-    ...order,
+    ...withoutOrderRequestHash(order),
     subtotalPaise: undefined,
     discountPaise: undefined,
     taxPaise: undefined,
@@ -27,6 +34,9 @@ function redactOrder<T extends { subtotalPaise: unknown; items?: Array<Record<st
   };
 }
 class ConflictError extends Error {}
+class DuplicateOrderReplay extends Error {
+  constructor(readonly order: OrderReplay) { super("Order request already committed."); }
+}
 async function withSerializableRetry<T>(operation: () => Promise<T>, attempts = 3): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try { return await operation(); }
@@ -61,6 +71,7 @@ async function GETHandler(request: NextRequest) {
 async function POSTHandler(request: NextRequest) {
   let retryOutletId = "";
   let retryKey = "";
+  let retryRequestHash = "";
   let maySeeFinancials = false;
   try {
     const body = await readJsonObject(request);
@@ -75,8 +86,29 @@ async function POSTHandler(request: NextRequest) {
     const type = typeof body.type === "string" ? types[body.type] : undefined;
     const inputItems: Array<{ menuItemId: string; quantity: unknown; note?: unknown }> = Array.isArray(body.items) ? body.items : [];
     if (!idempotencyKey || idempotencyKey.length > 150 || !type || inputItems.length < 1 || inputItems.length > 100) return NextResponse.json({ error: "A valid clientMutationId, order type, and 1–100 items are required." }, { status: 400 });
-    const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId, idempotencyKey } }, include: { items: true, bill: { include: { payments: { include: { reversals: true } } } }, kots: { include: { items: true } } } });
-    if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
+    const requestHash = createOrderRequestHash({
+      outletId,
+      deviceId,
+      type,
+      items: inputItems.map((item) => ({
+        menuItemId: item.menuItemId,
+        quantity: Number.isFinite(Number(item.quantity)) ? Number(item.quantity) : item.quantity,
+        note: typeof item.note === "string" ? item.note.slice(0, 300) : null,
+      })),
+      paidPaise: Number(body.paidPaise ?? 0),
+      discountBps: Number(body.discountBps ?? 0),
+      paymentMethod: typeof body.paymentMethod === "string" ? body.paymentMethod : null,
+      customerId: typeof body.customerId === "string" ? body.customerId : null,
+      tableId: typeof body.tableId === "string" ? body.tableId : null,
+      buyerDetails: body.buyerDetails ?? null,
+      kitchenNote: typeof body.kitchenNote === "string" ? body.kitchenNote.trim().slice(0, 300) : null,
+    });
+    retryRequestHash = requestHash;
+    const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId, idempotencyKey } }, include: orderReplayInclude });
+    if (existing) {
+      if (existing.idempotencyPayloadHash && existing.idempotencyPayloadHash !== requestHash) return NextResponse.json({ error: "This clientMutationId is already used for a different order payload." }, { status: 409 });
+      return NextResponse.json({ order: jsonSafe(maySeeFinancials ? withoutOrderRequestHash(existing) : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
+    }
     const uniqueIds: string[] = [...new Set(inputItems.map((item) => typeof item.menuItemId === "string" ? item.menuItemId : ""))].filter((id) => id.length > 0);
     if (uniqueIds.length !== inputItems.length) return NextResponse.json({ error: "Every order line needs a menu item ID." }, { status: 400 });
     const outlet = await prisma.outlet.findFirst({
@@ -147,6 +179,11 @@ async function POSTHandler(request: NextRequest) {
     if (type === OrderType.DINE_IN && !tableId) return NextResponse.json({ error: "A table is required for dine-in orders." }, { status: 400 });
     if (type !== OrderType.DINE_IN && tableId) return NextResponse.json({ error: "Tables can only be assigned to dine-in orders." }, { status: 400 });
     const saved = await withSerializableRetry(() => prisma.$transaction(async (tx) => {
+      const committedOrder = await tx.order.findUnique({ where: { outletId_idempotencyKey: { outletId, idempotencyKey } }, include: orderReplayInclude });
+      if (committedOrder) {
+        if (committedOrder.idempotencyPayloadHash && committedOrder.idempotencyPayloadHash !== requestHash) throw new ConflictError("This clientMutationId is already used for a different order payload.");
+        throw new DuplicateOrderReplay(committedOrder);
+      }
       if (customerId) {
         const customer = await tx.customer.findFirst({ where: { id: customerId, tenantId: access.tenantId } });
         if (!customer) throw new ReferenceError("Customer not found in this restaurant.");
@@ -187,7 +224,8 @@ async function POSTHandler(request: NextRequest) {
       const invoiceNumber = formatInvoiceNumber(sequence.invoicePrefix, fiscalYear.label, invoiceSequenceNumber);
       const order = await tx.order.create({ data: {
         tenantId: access.tenantId, outletId, orderNumber: sequence.orderNextNumber - 1, type, status: "PREPARING", customerId, tableId, createdById: access.user.id,
-        deviceId, idempotencyKey, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),
+        deviceId, idempotencyKey, idempotencyPayloadHash: requestHash,
+        subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),
          items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.gstBps, taxCodeKindSnapshot: i.product.taxCodeKind, taxCodeSnapshot: i.product.taxCode, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
       }, include: { items: true } });
       await consumeRecipeStock({
@@ -246,18 +284,22 @@ async function POSTHandler(request: NextRequest) {
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }));
     void publishOutletEvent(access.tenantId, outletId, "order:new", { orderId: saved.order.id, orderNumber: saved.order.orderNumber, kotId: saved.kot?.id });
     for (const ticket of saved.kots) void publishOutletEvent(access.tenantId, outletId, "kot:created", { ticketId: ticket.id, kotNumber: ticket.kotNumber, orderId: saved.order.id });
-    const result = maySeeFinancials ? saved : { ...saved, order: redactOrder(saved.order), bill: undefined };
+    const result = maySeeFinancials ? { ...saved, order: withoutOrderRequestHash(saved.order) } : { ...saved, order: redactOrder(saved.order), bill: undefined };
     return NextResponse.json({ ...jsonSafe(result), replayed: false }, { status: 201 });
   } catch (error) {
     if (error instanceof InsufficientRecipeStockError) return NextResponse.json({ error: error.message, shortages: error.shortages }, { status: 409 });
+    if (error instanceof DuplicateOrderReplay) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? withoutOrderRequestHash(error.order) : redactOrder(error.order)), kot: jsonSafe(error.order.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(error.order.bill) } : {}), replayed: true });
     if (error instanceof ConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     if (error instanceof ReferenceError) return NextResponse.json({ error: error.message }, { status: 404 });
     if ((typeof error === "object" && error && "code" in error && error.code === "P2002") || isTransactionConflict(error)) {
       if (retryOutletId && retryKey) {
-        const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId: retryOutletId, idempotencyKey: retryKey } }, include: { items: true, bill: { include: { payments: { include: { reversals: true } } } }, kots: { include: { items: true } } } }).catch(() => null);
-        if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
+        const existing = await prisma.order.findUnique({ where: { outletId_idempotencyKey: { outletId: retryOutletId, idempotencyKey: retryKey } }, include: orderReplayInclude }).catch(() => null);
+        if (existing) {
+          if (existing.idempotencyPayloadHash && existing.idempotencyPayloadHash !== retryRequestHash) return NextResponse.json({ error: "This clientMutationId is already used for a different order payload." }, { status: 409 });
+          return NextResponse.json({ order: jsonSafe(maySeeFinancials ? withoutOrderRequestHash(existing) : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
+        }
       }
       return NextResponse.json({ error: "A conflicting order already exists. Retry with its original clientMutationId." }, { status: 409 });
     }

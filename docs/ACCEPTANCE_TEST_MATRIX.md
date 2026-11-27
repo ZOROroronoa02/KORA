@@ -24,7 +24,7 @@ This is an execution checklist, not evidence that the cases have passed. Run aga
 | POS-01 | Create dine-in order with two items, variant, add-on, and note | Correct prices and quantity snapshots persist; one initial KOT is created; table becomes occupied |
 | POS-02 | Add an item after the first KOT was sent | Only newly added/changed unsent items appear on a follow-up KOT; original ticket remains auditable |
 | POS-03 | Remove/void an item before and after KOT send | Before send, item disappears from ticket; after send, a cancellation/void instruction is recorded and audit reason is mandatory |
-| POS-04 | Send same create request twice with same idempotency key | One order, one bill, one initial KOT, and one payment at most; replay returns the original result |
+| POS-04 | Concurrently send the same create request twice with one idempotency key, then reuse the key with a changed item quantity | One create and one replay return the same order; changed payload returns `409`; one order, bill, KOT, and payment at most |
 | POS-05 | Send same request with a different key | A separate order is created only when business validation allows it |
 | POS-06 | Two terminals claim the same table simultaneously | One transaction succeeds; the other receives a clear conflict; no duplicate active table occupancy |
 | POS-07 | Transfer order to an occupied or cross-outlet table | Transfer is rejected; original order/table remains unchanged |

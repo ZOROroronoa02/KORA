@@ -148,11 +148,16 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
       body: JSON.stringify({ ...orderPayload, clientMutationId: `bad-buyer-${suffix}`, buyerDetails: { ...orderPayload.buyerDetails, gstin: '27ABCDE1234F1Z5' } }),
     });
     assert.equal(wrongBuyerStateResponse.status, 400);
-    const orderResponse = await fetch(`${api}/api/orders`, {
+    const concurrentOrderResponses = await Promise.all([1, 2].map(() => fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(orderPayload),
-    });
-    const created = await orderResponse.json();
-    assert.equal(orderResponse.status, 201, JSON.stringify(created));
+    })));
+    const concurrentOrderBodies = await Promise.all(concurrentOrderResponses.map((response) => response.json()));
+    assert.deepEqual(concurrentOrderResponses.map((response) => response.status).sort(), [200, 201], JSON.stringify(concurrentOrderBodies));
+    const createdIndex = concurrentOrderResponses.findIndex((response) => response.status === 201);
+    const replayIndex = 1 - createdIndex;
+    const created = concurrentOrderBodies[createdIndex];
+    assert.equal(concurrentOrderBodies[replayIndex].replayed, true);
+    assert.equal(concurrentOrderBodies[replayIndex].order.id, created.order.id);
     assert.equal(created.order.items.length, 1);
     assert.equal(created.order.items[0].quantity, 2);
     assert.equal(created.kot.sequence, 1);
@@ -165,6 +170,7 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(created.bill.recipientGstinSnapshot, '29ABCDE1234F1Z5');
     assert.equal(created.order.items[0].taxCodeKindSnapshot, 'SAC');
     assert.equal(created.order.items[0].taxCodeSnapshot, '996331');
+    assert.equal(Object.hasOwn(created.order, 'idempotencyPayloadHash'), false, 'internal request hashes must not be returned to POS clients');
     assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 1500n, 'recipe stock is deducted atomically with the order');
     const saleMovement = await prisma.stockMovement.findFirst({ where: { outletId: registration.outlet.id, referenceId: created.order.items[0].id, type: 'SALE' } });
     assert.equal(saleMovement?.quantityMilli, -1500n);
@@ -203,8 +209,15 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(replayResponse.status, 200);
     assert.equal(replay.replayed, true);
     assert.equal(replay.order.id, created.order.id);
+    assert.equal(Object.hasOwn(replay.order, 'idempotencyPayloadHash'), false, 'replay responses must not expose internal hashes');
     assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 1500n, 'idempotent order replay must not deduct stock again');
     assert.equal(await prisma.order.count({ where: { tenantId } }), 1);
+    const mutationIdCollision = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...orderPayload, items: [{ menuItemId: item.id, quantity: 1 }] }),
+    });
+    assert.equal(mutationIdCollision.status, 409, 'reusing an idempotency key with a different request must conflict');
+    assert.equal(await prisma.order.count({ where: { tenantId } }), 1, 'a conflicting idempotency-key reuse must not create or alter an order');
 
     const queuedVoidResponse = await fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },

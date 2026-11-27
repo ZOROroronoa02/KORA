@@ -478,6 +478,7 @@ model Order {
   source              String               @default("POS")
   deviceId            String?
   idempotencyKey      String
+  idempotencyPayloadHash String?
   subtotalPaise       BigInt               @default(0)
   discountPaise       BigInt               @default(0)
   taxPaise            BigInt               @default(0)
