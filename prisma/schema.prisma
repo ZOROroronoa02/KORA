@@ -87,6 +87,7 @@ enum ShiftStatus {
 enum StockMovementType {
   PURCHASE
   SALE
+  SALE_REVERSAL
   WASTAGE
   ADJUSTMENT
   TRANSFER
@@ -165,6 +166,7 @@ model Outlet {
   shifts               Shift[]
   customers            CustomerOutlet[]
   materials            RawMaterial[]
+  recipes              Recipe[]
   stockMovements       StockMovement[]
   purchases            Purchase[]
   wastage              Wastage[]
@@ -362,7 +364,7 @@ model MenuItem {
   variants       ItemVariant[]
   addons         ItemAddon[]
   outletPrices   OutletMenuItem[]
-  recipe         Recipe?
+  recipes        Recipe[]
   happyHours     HappyHour[]
   orderItems     OrderItem[]
 
@@ -380,6 +382,7 @@ model OutletMenuItem {
   outlet     Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
   menuItem   MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
   station    Station? @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  recipes    Recipe[]
 
   @@id([outletId, menuItemId])
   @@map("outlet_menu_items")
@@ -810,14 +813,19 @@ model RawMaterial {
 }
 
 model Recipe {
-  id            String             @id @default(cuid())
-  tenantId      String
-  menuItemId    String             @unique
-  yieldQuantity Int                @default(1)
-  tenant        Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  menuItem      MenuItem           @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
-  ingredients   RecipeIngredient[]
+  id             String             @id @default(cuid())
+  tenantId       String
+  outletId       String
+  menuItemId     String
+  yieldQuantity  Int                @default(1)
+  tenant         Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet         Outlet             @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  menuItem       MenuItem           @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  outletMenuItem OutletMenuItem     @relation(fields: [outletId, menuItemId], references: [outletId, menuItemId], onDelete: Cascade, onUpdate: Cascade)
+  ingredients    RecipeIngredient[]
 
+  @@unique([outletId, menuItemId])
+  @@index([tenantId, outletId])
   @@map("recipes")
 }
 
@@ -863,17 +871,20 @@ model PurchaseLine {
 }
 
 model StockMovement {
-  id            String            @id @default(cuid())
-  outletId      String
-  rawMaterialId String
-  type          StockMovementType
-  quantityMilli BigInt
-  unitCostPaise BigInt?
-  referenceId   String?
-  reason        String?
-  createdAt     DateTime          @default(now())
-  outlet        Outlet            @relation(fields: [outletId], references: [id], onDelete: Cascade)
-  rawMaterial   RawMaterial       @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
+  id                            String            @id @default(cuid())
+  outletId                      String
+  rawMaterialId                 String
+  type                          StockMovementType
+  quantityMilli                 BigInt
+  unitCostPaise                 BigInt?
+  referenceId                   String?
+  recipeYieldQuantity           Int?
+  recipeIngredientQuantityMilli BigInt?
+  recipeQuantityBefore          BigInt?
+  reason                        String?
+  createdAt                     DateTime          @default(now())
+  outlet                        Outlet            @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  rawMaterial                   RawMaterial       @relation(fields: [rawMaterialId], references: [id], onDelete: Cascade)
 
   @@index([outletId, rawMaterialId, createdAt])
   @@map("stock_movements")

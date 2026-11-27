@@ -96,9 +96,9 @@ const policies: Record<string, ScopePolicy> = {
   },
   Vendor: { direct: (scope) => ({ tenantId: scope.tenantId }) },
   RawMaterial: { direct: (scope) => ({ tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }) },
-  Recipe: { direct: (scope) => ({ tenantId: scope.tenantId }) },
+  Recipe: { direct: (scope) => ({ tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }) },
   RecipeIngredient: {
-    related: (scope) => ({ recipe: { tenantId: scope.tenantId }, rawMaterial: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) } }),
+    related: (scope) => ({ recipe: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }, rawMaterial: { tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) } }),
   },
   Purchase: { direct: (scope) => ({ tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }) },
   PurchaseLine: {

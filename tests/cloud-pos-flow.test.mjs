@@ -126,12 +126,23 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(shiftOpenResponse.status, 201, await shiftOpenResponse.text());
 
     const clientMutationId = `cloud-flow-${suffix}`;
+    const recipeMaterial = await prisma.rawMaterial.create({ data: { tenantId, outletId: registration.outlet.id, name: `Sale rice ${suffix}`, unit: 'kg', quantityMilli: 1000n, reorderMilli: 500n } });
+    const saleRecipe = await prisma.recipe.create({ data: { tenantId, outletId: registration.outlet.id, menuItemId: item.id, yieldQuantity: 2, ingredients: { create: [{ rawMaterialId: recipeMaterial.id, quantityMilli: 1500n }] } } });
     const orderPayload = {
       outletId: registration.outlet.id, clientMutationId, deviceId: `device-${suffix}`,
       type: 'Dine in', tableId: firstTable.id, items: [{ menuItemId: item.id, quantity: 2 }],
       paidPaise: 0, discountBps: 0,
       buyerDetails: { name: 'Aarav Shah', gstin: '29ABCDE1234F1Z5', address: { line1: '20 Main Road', line2: '', city: 'Bengaluru', state: 'Karnataka', pincode: '560038' } },
     };
+    const blockedForShortage = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...orderPayload, clientMutationId: `short-stock-${suffix}` }),
+    });
+    const shortageResponse = await blockedForShortage.json();
+    assert.equal(blockedForShortage.status, 409, JSON.stringify(shortageResponse));
+    assert.equal(shortageResponse.shortages[0].material, recipeMaterial.name);
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 1000n, 'blocked sales must leave stock unchanged');
+    await prisma.rawMaterial.update({ where: { id: recipeMaterial.id }, data: { quantityMilli: 3000n } });
     const wrongBuyerStateResponse = await fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ ...orderPayload, clientMutationId: `bad-buyer-${suffix}`, buyerDetails: { ...orderPayload.buyerDetails, gstin: '27ABCDE1234F1Z5' } }),
@@ -154,6 +165,12 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(created.bill.recipientGstinSnapshot, '29ABCDE1234F1Z5');
     assert.equal(created.order.items[0].taxCodeKindSnapshot, 'SAC');
     assert.equal(created.order.items[0].taxCodeSnapshot, '996331');
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 1500n, 'recipe stock is deducted atomically with the order');
+    const saleMovement = await prisma.stockMovement.findFirst({ where: { outletId: registration.outlet.id, referenceId: created.order.items[0].id, type: 'SALE' } });
+    assert.equal(saleMovement?.quantityMilli, -1500n);
+    assert.equal(saleMovement?.recipeYieldQuantity, 2);
+    assert.equal(saleMovement?.recipeIngredientQuantityMilli, 1500n);
+    assert.equal(saleMovement?.recipeQuantityBefore, 0n);
     assert.equal(created.bill.supplierNameSnapshot, registration.tenant.name);
     const unitPricePaise = BigInt(item.outletPrices[0]?.pricePaise ?? item.basePricePaise);
     const expectedSubtotalPaise = unitPricePaise * 2n;
@@ -186,7 +203,89 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(replayResponse.status, 200);
     assert.equal(replay.replayed, true);
     assert.equal(replay.order.id, created.order.id);
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 1500n, 'idempotent order replay must not deduct stock again');
     assert.equal(await prisma.order.count({ where: { tenantId } }), 1);
+
+    const queuedVoidResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `void-queued-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    const queuedVoidOrder = await queuedVoidResponse.json();
+    assert.equal(queuedVoidResponse.status, 201, JSON.stringify(queuedVoidOrder));
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 750n);
+    await prisma.recipeIngredient.update({ where: { recipeId_rawMaterialId: { recipeId: saleRecipe.id, rawMaterialId: recipeMaterial.id } }, data: { quantityMilli: 3000n } });
+    const queuedVoid = await fetch(`${api}/api/orders/${queuedVoidOrder.order.id}`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: registration.outlet.id, action: 'void', reason: 'Guest cancelled before prep' }) });
+    assert.equal(queuedVoid.status, 200, await queuedVoid.text());
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 1500n, 'void restores from the sale-time BOM snapshot after recipe edits');
+    assert.equal(await prisma.stockMovement.count({ where: { outletId: registration.outlet.id, referenceId: queuedVoidOrder.order.id, type: 'SALE_REVERSAL' } }), 1);
+    await prisma.recipeIngredient.update({ where: { recipeId_rawMaterialId: { recipeId: saleRecipe.id, rawMaterialId: recipeMaterial.id } }, data: { quantityMilli: 1500n } });
+
+    const queuedMaterial = await prisma.rawMaterial.create({ data: { tenantId, outletId: registration.outlet.id, name: `Queued portion ${suffix}`, unit: 'g', quantityMilli: 1000n } });
+    await prisma.recipe.create({ data: { tenantId, outletId: registration.outlet.id, menuItemId: addedMenuItem.id, yieldQuantity: 2, ingredients: { create: [{ rawMaterialId: queuedMaterial.id, quantityMilli: 1000n }] } } });
+    const mixedVoidResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `void-mixed-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 2 }, { menuItemId: addedMenuItem.id, quantity: 2 }], paidPaise: 0 }),
+    });
+    const mixedVoidOrder = await mixedVoidResponse.json();
+    assert.equal(mixedVoidResponse.status, 201, JSON.stringify(mixedVoidOrder));
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 0n);
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: queuedMaterial.id } })).quantityMilli, 0n);
+    const startedOrderItem = mixedVoidOrder.order.items.find(({ menuItemId }) => menuItemId === item.id);
+    const startedKot = mixedVoidOrder.kots.find(({ items }) => items.some(({ orderItemId }) => orderItemId === startedOrderItem.id));
+    const startedKotItem = startedKot.items.find(({ orderItemId }) => orderItemId === startedOrderItem.id);
+    const startMixedKitchen = await fetch(`${api}/api/kds/actions`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, ticketId: startedKot.id, itemId: startedKotItem.id, action: 'item-cycle', clientMutationId: `start-mixed-${suffix}` }),
+    });
+    assert.equal(startMixedKitchen.status, 200, await startMixedKitchen.text());
+    const mixedVoid = await fetch(`${api}/api/orders/${mixedVoidOrder.order.id}`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: registration.outlet.id, action: 'void', reason: 'Guest cancelled one item before prep' }) });
+    assert.equal(mixedVoid.status, 200, await mixedVoid.text());
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 0n, 'cooking item consumption stays deducted');
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: queuedMaterial.id } })).quantityMilli, 1000n, 'queued item consumption is restored');
+
+    await prisma.rawMaterial.update({ where: { id: recipeMaterial.id }, data: { quantityMilli: 1500n } });
+    const cookingVoidResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `void-cooking-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 2 }], paidPaise: 0 }),
+    });
+    const cookingVoidOrder = await cookingVoidResponse.json();
+    assert.equal(cookingVoidResponse.status, 201, JSON.stringify(cookingVoidOrder));
+    const startedItem = cookingVoidOrder.kot.items[0];
+    const startKitchen = await fetch(`${api}/api/kds/actions`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, ticketId: cookingVoidOrder.kot.id, itemId: startedItem.id, action: 'item-cycle', clientMutationId: `start-void-${suffix}` }),
+    });
+    assert.equal(startKitchen.status, 200, await startKitchen.text());
+    const preparedVoid = await fetch(`${api}/api/orders/${cookingVoidOrder.order.id}`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: registration.outlet.id, action: 'void', reason: 'Guest cancelled after prep began' }) });
+    assert.equal(preparedVoid.status, 200, await preparedVoid.text());
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 0n, 'void does not restore ingredients for items already cooking');
+
+    await prisma.rawMaterial.update({ where: { id: recipeMaterial.id }, data: { quantityMilli: 750n } });
+    const missingKotResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `void-untracked-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    const missingKotOrder = await missingKotResponse.json();
+    assert.equal(missingKotResponse.status, 201, JSON.stringify(missingKotOrder));
+    await prisma.kOTItem.deleteMany({ where: { kotId: missingKotOrder.kot.id } });
+    const untrackedVoid = await fetch(`${api}/api/orders/${missingKotOrder.order.id}`, { method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: registration.outlet.id, action: 'void', reason: 'KOT state missing test' }) });
+    assert.equal(untrackedVoid.status, 200, await untrackedVoid.text());
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, 0n, 'missing KOT state must not restore unverified stock');
+    const untrackedAudit = await prisma.auditLog.findFirst({ where: { tenantId, outletId: registration.outlet.id, entityId: missingKotOrder.order.id, action: 'ORDER_VOIDED' } });
+    assert.equal(untrackedAudit?.after?.stockUntrackedOrderItems, 1);
+
+    const allowNegativePolicy = await fetch(`${api}/api/outlet-settings`, { method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: registration.outlet.id, stockShortagePolicy: 'ALLOW_NEGATIVE' }) });
+    assert.equal(allowNegativePolicy.status, 200, await allowNegativePolicy.text());
+    const negativeSaleResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `allow-negative-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    const negativeSale = await negativeSaleResponse.json();
+    assert.equal(negativeSaleResponse.status, 201, JSON.stringify(negativeSale));
+    assert.equal((await prisma.rawMaterial.findUniqueOrThrow({ where: { id: recipeMaterial.id } })).quantityMilli, -750n);
+    assert.ok(await prisma.auditLog.findFirst({ where: { tenantId, outletId: registration.outlet.id, action: 'STOCK_SHORTAGE_ALLOWED', entityId: negativeSale.order.id } }));
+    const blockShortagePolicy = await fetch(`${api}/api/outlet-settings`, { method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: registration.outlet.id, stockShortagePolicy: 'BLOCK' }) });
+    assert.equal(blockShortagePolicy.status, 200);
 
     const occupiedTables = await (await fetch(`${api}/api/tables?outletId=${registration.outlet.id}`, { headers })).json();
     assert.equal(occupiedTables.tables.find((table) => table.id === firstTable.id).occupied, true);
@@ -209,8 +308,8 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const orderListResponse = await fetch(`${api}/api/orders?outletId=${registration.outlet.id}`, { headers });
     const orderList = await orderListResponse.json();
     assert.equal(orderListResponse.status, 200);
-    assert.equal(orderList[0].id, created.order.id);
-    assert.equal(orderList[0].table.label, firstTable.label);
+    const listedOrder = orderList.find(({ id }) => id === created.order.id);
+    assert.equal(listedOrder?.table.label, firstTable.label);
 
     const readyResponse = await fetch(`${api}/api/orders/${created.order.id}`, {
       method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' },
@@ -268,6 +367,7 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const guestLink = await prisma.customerOutlet.findUnique({ where: { customerId_outletId: { customerId: guest.id, outletId: registration.outlet.id } } });
     assert.equal(guestLink.visits, 0, 'profile creation must not count as a visit');
 
+    await prisma.rawMaterial.update({ where: { id: recipeMaterial.id }, data: { quantityMilli: 1500n } });
     const guestOrderPayload = { outletId: registration.outlet.id, clientMutationId: `guest-order-${suffix}`, deviceId: `device-${suffix}`, type: 'Takeaway', customerId: guest.id, items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 500, paymentMethod: 'Cash' };
     const guestOrderResponse = await fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(guestOrderPayload),

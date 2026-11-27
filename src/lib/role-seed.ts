@@ -13,6 +13,7 @@ export const defaultOutletSettings = {
   kdsSoundEnabled: true,
   kdsColumnsByStation: {},
   hiddenReports: {},
+  stockShortagePolicy: "BLOCK",
 };
 
 export async function ensureTenantSystemRoles(tx: Prisma.TransactionClient, tenantId: string) {

@@ -128,14 +128,19 @@ WITH violations(issue) AS (
     LEFT JOIN public.outlets o ON o.id = m."outletId"
     WHERE m."tenantId" IS DISTINCT FROM o."tenantId"
   UNION ALL
-  SELECT 'recipes.menu_tenant' FROM public.recipes r
+  SELECT 'recipes.ownership' FROM public.recipes r
     LEFT JOIN public.menu_items i ON i.id = r."menuItemId"
+    LEFT JOIN public.outlets o ON o.id = r."outletId"
+    LEFT JOIN public.outlet_menu_items omi ON omi."outletId" = r."outletId" AND omi."menuItemId" = r."menuItemId"
     WHERE r."tenantId" IS DISTINCT FROM i."tenantId"
+       OR r."tenantId" IS DISTINCT FROM o."tenantId"
+       OR omi."menuItemId" IS NULL
   UNION ALL
-  SELECT 'recipe_ingredients.tenant' FROM public.recipe_ingredients ri
+  SELECT 'recipe_ingredients.outlet' FROM public.recipe_ingredients ri
     LEFT JOIN public.recipes r ON r.id = ri."recipeId"
     LEFT JOIN public.raw_materials m ON m.id = ri."rawMaterialId"
     WHERE r."tenantId" IS DISTINCT FROM m."tenantId"
+       OR r."outletId" IS DISTINCT FROM m."outletId"
   UNION ALL
   SELECT 'purchases.ownership' FROM public.purchases p
     LEFT JOIN public.outlets o ON o.id = p."outletId"

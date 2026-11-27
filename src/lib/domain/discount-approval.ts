@@ -2,6 +2,13 @@ export type DiscountApprovalPolicy = {
   discountApprovalThresholdPct?: number;
 };
 
+export type StockShortagePolicy = "BLOCK" | "ALLOW_NEGATIVE";
+
+export function stockShortagePolicyForOutlet(value: unknown): StockShortagePolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "BLOCK";
+  return (value as Record<string, unknown>).stockShortagePolicy === "ALLOW_NEGATIVE" ? "ALLOW_NEGATIVE" : "BLOCK";
+}
+
 /** Returns true only when a valid discount crosses the outlet's approval threshold. */
 export function requiresDiscountApproval(discountBps: number, settings: DiscountApprovalPolicy) {
   if (!Number.isInteger(discountBps) || discountBps < 0 || discountBps > 10_000) {

@@ -8,6 +8,7 @@ import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { isTransactionConflict } from "@/lib/db-conflicts";
 import { gstProfileDefaults, gstRateForItem, gstStateCodeForName, hasInvoiceAddress } from "@/lib/domain/gst-profile";
+import { consumeRecipeStock, InsufficientRecipeStockError } from "@/lib/inventory-stock";
 
 export const runtime = "nodejs";
 class KdsOrderConflict extends Error { constructor(message: string) { super(message); this.name = "KdsOrderConflict"; } }
@@ -100,8 +101,16 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
           unitPricePaise: BigInt(line.pricePaise), gstBps: line.gstBps, taxCodeKindSnapshot: line.product.taxCodeKind, taxCodeSnapshot: line.product.taxCode, discountPaise: discount,
           totalPaise: BigInt(line.pricePaise * line.input.quantity) - discount, notes: line.input.note,
         } });
-        addedOrderItems.push({ orderItem, stationId: line.product.outletPrices[0].stationId ?? generalStation?.id ?? null });
+        addedOrderItems.push({ orderItem, menuItemId: line.product.id, stationId: line.product.outletPrices[0].stationId ?? generalStation?.id ?? null });
       }
+      await consumeRecipeStock({
+        tx,
+        tenantId: access.tenantId,
+        outletId,
+        orderId,
+        orderNumber: order.orderNumber,
+        lines: addedOrderItems.map(({ orderItem, menuItemId }) => ({ orderItemId: orderItem.id, menuItemId, quantity: orderItem.quantity })),
+      });
       const groups = new Map<string, typeof addedOrderItems>();
       for (const entry of addedOrderItems) {
         const key = entry.stationId ?? "";
@@ -147,6 +156,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
     return NextResponse.json(saved.response, { status: 201 });
   } catch (error) {
     if (error instanceof KdsOrderConflict) return NextResponse.json({ error: error.message }, { status: 409 });
+    if (error instanceof InsufficientRecipeStockError) return NextResponse.json({ error: error.message, shortages: error.shortages }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });
     if (typeof error === "object" && error && "code" in error && error.code === "P2002") {

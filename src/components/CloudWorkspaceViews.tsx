@@ -26,6 +26,9 @@ type CloudMaterial = {
 };
 
 type CloudVendor = { id: string; name: string; phone: string | null; email: string | null; gstin: string | null; active: boolean };
+type CloudRecipeIngredient = { rawMaterialId: string; quantityMilli: string; rawMaterial: { id: string; name: string; unit: string; quantityMilli: string } };
+type CloudRecipe = { id: string; menuItemId: string; yieldQuantity: number; menuItem: { id: string; name: string }; ingredients: CloudRecipeIngredient[] };
+type CloudRecipeMenuItem = { id: string; name: string };
 
 export function CloudOverview({
   outletName,
@@ -112,18 +115,29 @@ function parseRupeesToPaise(value: string): bigint | null {
   return BigInt(rupees) * 100n + BigInt((paise + "00").slice(0, 2));
 }
 
-function formatMilliQuantity(value: string, unit: string) {
+function formatMilliInput(value: string) {
   const milli = BigInt(value);
   const whole = milli / 1000n;
   const fraction = (milli % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
-  return `${new Intl.NumberFormat("en-IN").format(whole)}${fraction ? `.${fraction}` : ""} ${unit}`;
+  return `${whole}${fraction ? `.${fraction}` : ""}`;
+}
+
+function formatMilliQuantity(value: string, unit: string) {
+  const signedMilli = BigInt(value);
+  const magnitude = signedMilli < 0n ? -signedMilli : signedMilli;
+  const whole = magnitude / 1000n;
+  const fraction = (magnitude % 1000n).toString().padStart(3, "0").replace(/0+$/, "");
+  return `${signedMilli < 0n ? "−" : ""}${new Intl.NumberFormat("en-IN").format(whole)}${fraction ? `.${fraction}` : ""} ${unit}`;
 }
 
 function formatStockValue(material: CloudMaterial) {
-  const paise = (BigInt(material.quantityMilli) * BigInt(material.costPerUnitPaise) + 500n) / 1000n;
-  const rupees = paise / 100n;
-  const fraction = (paise % 100n).toString().padStart(2, "0");
-  return `${new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(rupees)}.${fraction}`;
+  const rawPaise = BigInt(material.quantityMilli) * BigInt(material.costPerUnitPaise);
+  const roundedPaise = (rawPaise < 0n ? -((-rawPaise + 500n) / 1000n) : (rawPaise + 500n) / 1000n);
+  const magnitude = roundedPaise < 0n ? -roundedPaise : roundedPaise;
+  const rupees = magnitude / 100n;
+  const fraction = (magnitude % 100n).toString().padStart(2, "0");
+  const formattedRupees = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(rupees);
+  return `${roundedPaise < 0n ? "−" : ""}${formattedRupees}.${fraction}`;
 }
 
 export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: string; canAdjustStock: boolean }) {
@@ -157,6 +171,20 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
   const [vendorEmail, setVendorEmail] = useState("");
   const [vendorGstin, setVendorGstin] = useState("");
   const [savingVendor, setSavingVendor] = useState(false);
+  const [recipes, setRecipes] = useState<CloudRecipe[]>([]);
+  const [recipeMenuItems, setRecipeMenuItems] = useState<CloudRecipeMenuItem[]>([]);
+  const [recipeCursor, setRecipeCursor] = useState<string | null>(null);
+  const [recipeMenuCursor, setRecipeMenuCursor] = useState<string | null>(null);
+  const [recipeLoading, setRecipeLoading] = useState(true);
+  const [recipeLoadingMore, setRecipeLoadingMore] = useState(false);
+  const [recipeError, setRecipeError] = useState("");
+  const [recipeNotice, setRecipeNotice] = useState("");
+  const [recipeEditorOpen, setRecipeEditorOpen] = useState(false);
+  const [recipeOperation, setRecipeOperation] = useState<"create" | "update">("create");
+  const [editingRecipeMenuItemId, setEditingRecipeMenuItemId] = useState("");
+  const [recipeYield, setRecipeYield] = useState("1");
+  const [recipeIngredients, setRecipeIngredients] = useState<Array<{ rawMaterialId: string; quantity: string }>>([]);
+  const [savingRecipe, setSavingRecipe] = useState(false);
 
   useEffect(() => {
     setMovementOpen(false);
@@ -167,6 +195,9 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     setMaterialError("");
     setVendorFormOpen(false);
     setVendorError("");
+    setRecipeEditorOpen(false);
+    setRecipeError("");
+    setRecipeNotice("");
   }, [outletId]);
 
   useEffect(() => {
@@ -191,6 +222,32 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
       .then((result) => { if (!cancelled) { setVendors(result.items); setVendorCursor(result.nextCursor); } })
       .catch((reason: unknown) => { if (!cancelled) setVendorError(reason instanceof Error ? reason.message : "Could not load outlet vendors."); })
       .finally(() => { if (!cancelled) setVendorLoading(false); });
+    return () => { cancelled = true; };
+  }, [outletId, refreshKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRecipeLoading(true);
+    setRecipeError("");
+    setRecipes([]);
+    setRecipeMenuItems([]);
+    setRecipeCursor(null);
+    setRecipeMenuCursor(null);
+    if (!outletId) {
+      setRecipeLoading(false);
+      return;
+    }
+    void readJson<{ recipes: CloudRecipe[]; nextCursor: string | null; menuItems: CloudRecipeMenuItem[]; nextMenuCursor: string | null }>(`/api/inventory/recipes?outletId=${encodeURIComponent(outletId)}&take=100&menuTake=100`)
+      .then((result) => {
+        if (!cancelled) {
+          setRecipes(result.recipes);
+          setRecipeCursor(result.nextCursor);
+          setRecipeMenuItems(result.menuItems);
+          setRecipeMenuCursor(result.nextMenuCursor);
+        }
+      })
+      .catch((reason: unknown) => { if (!cancelled) setRecipeError(reason instanceof Error ? reason.message : "Could not load outlet recipes."); })
+      .finally(() => { if (!cancelled) setRecipeLoading(false); });
     return () => { cancelled = true; };
   }, [outletId, refreshKey]);
 
@@ -319,6 +376,100 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     }
   };
 
+  const openRecipeEditor = (recipe?: CloudRecipe) => {
+    setRecipeError("");
+    setRecipeNotice("");
+    if (recipe) {
+      setRecipeOperation("update");
+      setRecipeMenuItems((current) => current.some((item) => item.id === recipe.menuItemId) ? current : [...current, recipe.menuItem]);
+      setEditingRecipeMenuItemId(recipe.menuItemId);
+      setRecipeYield(String(recipe.yieldQuantity));
+      setRecipeIngredients(recipe.ingredients.map((ingredient) => ({ rawMaterialId: ingredient.rawMaterialId, quantity: formatMilliInput(ingredient.quantityMilli) })));
+    } else {
+      setRecipeOperation("create");
+      const configured = new Set(recipes.map((item) => item.menuItemId));
+      const firstAvailable = recipeMenuItems.find((item) => !configured.has(item.id));
+      setEditingRecipeMenuItemId(firstAvailable?.id ?? "");
+      setRecipeYield("1");
+      setRecipeIngredients([{ rawMaterialId: materials[0]?.id ?? "", quantity: "" }]);
+    }
+    setRecipeEditorOpen(true);
+  };
+
+  const submitRecipe = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setRecipeError("");
+    setRecipeNotice("");
+    const yieldQuantity = Number(recipeYield);
+    const mappedIngredients = recipeIngredients.map((ingredient) => ({ rawMaterialId: ingredient.rawMaterialId, quantityMilli: parseMilliQuantity(ingredient.quantity) }));
+    if (!editingRecipeMenuItemId || !Number.isSafeInteger(yieldQuantity) || yieldQuantity < 1 || yieldQuantity > 10000) {
+      setRecipeError("Select a menu item and enter a batch yield from 1 to 10,000 portions.");
+      return;
+    }
+    if (mappedIngredients.length < 1 || mappedIngredients.length > 50 || mappedIngredients.some((item) => !item.rawMaterialId || item.quantityMilli === null) || new Set(mappedIngredients.map((item) => item.rawMaterialId)).size !== mappedIngredients.length) {
+      setRecipeError("Choose unique outlet ingredients and enter positive quantities with up to three decimal places.");
+      return;
+    }
+    setSavingRecipe(true);
+    try {
+      await readJson<{ recipe: CloudRecipe }>("/api/inventory/recipes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operation: recipeOperation, outletId, menuItemId: editingRecipeMenuItemId, yieldQuantity, ingredients: mappedIngredients.map((item) => ({ rawMaterialId: item.rawMaterialId, quantityMilli: item.quantityMilli!.toString() })) }),
+      });
+      setRecipeEditorOpen(false);
+      setRecipeNotice("Recipe saved for this outlet. Stock deduction on sales is not enabled yet.");
+      setRefreshKey((key) => key + 1);
+    } catch (reason) {
+      setRecipeError(reason instanceof Error ? reason.message : "Could not save this recipe.");
+    } finally {
+      setSavingRecipe(false);
+    }
+  };
+
+  const deleteRecipe = async (recipe: CloudRecipe) => {
+    if (!window.confirm(`Remove the recipe for ${recipe.menuItem.name}? Historical orders will not be changed.`)) return;
+    setRecipeError("");
+    setRecipeNotice("");
+    try {
+      await readJson(`/api/inventory/recipes?outletId=${encodeURIComponent(outletId)}&menuItemId=${encodeURIComponent(recipe.menuItemId)}`, { method: "DELETE" });
+      setRecipeNotice(`Recipe for ${recipe.menuItem.name} removed.`);
+      setRefreshKey((key) => key + 1);
+    } catch (reason) {
+      setRecipeError(reason instanceof Error ? reason.message : "Could not remove this recipe.");
+    }
+  };
+
+  const loadMoreRecipes = async () => {
+    if (!recipeCursor || recipeLoadingMore) return;
+    setRecipeLoadingMore(true);
+    setRecipeError("");
+    try {
+      const result = await readJson<{ recipes: CloudRecipe[]; nextCursor: string | null }>(`/api/inventory/recipes?outletId=${encodeURIComponent(outletId)}&take=100&cursor=${encodeURIComponent(recipeCursor)}&menuTake=1`);
+      setRecipes((current) => [...current, ...result.recipes]);
+      setRecipeCursor(result.nextCursor);
+    } catch (reason) {
+      setRecipeError(reason instanceof Error ? reason.message : "Could not load more recipes.");
+    } finally {
+      setRecipeLoadingMore(false);
+    }
+  };
+
+  const loadMoreRecipeMenuItems = async () => {
+    if (!recipeMenuCursor || recipeLoadingMore) return;
+    setRecipeLoadingMore(true);
+    setRecipeError("");
+    try {
+      const result = await readJson<{ menuItems: CloudRecipeMenuItem[]; nextMenuCursor: string | null }>(`/api/inventory/recipes?outletId=${encodeURIComponent(outletId)}&take=1&menuTake=100&menuCursor=${encodeURIComponent(recipeMenuCursor)}`);
+      setRecipeMenuItems((current) => [...current, ...result.menuItems]);
+      setRecipeMenuCursor(result.nextMenuCursor);
+    } catch (reason) {
+      setRecipeError(reason instanceof Error ? reason.message : "Could not load more menu items.");
+    } finally {
+      setRecipeLoadingMore(false);
+    }
+  };
+
   return <>
     <div className="page-title-row"><div><p className="eyebrow">BACK OF HOUSE · LIVE DATA</p><h1>Inventory</h1><p className="muted">Current raw-material balances for this outlet.</p></div><div className="title-actions">{canAdjustStock && <button className="primary-button" onClick={() => { setMaterialOpen(true); setMaterialError(""); }}><Plus size={15} /> Add ingredient</button>}{canAdjustStock && materials.length > 0 && <button className="secondary-button" onClick={() => { setSelectedMaterialId(materials[0].id); setMovementOpen(true); setMovementError(""); }}><Package size={15} /> Record stock movement</button>}<button className="secondary-button" onClick={() => setRefreshKey((key) => key + 1)} disabled={loading}><RefreshCw size={15} /> Refresh stock</button></div></div>
     {error && <div className="cloud-data-notice" role="alert"><AlertTriangle size={16} /><span>{error}</span></div>}
@@ -358,13 +509,38 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
         {materials.map((material) => {
           const quantity = BigInt(material.quantityMilli);
           const reorder = BigInt(material.reorderMilli);
-          const status = quantity === 0n ? "Out of stock" : quantity <= reorder ? "Reorder" : "In stock";
+          const status = quantity < 0n ? "Shortage" : quantity === 0n ? "Out of stock" : quantity <= reorder ? "Reorder" : "In stock";
           return <div className="inventory-row cloud-inventory-row" key={material.id}>
             <span className="cloud-material-name"><b>{material.name}</b>{canAdjustStock && <button type="button" className="cloud-stock-action" onClick={() => { setSelectedMaterialId(material.id); setMovementOpen(true); setMovementError(""); }} aria-label={`Record stock movement for ${material.name}`}>Adjust</button>}</span><span>{formatMilliQuantity(material.quantityMilli, material.unit)}</span><span>{formatMilliQuantity(material.reorderMilli, material.unit)}</span><span><span className="role-tag">{status}</span></span><b>{formatStockValue(material)}</b>
           </div>;
         })}
       </div>}
     </div>
+    <section className="card content-card cloud-recipes" aria-labelledby="cloud-recipes-title">
+      <div className="cloud-vendors-heading"><div><h2 id="cloud-recipes-title">Outlet recipes</h2><p className="muted">Define raw materials and batch yield for each menu item in this outlet.</p></div>{canAdjustStock && <button className="primary-button" onClick={() => openRecipeEditor()} disabled={!materials.length || (!recipeMenuItems.some((item) => !recipes.some((recipe) => recipe.menuItemId === item.id)) && !recipeMenuCursor)}><Plus size={15} /> Add recipe</button>}</div>
+      {recipeError && <div className="cloud-data-notice" role="alert"><AlertTriangle size={15} /><span>{recipeError}</span></div>}
+      {recipeNotice && <div className="cloud-data-notice" role="status" aria-live="polite"><Package size={15} /><span>{recipeNotice}</span></div>}
+      {recipeEditorOpen && canAdjustStock && <form className="recipe-form" onSubmit={submitRecipe} aria-label="Recipe editor">
+        <div className="recipe-fields">
+          <label>Menu item<select required value={editingRecipeMenuItemId} disabled={recipeOperation === "update"} onChange={(event) => setEditingRecipeMenuItemId(event.target.value)}><option value="">Select a menu item</option>{recipeMenuItems.map((item) => { const configured = recipes.some((recipe) => recipe.menuItemId === item.id && recipe.menuItemId !== editingRecipeMenuItemId); return <option key={item.id} value={item.id} disabled={configured}>{item.name}{configured ? " · recipe exists" : ""}</option>; })}</select></label>
+          <label>Batch yield (portions)<input required inputMode="numeric" min={1} max={10000} step={1} value={recipeYield} onChange={(event) => setRecipeYield(event.target.value)} /></label>
+        </div>
+        <div className="recipe-ingredients-heading"><div><b>Ingredients per batch</b><small>Use the same outlet stock unit shown beside each ingredient.</small></div><button type="button" className="secondary-button" onClick={() => setRecipeIngredients((current) => current.length < 50 ? [...current, { rawMaterialId: materials.find((material) => !current.some((entry) => entry.rawMaterialId === material.id))?.id ?? "", quantity: "" }] : current)} disabled={recipeIngredients.length >= 50 || recipeIngredients.length >= materials.length}>Add ingredient</button></div>
+        {materials.length === 0 ? <p className="recipe-empty-note">Add at least one raw material before creating a recipe.</p> : recipeIngredients.map((ingredient, index) => <div className="recipe-ingredient-row" key={`recipe-ingredient-${index}`}>
+          <label>Ingredient<select required value={ingredient.rawMaterialId} onChange={(event) => setRecipeIngredients((current) => current.map((entry, row) => row === index ? { ...entry, rawMaterialId: event.target.value } : entry))}><option value="">Select ingredient</option>{materials.map((material) => <option key={material.id} value={material.id} disabled={recipeIngredients.some((entry, row) => row !== index && entry.rawMaterialId === material.id)}>{material.name} · {material.unit}</option>)}</select></label>
+          <label>Quantity<input required inputMode="decimal" value={ingredient.quantity} onChange={(event) => setRecipeIngredients((current) => current.map((entry, row) => row === index ? { ...entry, quantity: event.target.value } : entry))} placeholder="e.g. 0.180" /><small>Maximum 3 decimal places.</small></label>
+          <button type="button" className="recipe-remove-button" onClick={() => setRecipeIngredients((current) => current.filter((_, row) => row !== index))} disabled={recipeIngredients.length <= 1}>Remove</button>
+        </div>)}
+        <div className="recipe-form-footer"><small>Amounts are stored as integer milli-units. A yield of 1 means the listed quantities make one sale portion.</small><div><button type="button" className="secondary-button" onClick={() => setRecipeEditorOpen(false)} disabled={savingRecipe}>Cancel</button><button type="submit" className="primary-button" disabled={savingRecipe || !materials.length}>{savingRecipe ? "Saving…" : "Save recipe"}</button></div></div>
+      </form>}
+      {recipeLoading && recipes.length === 0 ? <div className="empty-state"><Package size={22} /><b>Loading recipes</b><span>Reading recipes for the selected outlet.</span></div> : recipes.length === 0 ? <div className="empty-state"><Box size={22} /><b>No recipes saved</b><span>{canAdjustStock ? "Add ingredients and menu items first, then map each sale portion to its raw-material usage." : "This outlet has no recipe records yet."}</span></div> : <div className="recipe-list">{recipes.map((recipe) => <article className="recipe-card" key={recipe.id}>
+        <div className="recipe-card-heading"><div><b>{recipe.menuItem.name}</b><small>Batch yield: {recipe.yieldQuantity} portion{recipe.yieldQuantity === 1 ? "" : "s"}</small></div>{canAdjustStock && <div><button type="button" className="secondary-button" onClick={() => openRecipeEditor(recipe)}>Edit</button><button type="button" className="recipe-remove-button" onClick={() => void deleteRecipe(recipe)}>Remove</button></div>}</div>
+        <ul>{recipe.ingredients.map((ingredient) => <li key={ingredient.rawMaterialId}><span>{ingredient.rawMaterial.name}</span><b>{formatMilliQuantity(ingredient.quantityMilli, ingredient.rawMaterial.unit)}</b></li>)}</ul>
+      </article>)}</div>}
+      {recipeCursor && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMoreRecipes()} disabled={recipeLoadingMore}>{recipeLoadingMore ? "Loading…" : "Load more recipes"}</button></div>}
+      {recipeMenuCursor && canAdjustStock && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMoreRecipeMenuItems()} disabled={recipeLoadingMore}>{recipeLoadingMore ? "Loading…" : "Load more menu items"}</button></div>}
+      <p className="recipe-scope-note">Recipes are outlet-specific. Saving a BOM does not deduct stock from sales yet; the sale policy and reversible stock movement flow are still pending.</p>
+    </section>
     <section className="card content-card cloud-vendors" aria-labelledby="cloud-vendors-title">
       <div className="cloud-vendors-heading"><div><h2 id="cloud-vendors-title">Vendors</h2><p className="muted">Vendor directory shared by outlets in this tenant.</p></div>{canAdjustStock && <button className="secondary-button" onClick={() => { setVendorFormOpen(true); setVendorError(""); }}><Plus size={15} /> Add vendor</button>}</div>
       {vendorError && <div className="cloud-data-notice" role="alert"><AlertTriangle size={15} /><span>{vendorError}</span></div>}

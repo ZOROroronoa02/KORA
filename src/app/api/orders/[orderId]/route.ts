@@ -6,6 +6,7 @@ import { publishOutletEvent } from "@/lib/realtime";
 import { transitionOrder } from "@/lib/billing";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { isTransactionConflict } from "@/lib/db-conflicts";
+import { restoreUnstartedRecipeStock } from "@/lib/inventory-stock";
 
 export const runtime = "nodejs";
 const safeJson = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
@@ -69,6 +70,13 @@ async function PATCHHandler(request: NextRequest, context: { params: Promise<{ o
         if (!approvalUserId) return NextResponse.json({ error: "A separate manager approval PIN is required to void this order." }, { status: 403 });
       }
       await prisma.$transaction(async (tx) => {
+        const lockedOrder = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "orders" WHERE "id" = ${orderId} AND "tenantId" = ${access.tenantId} AND "outletId" = ${outletId} FOR UPDATE`;
+        if (!lockedOrder.length) throw new RangeError("Order no longer exists in this outlet.");
+        const currentOrder = await tx.order.findFirst({
+          where: { id: orderId, tenantId: access.tenantId, outletId },
+          include: { items: true, kots: { include: { items: true } } },
+        });
+        if (!currentOrder || currentOrder.status === OrderStatus.COMPLETED || currentOrder.status === OrderStatus.CANCELLED) throw new RangeError("Order changed and can no longer be voided.");
         if (order.bill) {
           const billLock = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "bills" WHERE "id" = ${order.bill.id} AND "tenantId" = ${access.tenantId} AND "outletId" = ${outletId} FOR UPDATE`;
           if (!billLock.length) throw new RangeError("Order bill no longer exists.");
@@ -79,10 +87,18 @@ async function PATCHHandler(request: NextRequest, context: { params: Promise<{ o
           if (grossPaidPaise > BigInt(Number.MAX_SAFE_INTEGER) || refundedPaise > grossPaidPaise) throw new RangeError("Payment balance exceeds the supported range.");
           if (grossPaidPaise > refundedPaise) throw new RangeError("A paid order must be fully refunded before it can be voided.");
         }
-        const changed = await tx.order.updateMany({ where: { id: orderId, tenantId: access.tenantId, outletId, status: order.status }, data: { status: OrderStatus.CANCELLED } });
+        const changed = await tx.order.updateMany({ where: { id: orderId, tenantId: access.tenantId, outletId, status: currentOrder.status }, data: { status: OrderStatus.CANCELLED } });
         if (changed.count !== 1) throw new RangeError("Order changed concurrently; reload before retrying.");
+        const stockResult = await restoreUnstartedRecipeStock({
+          tx,
+          tenantId: access.tenantId,
+          outletId,
+          orderId,
+          orderItems: currentOrder.items.map((item) => ({ id: item.id, quantity: item.quantity })),
+          kotItems: currentOrder.kots.flatMap((ticket) => ticket.items.map((item) => ({ orderItemId: item.orderItemId, quantity: item.quantity, state: item.state }))),
+        });
         await tx.kOT.updateMany({ where: { orderId, status: { not: KOTStatus.SERVED } }, data: { status: KOTStatus.CANCELLED } });
-        await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, approvalUserId, action: "ORDER_VOIDED", entityType: "Order", entityId: orderId, before: { status: order.status }, after: { status: OrderStatus.CANCELLED }, reason } });
+        await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, approvalUserId, action: "ORDER_VOIDED", entityType: "Order", entityId: orderId, before: { status: currentOrder.status }, after: { status: OrderStatus.CANCELLED, stockRestored: stockResult.restored, stockMissingRecipeSnapshots: stockResult.missingSnapshotCount, stockUntrackedOrderItems: stockResult.untrackedOrderItemCount }, reason } });
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } else {
       return NextResponse.json({ error: "Supported actions are kot-ready, kot-served, transfer-table, and void." }, { status: 400 });

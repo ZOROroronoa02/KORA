@@ -55,6 +55,12 @@ test('KDS API enforces outlet permissions, idempotent transitions, routing, metr
     assert.deepEqual(columnSettings.body.settings.kdsColumnsByStation[stationsResponse.body.id], ['PREPARING', 'READY']);
     const invalidColumnSettings = await fetch(`${api}/api/outlet-settings`, { method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: outlet.id, kdsColumnsByStation: { [otherOutlet.id]: ['READY'] } }) });
     assert.equal(invalidColumnSettings.status, 400);
+    const negativeStockPolicy = await jsonResponse(await fetch(`${api}/api/outlet-settings`, { method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: outlet.id, stockShortagePolicy: 'ALLOW_NEGATIVE' }) }));
+    assert.equal(negativeStockPolicy.status, 200, JSON.stringify(negativeStockPolicy.body));
+    assert.equal(negativeStockPolicy.body.settings.stockShortagePolicy, 'ALLOW_NEGATIVE');
+    const invalidStockPolicy = await fetch(`${api}/api/outlet-settings`, { method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: outlet.id, stockShortagePolicy: 'IGNORE_SHORTAGE' }) });
+    assert.equal(invalidStockPolicy.status, 400);
+    await fetch(`${api}/api/outlet-settings`, { method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' }, body: JSON.stringify({ outletId: outlet.id, stockShortagePolicy: 'BLOCK' }) });
     const menu = await jsonResponse(await fetch(`${api}/api/menu?outletId=${outlet.id}`, { headers: manager.headers }));
     assert.equal(menu.status, 200);
     const item = menu.body.flatMap((category) => category.items).find((entry) => entry.name === 'Masala Dosa');

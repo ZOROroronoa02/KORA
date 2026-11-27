@@ -7,6 +7,7 @@ import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { requiresDiscountApproval, settingsForOutlet } from "@/lib/domain/discount-approval";
 import { isTransactionConflict } from "@/lib/db-conflicts";
+import { consumeRecipeStock, InsufficientRecipeStockError } from "@/lib/inventory-stock";
 import { gstProfileDefaults, gstRateForItem, gstStateCodeForName, gstinStateMatchesAddress, hasInvoiceAddress, validateRecipientInvoiceDetails } from "@/lib/domain/gst-profile";
 
 export const runtime = "nodejs";
@@ -189,6 +190,14 @@ async function POSTHandler(request: NextRequest) {
         deviceId, idempotencyKey, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),
          items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.gstBps, taxCodeKindSnapshot: i.product.taxCodeKind, taxCodeSnapshot: i.product.taxCode, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
       }, include: { items: true } });
+      await consumeRecipeStock({
+        tx,
+        tenantId: access.tenantId,
+        outletId,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        lines: order.items.flatMap((line) => line.menuItemId ? [{ orderItemId: line.id, menuItemId: line.menuItemId, quantity: line.quantity }] : []),
+      });
       const tableLabel = tableId ? (await tx.restaurantTable.findUnique({ where: { id: tableId }, select: { label: true } }))?.label ?? null : null;
       const routedItems = order.items.map((orderItem, index) => ({ orderItem, stationId: items[index].product.outletPrices[0]?.stationId ?? defaultStation?.id ?? null }));
       const grouped = new Map<string, typeof routedItems>();
@@ -240,6 +249,7 @@ async function POSTHandler(request: NextRequest) {
     const result = maySeeFinancials ? saved : { ...saved, order: redactOrder(saved.order), bill: undefined };
     return NextResponse.json({ ...jsonSafe(result), replayed: false }, { status: 201 });
   } catch (error) {
+    if (error instanceof InsufficientRecipeStockError) return NextResponse.json({ error: error.message, shortages: error.shortages }, { status: 409 });
     if (error instanceof ConflictError) return NextResponse.json({ error: error.message }, { status: 409 });
     if (error instanceof RangeError) return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof RequestInputError) return NextResponse.json({ error: error.message }, { status: error.statusCode });

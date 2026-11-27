@@ -46,6 +46,14 @@ async function POSTHandler(request: NextRequest) {
     }
 
     const outcome = await prisma.$transaction(async (tx) => {
+      const lockedOrder = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT o."id"
+        FROM "orders" o
+        JOIN "kots" k ON k."orderId" = o."id" AND k."outletId" = o."outletId"
+        WHERE k."id" = ${ticketId} AND o."tenantId" = ${access.tenantId} AND o."outletId" = ${outletId}
+        FOR UPDATE OF o
+      `;
+      if (!lockedOrder.length) throw new KdsConflict("Kitchen ticket not found in this outlet.");
       const ticket = await tx.kOT.findFirst({ where: { id: ticketId, outletId, order: { tenantId: access.tenantId } }, include: { items: { include: { orderItem: { select: { menuItemId: true } } } } } });
       if (!ticket) throw new KdsConflict("Kitchen ticket not found in this outlet.");
       if ((ticket.status === KOTStatus.SERVED || ticket.status === KOTStatus.CANCELLED) && action !== "undo-bump" && action !== "recall") throw new KdsConflict("This kitchen ticket is already complete.");

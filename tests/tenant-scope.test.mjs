@@ -40,6 +40,15 @@ test('refund ledger reads and writes are scoped to both tenant and outlet', () =
   });
 });
 
+test('recipe and BOM Prisma queries are scoped to the selected outlet', () => {
+  assert.deepEqual(applyPrismaTenantScope('Recipe', 'findMany', { where: { outletId: 'outlet-b' } }, scope), {
+    where: { outletId: 'outlet-a', tenantId: 'tenant-a' },
+  });
+  assert.deepEqual(applyPrismaTenantScope('RecipeIngredient', 'findMany', {}, scope), {
+    where: { AND: [{ recipe: { tenantId: 'tenant-a', outletId: 'outlet-a' }, rawMaterial: { tenantId: 'tenant-a', outletId: 'outlet-a' } }] },
+  });
+});
+
 test('tenant scope injects server-owned ownership fields on creates', () => {
   const args = applyPrismaTenantScope('Order', 'create', {
     data: { outletId: 'outlet-a', type: 'TAKEAWAY' },
