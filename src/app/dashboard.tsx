@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { calculateSale, parseRupeesToPaise } from "@/lib/billing";
 import { io } from "socket.io-client";
-import { ApiError, getAccessToken, hasPendingLogout, readJson, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
+import { ApiError, getAccessToken, hasPendingLogout, readJson, readSession, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
 import { cacheMenu, cacheOfflineWorkspace, cacheTables, clearOfflineWorkspace, getDeviceId, getPendingOrders, queueOrder, readCachedMenu, readOfflineWorkspace, removePendingOrder, updatePendingOrderError, type CachedDisplayOrder, type CloudOrderPayload } from "@/lib/pos-offline";
 import { systemRolePermissions, type PermissionKey } from "@/lib/permissions";
 import { RoleAdministration } from "@/components/RoleAdministration";
@@ -516,6 +516,17 @@ export default function Home() {
     setData(demoSnapshot.current ?? seed); demoSnapshot.current = null; setModal("");
     notify("Signed out of the restaurant account");
   };
+  const outletCreated = async (outletId: string) => {
+    const session = await readSession();
+    const outlet = session.outlets.find((item) => item.id === outletId);
+    if (!outlet) throw new Error("Outlet was created, but your new access could not be loaded. Refresh your session.");
+    setCloudSession(session);
+    setSelectedOutletId(outlet.id);
+    setModal("");
+    await loadCloudOutlet(outlet.id, outlet.permissions);
+    void cacheOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: outlet.id, outletName: outlet.name, role: outlet.role, permissions: outlet.permissions }).catch(() => undefined);
+    notify(`${outlet.name} is ready. Inventory starts empty.`);
+  };
   const changeOrderStatus = async (order: Order, status: string) => {
     if (!cloudMode) {
       setData((current) => ({ ...current, orders: current.orders.map((item) => item.id === order.id ? { ...item, status } : item) }));
@@ -677,8 +688,80 @@ export default function Home() {
       {modal === "shift" && <div className="modal-backdrop"><form className="modal form-modal" onSubmit={(e) => { e.preventDefault(); void closeCashierShift(); }}><button type="button" className="modal-close" onClick={() => setModal("")}><X size={18}/></button><p className="eyebrow">SHIFT RECONCILIATION</p><h2>Close your shift</h2><p className="muted">{cloudMode ? "Count the cash drawer. KORA reconciles paid cash against this shift." : "Count the cash drawer and compare it with the opening float recorded on this device."}</p><div className="payment-total"><span>Opening cash</span><b>{fmt(data.cashOpen)}</b></div><label>Cash counted (₹)<input required type="text" inputMode="decimal" value={cashCounted} onChange={(e)=>setCashCounted(e.target.value)} placeholder="Enter drawer total"/></label><button className="primary-button full-button" type="submit" disabled={!cashCounted}>Close shift <Check size={15}/></button></form></div>}
       {modal === "openShift" && <div className="modal-backdrop"><form className="modal form-modal" onSubmit={(e) => { e.preventDefault(); void openCashierShift(); }}><button type="button" className="modal-close" onClick={() => setModal("")}><X size={18}/></button><p className="eyebrow">START A CASHIER SHIFT</p><h2>Count opening cash</h2><p className="muted">{cloudMode ? "This opening float is stored in the outlet shift ledger." : "This demo records the opening float on this device only."}</p><label>Opening cash (₹)<input required type="text" inputMode="decimal" value={openingCash} onChange={(e) => setOpeningCash(e.target.value)} placeholder="e.g. 5000.00" /></label><button className="primary-button full-button" type="submit" disabled={!openingCash}>Open shift <ArrowRight size={15}/></button></form></div>}
       {modal === "connect" && <div className="modal-backdrop" role="presentation"><form className="modal form-modal" role="dialog" aria-modal="true" aria-labelledby="connect-title" onSubmit={(e) => { e.preventDefault(); authMode === "signin" ? void connectCloud() : void createRestaurantAccount(); }}><button type="button" className="modal-close" onClick={() => { setModal(""); setCloudError(""); setLoginInput((value) => ({ ...value, password: "" })); setRegisterInput((value) => ({ ...value, password: "" })); }} aria-label="Close"><X size={18}/></button><p className="eyebrow">RESTAURANT CLOUD</p>{authMode === "signin" ? <><h2 id="connect-title">Connect to KORA</h2><p className="muted">Sign in to load your outlet menu, shifts, customers, orders, and kitchen tickets.</p><label>Restaurant slug<input required autoCapitalize="none" value={loginInput.tenantSlug} onChange={(e) => setLoginInput({ ...loginInput, tenantSlug: e.target.value })} placeholder="e.g. saffron-room-demo"/></label><label>Email<input required type="email" autoCapitalize="none" value={loginInput.email} onChange={(e) => setLoginInput({ ...loginInput, email: e.target.value })} placeholder="owner@restaurant.in"/></label><label>Password<input required type="password" value={loginInput.password} onChange={(e) => setLoginInput({ ...loginInput, password: e.target.value })}/></label></> : <><h2 id="connect-title">Set up your restaurant</h2><p className="muted">Create an owner account and a starter outlet with an Indian menu.</p><label>Restaurant name<input required minLength={2} value={registerInput.tenantName} onChange={(e) => setRegisterInput({ ...registerInput, tenantName: e.target.value })} placeholder="The Saffron Room"/></label><label>First outlet name<input required minLength={2} value={registerInput.outletName} onChange={(e) => setRegisterInput({ ...registerInput, outletName: e.target.value })} placeholder="Indiranagar"/></label><label>Your name<input required minLength={2} value={registerInput.name} onChange={(e) => setRegisterInput({ ...registerInput, name: e.target.value })} placeholder="Restaurant owner"/></label><label>Email<input required type="email" autoCapitalize="none" value={registerInput.email} onChange={(e) => setRegisterInput({ ...registerInput, email: e.target.value })} placeholder="owner@restaurant.in"/></label><label>Password<input required type="password" minLength={12} value={registerInput.password} onChange={(e) => setRegisterInput({ ...registerInput, password: e.target.value })}/><small>Use 12–72 characters.</small></label></>}{cloudError && <p className="form-error" role="alert">{cloudError}</p>}<button className="primary-button full-button" type="submit" disabled={cloudLoading}>{cloudLoading ? "Connecting…" : authMode === "signin" ? "Sign in securely" : "Create restaurant"} <ArrowRight size={15}/></button><button type="button" className="text-link" onClick={() => { setAuthMode(authMode === "signin" ? "register" : "signin"); setCloudError(""); }}>{authMode === "signin" ? "New to KORA? Create a restaurant" : "Already set up? Sign in"}</button><p className="secure-note"><ShieldCheck size={14}/> Access tokens stay in memory. Refresh session uses an HttpOnly cookie.</p></form></div>}
-      {modal === "outlet" && cloudSession && <div className="modal-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setModal(""); }}><div className="modal form-modal" role="dialog" aria-modal="true" aria-labelledby="outlet-title"><button type="button" className="modal-close" onClick={() => setModal("")} aria-label="Close"><X size={18}/></button><p className="eyebrow">OWNER WORKSPACE</p><h2 id="outlet-title">Switch outlet</h2><p className="muted">Each outlet keeps its own menu, orders, tables, and shift.</p><label>Outlet<select value={selectedOutletId} onChange={(e) => { if (cart.length) { notify("Finish or clear the current cart before switching outlets."); return; } setSelectedOutletId(e.target.value); setModal(""); }}><option value="" disabled>Select outlet</option>{cloudSession.outlets.map((outlet) => <option key={outlet.id} value={outlet.id}>{outlet.name} · {outlet.role}</option>)}</select></label><button type="button" className="secondary-button full-button" onClick={() => void disconnectCloud()}><LogOut size={15}/> Sign out</button></div></div>}    </main>
+      {modal === "outlet" && cloudSession && <OutletSwitcherModal
+        session={cloudSession}
+        selectedOutletId={selectedOutletId}
+        cartHasItems={cart.length > 0}
+        onSwitch={(outletId) => {
+          if (cart.length) { notify("Finish or clear the current cart before switching outlets."); return; }
+          setSelectedOutletId(outletId);
+          setModal("");
+        }}
+        onCreated={outletCreated}
+        onClose={() => setModal("")}
+        onSignOut={() => void disconnectCloud()}
+      />}    </main>
   );
+}
+
+function OutletSwitcherModal({ session, selectedOutletId, cartHasItems, onSwitch, onCreated, onClose, onSignOut }: {
+  session: AuthenticatedSession;
+  selectedOutletId: string;
+  cartHasItems: boolean;
+  onSwitch: (outletId: string) => void;
+  onCreated: (outletId: string) => Promise<void>;
+  onClose: () => void;
+  onSignOut: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const selected = session.outlets.find((outlet) => outlet.id === selectedOutletId);
+  const canManageOutlets = selected?.permissions.includes("outlets.manage") ?? false;
+
+  const createOutlet = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (cartHasItems) { setError("Finish or clear the current cart before creating and switching outlets."); return; }
+    setSaving(true);
+    setError("");
+    try {
+      const result = await readJson<{ outlet: { id: string } }>("/api/outlets", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outletId: selectedOutletId, name, code }),
+      });
+      await onCreated(result.outlet.id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Outlet could not be created.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div className="modal form-modal" role="dialog" aria-modal="true" aria-labelledby="outlet-title">
+      <button type="button" className="modal-close" onClick={onClose} aria-label="Close"><X size={18}/></button>
+      <p className="eyebrow">OWNER WORKSPACE</p>
+      <h2 id="outlet-title">Your outlets</h2>
+      <p className="muted">Outlets have separate orders, tables, stock, and shifts. New outlets start with a copy of this outlet’s menu and tables.</p>
+      <label>Switch outlet<select value={selectedOutletId} onChange={(event) => onSwitch(event.target.value)}>
+        {session.outlets.map((outlet) => <option key={outlet.id} value={outlet.id}>{outlet.name} · {outlet.role}</option>)}
+      </select></label>
+      {canManageOutlets && <form className="outlet-create-form" onSubmit={(event) => void createOutlet(event)}>
+        <div className="settings-divider"/>
+        <p className="settings-subhead">Add outlet</p>
+        <label>Outlet name<input required minLength={2} maxLength={80} value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Bengaluru Airport"/></label>
+        <label>Outlet code <small>Optional; 2–12 letters, numbers, hyphens, or underscores.</small><input maxLength={12} value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="Auto-created from the name"/></label>
+        <p className="muted">Menu items, variants, add-ons, prices, and tables are copied. Inventory and recipes must be configured for this outlet.</p>
+        {cartHasItems && <p className="form-error" role="status">Finish or clear the current cart before adding an outlet.</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <button className="primary-button full-button" type="submit" disabled={saving || cartHasItems || name.trim().length < 2}>{saving ? "Creating outlet…" : "Create outlet"}<ArrowRight size={15}/></button>
+      </form>}
+      {!canManageOutlets && <p className="muted">Only restaurant owners can add outlets.</p>}
+      <button type="button" className="secondary-button full-button" onClick={onSignOut}><LogOut size={15}/> Sign out</button>
+    </div>
+  </div>;
 }
 
 function Overview({ data, todayOrders, todaySales, role, canCreateOrders, cloudMode, outletName, pendingCount, cloudLoading, cloudError, canManageTeam, canViewReports, onNavigate, onNotify }: { data: AppData; todayOrders: number; todaySales: number; role: string; canCreateOrders: boolean; cloudMode: boolean; outletName: string; pendingCount: number; cloudLoading: boolean; cloudError: string; canManageTeam: boolean; canViewReports: boolean; onNavigate: (p: Page) => void; onNotify: (s: string) => void }) {

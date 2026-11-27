@@ -2,6 +2,7 @@
 
 ## 2026-11-27
 
+- Enforced the approved Free/Plus/Pro outlet quotas with tenant-row locking, owner-only outlet provisioning, copied menu/table setup, audit logging, and race/tenant-isolation coverage. User seat limits are defined but await a staff invitation/provisioning path.
 - Replaced hardcoded cloud restaurant settings with an outlet profile editor backed by outlet name, GSTIN, FSSAI license, and structured address fields; server-side `settings.manage` checks, outlet scoping, format validation, and before/after audit logging are covered by a live API integration test.
 - Made accepted cloud POS orders independent of the follow-up list refresh: the API response is shown immediately, refresh failures surface as sync attention, and IndexedDB queue read failures no longer appear as an empty/synced queue.
 - Persisted offline logout intent before network logout, blocked cached workspace restoration while sign-out is pending, and require that pending logout to flush before a new sign-in or restaurant registration.
