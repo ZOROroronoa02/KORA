@@ -4,6 +4,15 @@ const prisma = new PrismaClient();
 
 const sql = `
 WITH violations(issue) AS (
+  SELECT 'staff_invitations.ownership' FROM public.staff_invitations i
+    LEFT JOIN public.outlets o ON o.id = i."outletId"
+    LEFT JOIN public.roles r ON r.id = i."roleId"
+    LEFT JOIN public.users u ON u.id = i."createdByUserId"
+    WHERE i."tenantId" IS DISTINCT FROM o."tenantId"
+       OR i."tenantId" IS DISTINCT FROM r."tenantId"
+       OR (r."outletId" IS NOT NULL AND r."outletId" IS DISTINCT FROM i."outletId")
+       OR i."tenantId" IS DISTINCT FROM u."tenantId"
+  UNION ALL
   SELECT 'roles.outlet_tenant' FROM public.roles r LEFT JOIN public.outlets o ON o.id = r."outletId"
     WHERE (r."outletId" IS NOT NULL AND (r."tenantId" IS DISTINCT FROM o."tenantId" OR r."tenantId" IS NULL))
        OR (r."tenantId" IS NULL AND (r."outletId" IS NOT NULL OR r.name IS DISTINCT FROM 'SUPER_ADMIN' OR r."isSystem" IS DISTINCT FROM TRUE))

@@ -22,6 +22,10 @@ const policies: Record<string, ScopePolicy> = {
     related: (scope) => ({ user: { tenantId: scope.tenantId }, outlet: { tenantId: scope.tenantId }, role: { tenantId: scope.tenantId } }),
   },
   UserPlatformRole: { direct: (scope) => scope.userId ? { userId: scope.userId } : {} },
+  StaffInvitation: {
+    direct: (scope) => ({ tenantId: scope.tenantId, ...(scope.outletId ? { outletId: scope.outletId } : {}) }),
+    related: (scope) => ({ outlet: { tenantId: scope.tenantId }, role: { tenantId: scope.tenantId, ...(scope.outletId ? { OR: [{ outletId: null }, { outletId: scope.outletId }] } : {}) }, createdBy: { tenantId: scope.tenantId } }),
+  },
   OutletSettings: {
     direct: (scope) => scope.outletId ? { outletId: scope.outletId } : {},
     related: (scope) => ({ outlet: { tenantId: scope.tenantId } }),

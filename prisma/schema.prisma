@@ -117,6 +117,7 @@ model Tenant {
   updatedAt        DateTime          @updatedAt
   outlets          Outlet[]
   users            User[]
+  staffInvitations StaffInvitation[]
   roles            Role[]
   customers        Customer[]
   categories       MenuCategory[]
@@ -172,6 +173,7 @@ model Outlet {
   wastage              Wastage[]
   feedback             Feedback[]
   assignments          UserOutletRole[]
+  staffInvitations     StaffInvitation[]
   roles                Role[]
   syncMutations        SyncMutation[]
   auditLogs            AuditLog[]
@@ -182,26 +184,27 @@ model Outlet {
 }
 
 model User {
-  id                String             @id @default(cuid())
-  tenantId          String
-  name              String
-  email             String
-  phone             String?
-  passwordHash      String
-  approvalPinHash   String?
-  active            Boolean            @default(true)
-  locale            String             @default("en-IN")
-  createdAt         DateTime           @default(now())
-  updatedAt         DateTime           @updatedAt
-  tenant            Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  assignments       UserOutletRole[]
-  refreshTokens     RefreshToken[]
-  orders            Order[]            @relation("OrderCreatedBy")
-  shifts            Shift[]
-  auditLogs         AuditLog[]         @relation("AuditActor")
-  approvalAuditLogs AuditLog[]         @relation("AuditApprover")
-  platformRoles     UserPlatformRole[]
-  paymentReversals  PaymentReversal[]  @relation("PaymentReversalActor")
+  id                      String             @id @default(cuid())
+  tenantId                String
+  name                    String
+  email                   String
+  phone                   String?
+  passwordHash            String
+  approvalPinHash         String?
+  active                  Boolean            @default(true)
+  locale                  String             @default("en-IN")
+  createdAt               DateTime           @default(now())
+  updatedAt               DateTime           @updatedAt
+  tenant                  Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignments             UserOutletRole[]
+  refreshTokens           RefreshToken[]
+  orders                  Order[]            @relation("OrderCreatedBy")
+  shifts                  Shift[]
+  auditLogs               AuditLog[]         @relation("AuditActor")
+  approvalAuditLogs       AuditLog[]         @relation("AuditApprover")
+  platformRoles           UserPlatformRole[]
+  createdStaffInvitations StaffInvitation[]  @relation("StaffInvitationCreator")
+  paymentReversals        PaymentReversal[]  @relation("PaymentReversalActor")
 
   @@unique([tenantId, email])
   @@index([tenantId, active])
@@ -219,6 +222,7 @@ model Role {
   outlet              Outlet?            @relation(fields: [outletId], references: [id], onDelete: Cascade)
   permissions         RolePermission[]
   assignments         UserOutletRole[]
+  staffInvitations    StaffInvitation[]
   platformAssignments UserPlatformRole[]
 
   @@unique([tenantId, name])
@@ -267,6 +271,29 @@ model UserPlatformRole {
   @@id([userId, roleId])
   @@index([roleId])
   @@map("user_platform_roles")
+}
+
+model StaffInvitation {
+  id              String    @id @default(cuid())
+  tenantId        String
+  outletId        String
+  email           String
+  roleId          String
+  tokenHash       String    @unique
+  createdByUserId String
+  expiresAt       DateTime
+  acceptedAt      DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  tenant          Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet          Outlet    @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  role            Role      @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  createdBy       User      @relation("StaffInvitationCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, email, acceptedAt, revokedAt])
+  @@index([tenantId, outletId, createdAt])
+  @@index([expiresAt, acceptedAt, revokedAt])
+  @@map("staff_invitations")
 }
 
 model OutletSettings {

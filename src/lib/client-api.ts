@@ -127,6 +127,19 @@ export async function signOut() {
   finally { accessToken = null; }
 }
 
+/** Clears any prior browser session before a bearer invitation establishes a new account. */
+export async function prepareFreshAuthentication() {
+  await flushPendingLogout();
+  accessToken = null;
+  let response: Response;
+  try {
+    response = await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin", cache: "no-store" });
+  } catch {
+    throw new ApiError("Could not clear the previous browser session. Connect and try again.", 503);
+  }
+  if (!response.ok) throw new ApiError("Could not clear the previous browser session. Try again.", response.status);
+}
+
 export async function readJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await apiFetch(path, init);
   const body = await response.json().catch(() => ({})) as T & { error?: string };

@@ -40,6 +40,24 @@ test('refund ledger reads and writes are scoped to both tenant and outlet', () =
   });
 });
 
+test('staff invitation reads, writes, and relation filters stay within tenant and selected outlet', () => {
+  assert.deepEqual(applyPrismaTenantScope('StaffInvitation', 'findMany', {
+    where: { tenantId: 'tenant-b', outletId: 'outlet-b', email: 'staff@example.test' },
+  }, scope), {
+    where: {
+      tenantId: 'tenant-a', outletId: 'outlet-a', email: 'staff@example.test',
+      AND: [{
+        outlet: { tenantId: 'tenant-a' },
+        role: { tenantId: 'tenant-a', OR: [{ outletId: null }, { outletId: 'outlet-a' }] },
+        createdBy: { tenantId: 'tenant-a' },
+      }],
+    },
+  });
+  assert.throws(() => applyPrismaTenantScope('StaffInvitation', 'create', {
+    data: { tenantId: 'tenant-b', outletId: 'outlet-b' },
+  }, scope), /attempted to change its tenantId scope/);
+});
+
 test('recipe and BOM Prisma queries are scoped to the selected outlet', () => {
   assert.deepEqual(applyPrismaTenantScope('Recipe', 'findMany', { where: { outletId: 'outlet-b' } }, scope), {
     where: { outletId: 'outlet-a', tenantId: 'tenant-a' },
@@ -109,6 +127,8 @@ test('every business API route establishes tenant scope; only auth bootstrap and
   const exemptions = new Set([
     'auth/login/route.ts',
     'auth/register/route.ts',
+    'auth/invitations/resolve/route.ts',
+    'auth/invitations/accept/route.ts',
     'auth/refresh/route.ts',
     'auth/logout/route.ts',
     'health/route.ts',
