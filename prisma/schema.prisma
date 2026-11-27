@@ -466,39 +466,39 @@ model RestaurantTable {
 }
 
 model Order {
-  id                  String               @id @default(cuid())
-  tenantId            String
-  outletId            String
-  customerId          String?
-  tableId             String?
-  createdById         String?
-  orderNumber         Int
-  type                OrderType
-  status              OrderStatus          @default(OPEN)
-  source              String               @default("POS")
-  deviceId            String?
-  idempotencyKey      String
+  id                     String               @id @default(cuid())
+  tenantId               String
+  outletId               String
+  customerId             String?
+  tableId                String?
+  createdById            String?
+  orderNumber            Int
+  type                   OrderType
+  status                 OrderStatus          @default(OPEN)
+  source                 String               @default("POS")
+  deviceId               String?
+  idempotencyKey         String
   idempotencyPayloadHash String?
-  subtotalPaise       BigInt               @default(0)
-  discountPaise       BigInt               @default(0)
-  taxPaise            BigInt               @default(0)
-  serviceChargePaise  BigInt               @default(0)
-  totalPaise          BigInt               @default(0)
-  notes               String?
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
-  completedAt         DateTime?
-  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  outlet              Outlet               @relation(fields: [outletId], references: [id], onDelete: Cascade)
-  customer            Customer?            @relation(fields: [customerId], references: [id])
-  table               RestaurantTable?     @relation(fields: [tableId], references: [id])
-  createdBy           User?                @relation("OrderCreatedBy", fields: [createdById], references: [id])
-  items               OrderItem[]
-  kots                KOT[]
-  bill                Bill?
-  tableEvents         TableEvent[]
-  loyaltyTransactions LoyaltyTransaction[]
-  feedback            Feedback?
+  subtotalPaise          BigInt               @default(0)
+  discountPaise          BigInt               @default(0)
+  taxPaise               BigInt               @default(0)
+  serviceChargePaise     BigInt               @default(0)
+  totalPaise             BigInt               @default(0)
+  notes                  String?
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+  completedAt            DateTime?
+  tenant                 Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet                 Outlet               @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  customer               Customer?            @relation(fields: [customerId], references: [id])
+  table                  RestaurantTable?     @relation(fields: [tableId], references: [id])
+  createdBy              User?                @relation("OrderCreatedBy", fields: [createdById], references: [id])
+  items                  OrderItem[]
+  kots                   KOT[]
+  bill                   Bill?
+  tableEvents            TableEvent[]
+  loyaltyTransactions    LoyaltyTransaction[]
+  feedback               Feedback?
 
   @@unique([outletId, orderNumber])
   @@unique([outletId, idempotencyKey])
@@ -870,20 +870,24 @@ model RecipeIngredient {
 }
 
 model Purchase {
-  id          String         @id @default(cuid())
-  tenantId    String
-  outletId    String
-  vendorId    String?
-  reference   String?
-  purchasedAt DateTime       @default(now())
-  totalPaise  BigInt         @default(0)
-  status      String         @default("RECEIVED")
-  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  outlet      Outlet         @relation(fields: [outletId], references: [id], onDelete: Cascade)
-  vendor      Vendor?        @relation(fields: [vendorId], references: [id])
-  lines       PurchaseLine[]
+  id                     String         @id @default(cuid())
+  tenantId               String
+  outletId               String
+  vendorId               String?
+  reference              String?
+  purchasedAt            DateTime       @default(now())
+  totalPaise             BigInt         @default(0)
+  status                 String         @default("RECEIVED")
+  idempotencyKey         String?
+  idempotencyPayloadHash String?
+  tenant                 Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet                 Outlet         @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  vendor                 Vendor?        @relation(fields: [vendorId], references: [id])
+  lines                  PurchaseLine[]
 
+  @@unique([outletId, idempotencyKey])
   @@index([outletId, purchasedAt])
+  @@index([tenantId, outletId, purchasedAt, id])
   @@map("purchases")
 }
 

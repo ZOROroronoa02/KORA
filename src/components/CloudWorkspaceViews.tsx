@@ -26,6 +26,10 @@ type CloudMaterial = {
 };
 
 type CloudVendor = { id: string; name: string; phone: string | null; email: string | null; gstin: string | null; active: boolean };
+type CloudPurchaseLine = { id: string; quantityMilli: string; unitCostPaise: string; rawMaterial: { id: string; name: string; unit: string } };
+type CloudPurchase = { id: string; reference: string | null; purchasedAt: string; totalPaise: string; vendor: { id: string; name: string } | null; lines: CloudPurchaseLine[] };
+type PurchaseRequest = { outletId: string; vendorId: string | null; reference: string | null; clientMutationId: string; lines: Array<{ rawMaterialId: string; quantityMilli: string; unitCostPaise: string }> };
+type PendingPurchase = { outletId: string; body: PurchaseRequest };
 type CloudRecipeIngredient = { rawMaterialId: string; quantityMilli: string; rawMaterial: { id: string; name: string; unit: string; quantityMilli: string } };
 type CloudRecipe = { id: string; menuItemId: string; yieldQuantity: number; menuItem: { id: string; name: string }; ingredients: CloudRecipeIngredient[] };
 type CloudRecipeMenuItem = { id: string; name: string };
@@ -70,6 +74,17 @@ function formatReportPaise(value: string | undefined) {
   const absolute = amount < 0n ? -amount : amount;
   const rupees = new Intl.NumberFormat("en-IN").format(absolute / 100n);
   return `${sign}₹${rupees}.${(absolute % 100n).toString().padStart(2, "0")}`;
+}
+
+function formatPurchasePaise(value: string) {
+  const amount = BigInt(value);
+  const rupees = new Intl.NumberFormat("en-IN").format(amount / 100n);
+  return `₹${rupees}.${(amount % 100n).toString().padStart(2, "0")}`;
+}
+
+function formatPaiseInput(value: string) {
+  const amount = BigInt(value);
+  return `${amount / 100n}.${(amount % 100n).toString().padStart(2, "0")}`;
 }
 
 export function CloudOverview({
@@ -183,8 +198,23 @@ function formatStockValue(material: CloudMaterial) {
 }
 
 export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: string; canAdjustStock: boolean }) {
+  const activeOutletId = useRef(outletId);
+  activeOutletId.current = outletId;
   const [materials, setMaterials] = useState<CloudMaterial[]>([]);
   const [vendors, setVendors] = useState<CloudVendor[]>([]);
+  const [purchases, setPurchases] = useState<CloudPurchase[]>([]);
+  const [purchaseCursor, setPurchaseCursor] = useState<string | null>(null);
+  const [purchaseLoading, setPurchaseLoading] = useState(false);
+  const [purchaseLoadingMore, setPurchaseLoadingMore] = useState(false);
+  const [purchaseError, setPurchaseError] = useState("");
+  const [purchaseNotice, setPurchaseNotice] = useState("");
+  const [receiptOpen, setReceiptOpen] = useState(false);
+  const [receiptVendorId, setReceiptVendorId] = useState("");
+  const [receiptReference, setReceiptReference] = useState("");
+  const [receiptLines, setReceiptLines] = useState<Array<{ rawMaterialId: string; quantity: string; unitCost: string }>>([{ rawMaterialId: "", quantity: "", unitCost: "" }]);
+  const [savingReceipt, setSavingReceipt] = useState(false);
+  const [pendingReceipt, setPendingReceipt] = useState<PendingPurchase | null>(null);
+  const pendingReceiptsByOutlet = useRef(new Map<string, PendingPurchase>());
   const [vendorCursor, setVendorCursor] = useState<string | null>(null);
   const [vendorLoading, setVendorLoading] = useState(false);
   const [vendorError, setVendorError] = useState("");
@@ -237,6 +267,21 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     setMaterialError("");
     setVendorFormOpen(false);
     setVendorError("");
+    setReceiptOpen(false);
+    setPurchaseError("");
+    setPurchaseNotice("");
+    setPurchaseLoadingMore(false);
+    setReceiptVendorId("");
+    setReceiptReference("");
+    setReceiptLines([{ rawMaterialId: "", quantity: "", unitCost: "" }]);
+    const pending = pendingReceiptsByOutlet.current.get(outletId) ?? null;
+    setPendingReceipt(pending);
+    setReceiptOpen(Boolean(pending));
+    if (pending) {
+      setReceiptVendorId(pending.body.vendorId ?? "");
+      setReceiptReference(pending.body.reference ?? "");
+      setReceiptLines(pending.body.lines.map((line) => ({ rawMaterialId: line.rawMaterialId, quantity: formatMilliInput(line.quantityMilli), unitCost: formatPaiseInput(line.unitCostPaise) })));
+    }
     setRecipeEditorOpen(false);
     setRecipeError("");
     setRecipeNotice("");
@@ -246,14 +291,19 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     let cancelled = false;
     setLoading(true);
     setVendorLoading(true);
+    setPurchaseLoading(true);
     setError("");
     setVendorError("");
+    setPurchaseError("");
     setVendors([]);
     setVendorCursor(null);
+    setPurchases([]);
+    setPurchaseCursor(null);
     if (!outletId) {
       setMaterials([]);
       setLoading(false);
       setVendorLoading(false);
+      setPurchaseLoading(false);
       return;
     }
     void readJson<CloudMaterial[]>(`/api/inventory?outletId=${encodeURIComponent(outletId)}`)
@@ -264,6 +314,10 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
       .then((result) => { if (!cancelled) { setVendors(result.items); setVendorCursor(result.nextCursor); } })
       .catch((reason: unknown) => { if (!cancelled) setVendorError(reason instanceof Error ? reason.message : "Could not load outlet vendors."); })
       .finally(() => { if (!cancelled) setVendorLoading(false); });
+    void readJson<{ items: CloudPurchase[]; nextCursor: string | null }>(`/api/inventory/purchases?outletId=${encodeURIComponent(outletId)}`)
+      .then((result) => { if (!cancelled) { setPurchases(result.items); setPurchaseCursor(result.nextCursor); } })
+      .catch((reason: unknown) => { if (!cancelled) setPurchaseError(reason instanceof Error ? reason.message : "Could not load purchase receipts."); })
+      .finally(() => { if (!cancelled) setPurchaseLoading(false); });
     return () => { cancelled = true; };
   }, [outletId, refreshKey]);
 
@@ -416,6 +470,88 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     } finally {
       setVendorLoading(false);
     }
+  };
+
+  const loadMorePurchases = async () => {
+    if (!purchaseCursor || purchaseLoadingMore) return;
+    const requestedOutletId = outletId;
+    setPurchaseLoadingMore(true);
+    setPurchaseError("");
+    try {
+      const result = await readJson<{ items: CloudPurchase[]; nextCursor: string | null }>(`/api/inventory/purchases?outletId=${encodeURIComponent(requestedOutletId)}&cursor=${encodeURIComponent(purchaseCursor)}`);
+      if (activeOutletId.current !== requestedOutletId) return;
+      setPurchases((current) => [...current, ...result.items.filter((purchase) => !current.some((entry) => entry.id === purchase.id))]);
+      setPurchaseCursor(result.nextCursor);
+    } catch (reason) {
+      if (activeOutletId.current === requestedOutletId) setPurchaseError(reason instanceof Error ? reason.message : "Could not load more purchase receipts.");
+    } finally {
+      if (activeOutletId.current === requestedOutletId) setPurchaseLoadingMore(false);
+    }
+  };
+
+  const sendPurchaseReceipt = async (pending: PendingPurchase) => {
+    setSavingReceipt(true);
+    if (activeOutletId.current === pending.outletId) {
+      setPurchaseError("");
+      setPurchaseNotice("");
+    }
+    try {
+      const result = await readJson<{ purchase: CloudPurchase; replayed: boolean }>("/api/inventory/purchases", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(pending.body),
+      });
+      pendingReceiptsByOutlet.current.delete(pending.outletId);
+      if (activeOutletId.current === pending.outletId) {
+        setPendingReceipt(null);
+        setReceiptOpen(false);
+        setReceiptVendorId("");
+        setReceiptReference("");
+        setReceiptLines([{ rawMaterialId: "", quantity: "", unitCost: "" }]);
+        setPurchaseNotice(result.replayed ? "Receipt confirmed. The retry did not add stock twice." : "Purchase receipt saved; stock and weighted-average cost were updated.");
+        setRefreshKey((key) => key + 1);
+      }
+    } catch (reason) {
+      if (activeOutletId.current === pending.outletId) setPurchaseError(reason instanceof Error ? reason.message : "Could not confirm this receipt. Retry the same request safely.");
+    } finally {
+      setSavingReceipt(false);
+    }
+  };
+
+  const submitPurchaseReceipt = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setPurchaseError("");
+    setPurchaseNotice("");
+    if (pendingReceipt) {
+      await sendPurchaseReceipt(pendingReceipt);
+      return;
+    }
+
+    if (!materials.length || receiptLines.length < 1 || receiptLines.length > 20) {
+      setPurchaseError("Add between 1 and 20 receipt lines after ingredients are set up.");
+      return;
+    }
+    const lines = receiptLines.map((line) => ({
+      rawMaterialId: line.rawMaterialId,
+      quantityMilli: parseMilliQuantity(line.quantity),
+      unitCostPaise: parseRupeesToPaise(line.unitCost),
+    }));
+    if (lines.some((line) => !line.rawMaterialId || line.quantityMilli === null || line.unitCostPaise === null)
+      || new Set(lines.map((line) => line.rawMaterialId)).size !== lines.length) {
+      setPurchaseError("Choose a different ingredient for each line, enter a positive quantity, and provide a landed unit cost in rupees.");
+      return;
+    }
+    const body: PurchaseRequest = {
+      outletId,
+      vendorId: receiptVendorId || null,
+      reference: receiptReference.trim() || null,
+      clientMutationId: crypto.randomUUID(),
+      lines: lines.map((line) => ({ rawMaterialId: line.rawMaterialId, quantityMilli: line.quantityMilli!.toString(), unitCostPaise: line.unitCostPaise!.toString() })),
+    };
+    const pending = { outletId, body };
+    pendingReceiptsByOutlet.current.set(outletId, pending);
+    setPendingReceipt(pending);
+    await sendPurchaseReceipt(pending);
   };
 
   const openRecipeEditor = (recipe?: CloudRecipe) => {
@@ -581,7 +717,7 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
       </article>)}</div>}
       {recipeCursor && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMoreRecipes()} disabled={recipeLoadingMore}>{recipeLoadingMore ? "Loading…" : "Load more recipes"}</button></div>}
       {recipeMenuCursor && canAdjustStock && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMoreRecipeMenuItems()} disabled={recipeLoadingMore}>{recipeLoadingMore ? "Loading…" : "Load more menu items"}</button></div>}
-      <p className="recipe-scope-note">Recipes are outlet-specific. Saving a BOM does not deduct stock from sales yet; the sale policy and reversible stock movement flow are still pending.</p>
+      <p className="recipe-scope-note">Recipes are outlet-specific. Cloud sales deduct recipe ingredients transactionally; shortage behavior follows the outlet stock policy, and voids restore only quantities not started in the kitchen.</p>
     </section>
     <section className="card content-card cloud-vendors" aria-labelledby="cloud-vendors-title">
       <div className="cloud-vendors-heading"><div><h2 id="cloud-vendors-title">Vendors</h2><p className="muted">Vendor directory shared by outlets in this tenant.</p></div>{canAdjustStock && <button className="secondary-button" onClick={() => { setVendorFormOpen(true); setVendorError(""); }}><Plus size={15} /> Add vendor</button>}</div>
@@ -593,14 +729,41 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
         <label>GSTIN<input maxLength={15} value={vendorGstin} onChange={(event) => setVendorGstin(event.target.value.toUpperCase())} placeholder="Optional" /></label>
         <div className="vendor-form-actions"><button type="button" className="secondary-button" onClick={() => setVendorFormOpen(false)} disabled={savingVendor}>Cancel</button><button type="submit" className="primary-button" disabled={savingVendor}>{savingVendor ? "Saving…" : "Save vendor"}</button></div>
       </form>}
-      {vendorLoading && vendors.length === 0 ? <div className="empty-state"><Truck size={22} /><b>Loading vendors</b><span>Reading the tenant vendor directory.</span></div> : vendors.length === 0 ? <div className="empty-state"><Truck size={22} /><b>No vendors recorded</b><span>{canAdjustStock ? "Add suppliers here; purchase receipts will be linked when that workflow is enabled." : "No tenant vendors are available."}</span></div> : <div className="cloud-vendor-list">
+      {vendorLoading && vendors.length === 0 ? <div className="empty-state"><Truck size={22} /><b>Loading vendors</b><span>Reading the tenant vendor directory.</span></div> : vendors.length === 0 ? <div className="empty-state"><Truck size={22} /><b>No vendors recorded</b><span>{canAdjustStock ? "Add suppliers here; they can be linked to received stock." : "No tenant vendors are available."}</span></div> : <div className="cloud-vendor-list">
         {vendors.map((vendor) => <article className={`cloud-vendor-row ${vendor.active ? "" : "inactive"}`} key={vendor.id}>
           <span className="vendor-icon"><Truck size={16} /></span><span className="vendor-details"><b>{vendor.name}</b><small>{[vendor.phone, vendor.email, vendor.gstin].filter(Boolean).join(" · ") || "No contact details"}</small></span><span className={`role-tag ${vendor.active ? "" : "inactive-tag"}`}>{vendor.active ? "Active" : "Inactive"}</span>{canAdjustStock && <button type="button" className="cloud-stock-action" onClick={() => void toggleVendor(vendor)} aria-label={`${vendor.active ? "Deactivate" : "Activate"} ${vendor.name}`}>{vendor.active ? "Deactivate" : "Activate"}</button>}
         </article>)}
       </div>}
       {vendorCursor && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMoreVendors()} disabled={vendorLoading}>{vendorLoading ? "Loading…" : "Load more vendors"}</button></div>}
     </section>
-    <div className="cloud-data-notice"><Package size={16} /><span>Ingredient stock corrections, wastage, and the shared vendor directory are active. Purchase receipts, recipe-linked deductions, and stock-to-sale reconciliation remain open.</span></div>
+    <section className="card content-card cloud-purchases" aria-labelledby="cloud-purchases-title">
+      <div className="cloud-vendors-heading"><div><h2 id="cloud-purchases-title">Purchase receipts</h2><p className="muted">Record stock already received from a supplier. KORA values ingredients using moving weighted-average landed cost.</p></div>{canAdjustStock && <button type="button" className="primary-button" onClick={() => { setReceiptOpen(true); setPurchaseError(""); setPurchaseNotice(""); }} disabled={savingReceipt || Boolean(pendingReceipt) || materials.length === 0}><Plus size={15} /> New receipt</button>}</div>
+      {purchaseNotice && <div className="cloud-data-notice" role="status" aria-live="polite"><Package size={15} /><span>{purchaseNotice}</span></div>}
+      {purchaseError && <div className="cloud-data-notice" role="alert"><AlertTriangle size={15} /><span>{purchaseError}</span></div>}
+      {receiptOpen && canAdjustStock && <form className="purchase-form" onSubmit={submitPurchaseReceipt} aria-label="Record received stock">
+        {pendingReceipt && <div className="purchase-retry-note" role="status">The server response was uncertain. Retry sends this exact receipt with the same request ID, so committed stock will not be added twice.</div>}
+        <div className="purchase-header-fields">
+          <label>Supplier<select value={receiptVendorId} disabled={savingReceipt || Boolean(pendingReceipt)} onChange={(event) => setReceiptVendorId(event.target.value)}><option value="">Direct / unlisted supplier</option>{vendors.filter((vendor) => vendor.active).map((vendor) => <option key={vendor.id} value={vendor.id}>{vendor.name}</option>)}</select></label>
+          <label>Invoice or delivery reference<input maxLength={100} value={receiptReference} disabled={savingReceipt || Boolean(pendingReceipt)} onChange={(event) => setReceiptReference(event.target.value)} placeholder="Optional supplier reference" /></label>
+        </div>
+        <div className="purchase-lines-heading"><b>Received ingredients</b><button type="button" className="secondary-button" onClick={() => setReceiptLines((current) => current.length < 20 ? [...current, { rawMaterialId: "", quantity: "", unitCost: "" }] : current)} disabled={savingReceipt || Boolean(pendingReceipt) || receiptLines.length >= 20 || receiptLines.length >= materials.length}>Add line</button></div>
+        {receiptLines.map((line, index) => <div className="purchase-line-row" key={`purchase-line-${index}`}>
+          <label>Ingredient<select required value={line.rawMaterialId} disabled={savingReceipt || Boolean(pendingReceipt)} onChange={(event) => setReceiptLines((current) => current.map((entry, row) => row === index ? { ...entry, rawMaterialId: event.target.value } : entry))}><option value="">Select ingredient</option>{materials.map((material) => <option key={material.id} value={material.id} disabled={receiptLines.some((entry, row) => row !== index && entry.rawMaterialId === material.id)}>{material.name} · {material.unit}</option>)}</select></label>
+          <label>Quantity<input required inputMode="decimal" autoComplete="off" value={line.quantity} disabled={savingReceipt || Boolean(pendingReceipt)} onChange={(event) => setReceiptLines((current) => current.map((entry, row) => row === index ? { ...entry, quantity: event.target.value } : entry))} placeholder="e.g. 5.000" /></label>
+          <label>Landed cost (₹ / {materials.find((material) => material.id === line.rawMaterialId)?.unit ?? "unit"})<input required inputMode="decimal" autoComplete="off" value={line.unitCost} disabled={savingReceipt || Boolean(pendingReceipt)} onChange={(event) => setReceiptLines((current) => current.map((entry, row) => row === index ? { ...entry, unitCost: event.target.value } : entry))} placeholder="e.g. 72.50" /></label>
+          <button type="button" className="recipe-remove-button" onClick={() => setReceiptLines((current) => current.filter((_, row) => row !== index))} disabled={savingReceipt || Boolean(pendingReceipt) || receiptLines.length <= 1} aria-label={`Remove receipt line ${index + 1}`}>Remove</button>
+        </div>)}
+        <div className="purchase-form-footer"><small>Landed cost is per selected stock unit and includes non-creditable taxes and charges. Receipt totals and weighted-average costs are calculated on the server; this records received goods, not a purchase order or payable.</small><div><button type="button" className="secondary-button" onClick={() => setReceiptOpen(false)} disabled={savingReceipt || Boolean(pendingReceipt)}>Cancel</button><button type="submit" className="primary-button" disabled={savingReceipt || !materials.length}>{savingReceipt ? "Saving receipt…" : pendingReceipt ? "Retry same receipt" : "Receive stock"}</button></div></div>
+      </form>}
+      {purchaseLoading && purchases.length === 0 ? <div className="empty-state"><Truck size={22} /><b>Loading receipts</b><span>Reading stock receipts for this outlet.</span></div> : purchases.length === 0 ? <div className="empty-state"><Box size={22} /><b>No purchase receipts yet</b><span>{canAdjustStock ? "Record a delivery after it has arrived; the receipt will update stock and cost together." : "Received stock transactions will appear here."}</span></div> : <div className="purchase-receipt-list">
+        {purchases.map((purchase) => <article className="purchase-receipt-card" key={purchase.id}>
+          <div className="purchase-receipt-heading"><div><b>{purchase.vendor?.name ?? "Direct purchase"}</b><small>{new Date(purchase.purchasedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short" })}{purchase.reference ? ` · Ref ${purchase.reference}` : ""}</small></div><strong>{formatPurchasePaise(purchase.totalPaise)}</strong></div>
+          <ul>{purchase.lines.map((line) => <li key={line.id}><span>{formatMilliQuantity(line.quantityMilli, line.rawMaterial.unit)} {line.rawMaterial.name}</span><small>{formatPurchasePaise(line.unitCostPaise)} / {line.rawMaterial.unit}</small></li>)}</ul>
+        </article>)}
+      </div>}
+      {purchaseCursor && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMorePurchases()} disabled={purchaseLoadingMore}>{purchaseLoadingMore ? "Loading…" : "Load more receipts"}</button></div>}
+    </section>
+    <div className="cloud-data-notice"><Package size={16} /><span>Stock receipts update ingredient quantity, weighted-average landed cost, the purchase ledger, stock movements, and the audit log in one transaction. Recipe deductions use the same outlet stock ledger.</span></div>
   </>;
 }
 

@@ -58,6 +58,19 @@ test('staff invitation reads, writes, and relation filters stay within tenant an
   }, scope), /attempted to change its tenantId scope/);
 });
 
+test('purchase headers and lines stay scoped to the tenant, outlet, vendor, and ingredient relations', () => {
+  assert.deepEqual(applyPrismaTenantScope('Purchase', 'findMany', {
+    where: { outletId: 'outlet-b', tenantId: 'tenant-b' },
+  }, scope), {
+    where: { outletId: 'outlet-a', tenantId: 'tenant-a' },
+  });
+  assert.deepEqual(applyPrismaTenantScope('PurchaseLine', 'findMany', {}, scope), {
+    where: {
+      AND: [{ purchase: { tenantId: 'tenant-a', outletId: 'outlet-a' }, rawMaterial: { tenantId: 'tenant-a', outletId: 'outlet-a' } }],
+    },
+  });
+});
+
 test('recipe and BOM Prisma queries are scoped to the selected outlet', () => {
   assert.deepEqual(applyPrismaTenantScope('Recipe', 'findMany', { where: { outletId: 'outlet-b' } }, scope), {
     where: { outletId: 'outlet-a', tenantId: 'tenant-a' },
