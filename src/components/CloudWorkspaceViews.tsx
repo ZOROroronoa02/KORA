@@ -2,8 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import { Activity, AlertTriangle, ArrowRight, Box, Clock3, Package, Plus, RefreshCw, Search, ShoppingBag, Truck, Users } from "lucide-react";
-import { readJson } from "@/lib/client-api";
+import { Activity, AlertTriangle, ArrowRight, Box, CalendarDays, Clock3, Download, Package, Plus, RefreshCw, Search, ShoppingBag, Truck, Users } from "lucide-react";
+import { apiFetch, readJson } from "@/lib/client-api";
 
 type CloudOrder = {
   id: string;
@@ -29,6 +29,30 @@ type CloudVendor = { id: string; name: string; phone: string | null; email: stri
 type CloudRecipeIngredient = { rawMaterialId: string; quantityMilli: string; rawMaterial: { id: string; name: string; unit: string; quantityMilli: string } };
 type CloudRecipe = { id: string; menuItemId: string; yieldQuantity: number; menuItem: { id: string; name: string }; ingredients: CloudRecipeIngredient[] };
 type CloudRecipeMenuItem = { id: string; name: string };
+type SalesReport = {
+  range: { from: string; to: string; timeZone: string; maxDays: number };
+  summary: { billCount: number };
+  financials?: { subtotalPaise: string; discountPaise: string; taxablePaise: string; cgstPaise: string; sgstPaise: string; igstPaise: string; serviceChargePaise: string; billedTotalPaise: string };
+  daily: Array<{ date: string; billCount: number; totalPaise?: string }>;
+  topItems: Array<{ name: string; quantity: string; salesPaise?: string }>;
+  paymentActivity?: Array<{ method: string; amountPaise: string }>;
+  refundActivity?: Array<{ method: string; amountPaise: string }>;
+  gstSummary?: Array<{ documentType: string; gstProfile: string; taxablePaise: string; cgstPaise: string; sgstPaise: string; igstPaise: string }>;
+};
+
+function currentIndiaDate() {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function formatReportPaise(value: string | undefined) {
+  const amount = BigInt(value ?? "0");
+  const sign = amount < 0n ? "-" : "";
+  const absolute = amount < 0n ? -amount : amount;
+  const rupees = new Intl.NumberFormat("en-IN").format(absolute / 100n);
+  return `${sign}₹${rupees}.${(absolute % 100n).toString().padStart(2, "0")}`;
+}
 
 export function CloudOverview({
   outletName,
@@ -86,7 +110,7 @@ export function CloudOverview({
     <div className="quick-actions cloud-quick-actions">
       <span className="quick-label">OUTLET SHORTCUTS</span>
       {canCreateOrders && <button onClick={() => onNavigate("POS")}><span className="quick-icon lime-icon"><ShoppingBag size={16} /></span><span><b>Start an order</b><small>Open the point of sale</small></span><ArrowRight size={15} /></button>}
-      {canViewReports && <button onClick={() => onNavigate("Reports")}><span className="quick-icon lavender-icon"><Activity size={16} /></span><span><b>Reports</b><small>See current report availability</small></span><ArrowRight size={15} /></button>}
+      {canViewReports && <button onClick={() => onNavigate("Reports")}><span className="quick-icon lavender-icon"><Activity size={16} /></span><span><b>Reports</b><small>Review saved sales and payments</small></span><ArrowRight size={15} /></button>}
       {canManageTeam && <button onClick={() => onNavigate("Team")}><span className="quick-icon sage-icon"><Users size={16} /></span><span><b>Manage team access</b><small>Roles and outlet assignments</small></span><ArrowRight size={15} /> </button>}
     </div>
   </>;
@@ -593,14 +617,85 @@ export function CloudCustomersPage({ customers, onAdd }: { customers: CloudCusto
   </>;
 }
 
-export function CloudReportsPage() {
+export function CloudReportsPage({ outletId, canViewFinancials, canViewGst }: { outletId: string; canViewFinancials: boolean; canViewGst: boolean }) {
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [report, setReport] = useState<SalesReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [exporting, setExporting] = useState(false);
+
+  useEffect(() => {
+    const today = currentIndiaDate();
+    setFrom((value) => value || today);
+    setTo((value) => value || today);
+  }, []);
+
+  useEffect(() => {
+    if (!outletId || !from || !to) return;
+    let active = true;
+    setLoading(true);
+    setError("");
+    setReport(null);
+    void readJson<SalesReport>(`/api/reports/sales?outletId=${encodeURIComponent(outletId)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`)
+      .then((result) => { if (active) setReport(result); })
+      .catch((reason) => { if (active) setError(reason instanceof Error ? reason.message : "Reports could not be loaded."); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [outletId, from, to]);
+
+  async function downloadCsv() {
+    if (!outletId || !from || !to || from > to) return;
+    setExporting(true);
+    setError("");
+    try {
+      const response = await apiFetch(`/api/reports/sales?outletId=${encodeURIComponent(outletId)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&format=csv`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error ?? `Report export failed (${response.status}).`);
+      }
+      const objectUrl = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = `kora-sales-${from}-to-${to}.csv`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Report export failed.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const invalidRange = !from || !to || from > to;
   return <>
-    <div className="page-title-row"><div><p className="eyebrow">INSIGHTS · CLOUD ACCOUNT</p><h1>Reports</h1><p className="muted">Sales and tax reporting must reconcile against stored bills and payments.</p></div></div>
-    <div className="card cloud-report-state">
-      <span className="feature-icon"><Activity size={22} /></span>
-      <h2>Live report aggregation is not available yet</h2>
-      <p>Cloud reports and export endpoints are not part of this release. No sample sales, GST, payment mix, or trend numbers are shown as outlet results.</p>
-      <small>Reporting is planned for Phase 4 and must reconcile bills, refunds, discounts, GST, and settlements before it is enabled.</small>
-    </div>
+    <div className="page-title-row"><div><p className="eyebrow">INSIGHTS · OUTLET DATA</p><h1>Reports</h1><p className="muted">Bill totals use issue date. Payment and refund activity use their recorded dates. Times are India Standard Time.</p></div><button className="secondary-button" disabled={loading || exporting || invalidRange || !report} onClick={() => void downloadCsv()}><Download size={15} />{exporting ? "Preparing…" : "Export CSV"}</button></div>
+    <section className="card report-controls" aria-label="Report date range">
+      <label><CalendarDays size={15} /> From <input aria-label="Report start date" type="date" value={from} max={to || undefined} onChange={(event) => setFrom(event.target.value)} /></label>
+      <label><CalendarDays size={15} /> To <input aria-label="Report end date" type="date" value={to} min={from || undefined} onChange={(event) => setTo(event.target.value)} /></label>
+      <span>Up to 93 days · voided orders excluded</span>
+    </section>
+    {error && <div className="cloud-data-notice" role="alert"><AlertTriangle size={16} /><span>{error}</span></div>}
+    {invalidRange && <div className="cloud-data-notice" role="alert"><AlertTriangle size={16} /><span>Choose a valid start and end date.</span></div>}
+    {loading && <div className="card report-loading" role="status"><RefreshCw size={18} className="spinning" /> Loading outlet report…</div>}
+    {!loading && report && <>
+      <div className="stats-grid report-metrics">
+        <div className="card cloud-metric"><span>Bills issued</span><b>{report.summary.billCount.toLocaleString("en-IN")}</b><small>Non-voided bills in the selected period</small></div>
+        {canViewFinancials && report.financials && <>
+          <div className="card cloud-metric"><span>Billed total</span><b>{formatReportPaise(report.financials.billedTotalPaise)}</b><small>Includes GST and service charge</small></div>
+          <div className="card cloud-metric"><span>Discounts</span><b>{formatReportPaise(report.financials.discountPaise)}</b><small>Saved bill discounts</small></div>
+          <div className="card cloud-metric"><span>Service charge</span><b>{formatReportPaise(report.financials.serviceChargePaise)}</b><small>Included in the billed total</small></div>
+        </>}
+      </div>
+      {report.summary.billCount === 0 ? <div className="card empty-state report-empty"><Activity size={23} /><b>No bills in this period</b><span>Choose another date range to view outlet activity.</span></div> : <div className="report-panels">
+        {report.daily.length > 0 && <section className="card content-card"><div className="card-heading"><div><h2>Daily billed totals</h2><p>By bill issue date · {report.range.timeZone}</p></div></div><div className="wide-table report-table"><div className="table-head"><span>DATE</span><span>BILLS</span><span>TOTAL</span></div>{report.daily.map((day) => <div className="table-row" key={day.date}><span>{day.date}</span><span>{day.billCount.toLocaleString("en-IN")}</span><span>{canViewFinancials ? formatReportPaise(day.totalPaise) : "—"}</span></div>)}</div></section>}
+        <section className="card content-card"><div className="card-heading"><div><h2>Top items</h2><p>Line sales after discounts, before GST and service charge</p></div></div>{report.topItems.length ? <div className="wide-table report-table"><div className="table-head"><span>ITEM</span><span>QUANTITY</span><span>LINE SALES</span></div>{report.topItems.map((item, index) => <div className="table-row" key={`${item.name}-${index}`}><span>{item.name}</span><span>{new Intl.NumberFormat("en-IN").format(BigInt(item.quantity))}</span><span>{canViewFinancials ? formatReportPaise(item.salesPaise) : "—"}</span></div>)}</div> : <div className="empty-state">No item lines were recorded in this period.</div>}</section>
+        {canViewFinancials && <section className="card content-card"><div className="card-heading"><div><h2>Payment activity</h2><p>Captured payments recorded during the selected dates</p></div></div>{report.paymentActivity?.length ? <div className="wide-table report-table"><div className="table-head"><span>METHOD</span><span>ACTIVITY</span><span>AMOUNT</span></div>{report.paymentActivity.map((entry) => <div className="table-row" key={entry.method}><span>{entry.method}</span><span>Captured</span><span>{formatReportPaise(entry.amountPaise)}</span></div>)}</div> : <div className="empty-state">No payments were recorded in this period.</div>}
+          <div className="card-heading report-subheading"><div><h2>Refund activity</h2><p>Recorded refunds, shown separately from bill issue totals</p></div></div>{report.refundActivity?.length ? <div className="wide-table report-table"><div className="table-head"><span>METHOD</span><span>ACTIVITY</span><span>AMOUNT</span></div>{report.refundActivity.map((entry) => <div className="table-row" key={entry.method}><span>{entry.method}</span><span>Refunded</span><span>{formatReportPaise(entry.amountPaise)}</span></div>)}</div> : <div className="empty-state">No refunds were recorded in this period.</div>}
+        </section>}
+        {canViewGst && <section className="card content-card"><div className="card-heading"><div><h2>GST summary</h2><p>Stored bill tax buckets · reference only, not a GST return</p></div></div>{report.gstSummary?.length ? <div className="wide-table report-table gst-report-table"><div className="table-head"><span>DOCUMENT / PROFILE</span><span>TAXABLE</span><span>CGST</span><span>SGST</span><span>IGST</span></div>{report.gstSummary.map((entry) => <div className="table-row" key={`${entry.documentType}-${entry.gstProfile}`}><span>{entry.documentType.replaceAll("_", " ")} · {entry.gstProfile.replaceAll("_", " ")}</span><span>{formatReportPaise(entry.taxablePaise)}</span><span>{formatReportPaise(entry.cgstPaise)}</span><span>{formatReportPaise(entry.sgstPaise)}</span><span>{formatReportPaise(entry.igstPaise)}</span></div>)}</div> : <div className="empty-state">No GST documents were issued in this period.</div>}</section>}
+      </div>}
+      <p className="report-footnote">Reports aggregate saved bills and payment ledgers on the server. Refunds appear by refund date; voided orders are excluded from bill totals. GST summary is a reconciliation aid and is not filing output.</p>
+    </>}
   </>;
 }

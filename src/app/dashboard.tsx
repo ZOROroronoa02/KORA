@@ -663,7 +663,7 @@ export default function Home() {
           {page === "Inventory" && (cloudMode ? <CloudInventoryPage outletId={selectedOutletId} canAdjustStock={effectivePermissions.includes("inventory.adjust")} /> : <InventoryPage products={data.products} onNotify={notify} />)}
           {page === "Customers" && (cloudMode ? <CloudCustomersPage customers={data.customers} onAdd={() => setModal("customer")} /> : <CustomersPage customers={data.customers} onAdd={() => setModal("customer")} canManage={canManageCustomers} />)}
           {page === "Team" && <RoleAdministration outletId={selectedOutletId} permissions={effectivePermissions} onNotify={notify} />}
-          {page === "Reports" && (cloudMode ? <CloudReportsPage /> : <ReportsPage range={range} setRange={setRange} todaySales={todaySales} onNotify={notify} />)}
+          {page === "Reports" && (cloudMode ? <CloudReportsPage outletId={selectedOutletId} canViewFinancials={effectivePermissions.includes("reports.view.financial")} canViewGst={effectivePermissions.includes("reports.view.gst")} /> : <ReportsPage range={range} setRange={setRange} todaySales={todaySales} onNotify={notify} />)}
           {page === "Audit" && <AuditLogViewer outletId={selectedOutletId} onNotify={notify} />}
           {page === "Settings" && <>{cloudMode ? <OutletProfileSettings key={selectedOutletId} outletId={selectedOutletId} permissions={effectivePermissions} onNotify={notify} /> : <SettingsPage data={data} setData={setData} onNotify={notify} />}<OutletApprovalSettings outletId={selectedOutletId} permissions={effectivePermissions} cloudMode={cloudMode} demoRole={demoRole} setDemoRole={setDemoRole} onNotify={notify} /></>}
           </>}
