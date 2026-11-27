@@ -5,10 +5,11 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   return NextResponse.json({
     name: "KORA",
-    status: "alive",
-    mode: "local-demo",
-    persistence: "browser-local-storage",
-    readiness: "/api/health/ready",
+    status: "live",
+    checks: {
+      liveness: "/api/health/live",
+      readiness: "/api/health/ready",
+    },
     timestamp: new Date().toISOString(),
   });
 }

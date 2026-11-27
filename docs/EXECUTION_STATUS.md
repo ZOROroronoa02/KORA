@@ -25,10 +25,12 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 - Inventory cloud UI now shows exact quantity/value formatting and offers ingredient creation, stock corrections, wastage, and vendor management to users with the matching permission. Contract and remaining inventory gaps are documented in `docs/inventory-stock-workflow.md`.
 - SQL migration history includes `20261127153000_invoice_financial_year_sequence` after the tenant ownership guard migration.
 - Production start launches `.next/standalone/server.js`, matching `output: "standalone"`. The build copies `.next/static` and `public` into the standalone runtime; this fixes missing CSS/JavaScript asset 404s that made the local production UI unstyled and noninteractive.
+- `/api/health` now reports liveness and links to the liveness/readiness probes without falsely describing the cloud platform as a browser-local demo.
 - Local preview is available at `http://localhost:3000`; `/` and `/api/health/live` returned 200. `/api/health/ready` returned 503 because local Redis is unavailable, as production readiness requires Redis.
 
 ## Latest verification
 
+- Health-contract smoke after rebuild: `/`, `/api/health`, and `/api/health/live` returned 200; all 9 CSS/JS assets linked from the page returned 200. `/api/health/ready` returned 503 because Redis is unavailable, correctly keeping the deployment unready.
 - `npx prisma generate` and `npm run lint` (TypeScript check): passed after a clean `npm ci`.
 - `npx prisma validate`: passed on the current schema.
 - `npx prisma migrate status`: all seven migrations applied locally.
