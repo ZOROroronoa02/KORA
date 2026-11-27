@@ -9,7 +9,7 @@ This is an execution checklist, not evidence that the cases have passed. Run aga
 | TypeScript and lint | `npm run lint` and `npm run typecheck` exit 0 | Any compile/type error |
 | Production build | `npm run build` exit 0 | Build failure or missing route chunk |
 | Unit suite | `npm test` exit 0 with test count | Failed test or skipped critical billing test |
-| Offline permission policy | `tests/offline-permissions.test.mjs` covers the 12-hour boundary and unknown keys | Expired/future snapshots grant actions or unknown claims survive filtering |
+| Offline permission policy | `tests/offline-permissions.test.mjs` covers the 12-hour permission and open-shift snapshot boundaries, closed/unknown shifts, and unknown permission keys | Expired/future snapshots grant actions or unknown claims survive filtering |
 | Prisma schema | `npx prisma validate` and generated client in sync | Invalid relations, stale client, or migration drift |
 | Migration reproducibility | Empty disposable DB migrates to current schema | Migration fails or `migrate diff` reports drift |
 | API authorization scan | Every tenant route resolves tenant/outlet from authenticated membership | Any caller-controlled tenant ID is trusted without membership validation |
@@ -40,7 +40,7 @@ This is an execution checklist, not evidence that the cases have passed. Run aga
 | POS-17 | Print to available ESC/POS printer and printer disconnected | Correct receipt prints when connected; disconnection produces actionable retry/fallback state without marking a duplicate sale |
 | POS-18 | Keyboard-only and Android touch operation at 360px, 768px, and 1280px | Primary order/pay actions are keyboard reachable; controls meet touch target size; no clipped cart/payment actions |
 | POS-19 | Refund part of a payment, retry its mutation ID, race two refunds for the remaining balance, and void after full reversal | One immutable refund ledger entry per committed mutation; duplicate retries replay; total reversals never exceed captured payment; partial funds block void; full reversal updates bill/shift state and allows audited void |
-| POS-20 | Cloud POS loses connectivity, queues an order with a recorded payment, prints receipt/KOT, restarts within 12 hours, then reconnects with a revoked role or stale menu price | UI shows provisional state and uses only the fresh cached permission snapshot; server re-authorizes; rejected commands remain visible and editable/retriable by an authorized operator; no final tax invoice is printed before server sync |
+| POS-20 | Cloud POS loses connectivity, queues an order with a recorded payment, prints receipt/KOT, restarts within 12 hours, then reconnects with a revoked role or stale menu price | UI shows provisional state and uses only fresh cached permissions; offline cash requires a recent same-user/outlet open-shift snapshot; shift open/close remains online-only; server re-authorizes; rejected commands remain visible and retriable by an authorized operator; no final tax invoice is printed before server sync |
 
 ## Cross-tenant, security, and reliability workflows
 

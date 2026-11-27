@@ -4,6 +4,14 @@ export function hasFreshOfflinePermissionSnapshot(savedAt: number, now = Date.no
   return Number.isSafeInteger(savedAt) && savedAt <= now && now - savedAt <= OFFLINE_PERMISSION_TTL_MS;
 }
 
+export function canUseOfflineCashShift(
+  cashShiftOpen: boolean | undefined,
+  shiftSnapshotAt: number | undefined,
+  now = Date.now(),
+): boolean {
+  return cashShiftOpen === true && shiftSnapshotAt !== undefined && hasFreshOfflinePermissionSnapshot(shiftSnapshotAt, now);
+}
+
 export function filterOfflinePermissions(permissions: string[] | undefined, knownPermissions: ReadonlySet<string>): string[] {
   return (permissions ?? []).filter((permission) => knownPermissions.has(permission));
 }

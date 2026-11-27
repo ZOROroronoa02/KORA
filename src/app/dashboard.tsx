@@ -17,7 +17,7 @@ import { io } from "socket.io-client";
 import { ApiError, getAccessToken, hasPendingLogout, readJson, readSession, registerRestaurant, restoreSession, signIn, signOut, type AuthenticatedSession } from "@/lib/client-api";
 import { cacheMenu, cacheOfflineWorkspace, cacheTables, clearOfflineWorkspace, getDeviceId, getPendingOrders, queueOrder, readCachedMenu, readOfflineWorkspace, removePendingOrder, updatePendingOrderError, type CachedDisplayOrder, type CloudOrderPayload } from "@/lib/pos-offline";
 import { allPermissionKeys, systemRolePermissions, type PermissionKey } from "@/lib/permissions";
-import { filterOfflinePermissions, hasFreshOfflinePermissionSnapshot, OFFLINE_PERMISSION_TTL_MS } from "@/lib/offline-permissions";
+import { canUseOfflineCashShift, filterOfflinePermissions, hasFreshOfflinePermissionSnapshot, OFFLINE_PERMISSION_TTL_MS } from "@/lib/offline-permissions";
 import { RoleAdministration } from "@/components/RoleAdministration";
 import { AuditLogViewer } from "@/components/AuditLogViewer";
 import { OutletApprovalSettings } from "@/components/OutletApprovalSettings";
@@ -262,13 +262,16 @@ export default function Home() {
     try {
       const cached = await readCachedMenu(outletId).catch(() => undefined);
       if (offlineOnly && !navigator.onLine) {
+        const cachedWorkspace = await readOfflineWorkspace().catch(() => undefined);
+        const cachedCashShiftOpen = Boolean(cachedWorkspace && cloudSession && cachedWorkspace.userId === cloudSession.user.id
+          && cachedWorkspace.outletId === outletId && canUseOfflineCashShift(cachedWorkspace.cashShiftOpen, cachedWorkspace.cashShiftSnapshotAt));
         let pending: Awaited<ReturnType<typeof getPendingOrders>> | null = null;
         try { pending = await readPendingOrders(outletId); } catch { /* The queue warning is visible; cached menu browsing can continue. */ }
         if (!cached?.categories) setCloudError("This outlet menu is not available in this device's offline cache. Reconnect before taking orders.");
         setData((current) => ({
           ...current,
           products: cached?.categories ? mapCloudMenu(cached.categories as Array<{ id: string; name: string; items: Array<Record<string, unknown>> }>) : [],
-          serviceChargeBps: cached?.serviceChargeBps ?? 0, customers: [], shiftOpen: false,
+          serviceChargeBps: cached?.serviceChargeBps ?? 0, customers: [], shiftOpen: cachedCashShiftOpen, cashOpen: 0,
           orders: pending?.map((item) => ({ ...item.displayOrder, syncState: item.lastError ? "needs-attention" as const : "queued" as const })) ?? [],
         }));
         setCloudTables(cached?.tables ?? []);
@@ -283,6 +286,7 @@ export default function Home() {
         permissions.includes("shift.open") ? readJson<{ shift: Record<string, unknown> | null }>(`/api/shifts?outletId=${encodeURIComponent(outletId)}`) : Promise.resolve(null),
         permissions.includes("customers.view") ? readJson<Array<Record<string, unknown>>>(`/api/customers?outletId=${encodeURIComponent(outletId)}`) : Promise.resolve(null),
       ]);
+      let verifiedCashShiftOpen: boolean | undefined;
       const menuResult = jobs[0];
       if (menuResult.status === "fulfilled") {
         await cacheMenu(outletId, menuResult.value).catch(() => undefined);
@@ -297,6 +301,7 @@ export default function Home() {
       }
       if (jobs[3].status === "fulfilled" && jobs[3].value) {
         const shift = jobs[3].value.shift;
+        verifiedCashShiftOpen = Boolean(shift);
         setData((current) => ({ ...current, shiftOpen: Boolean(shift), cashOpen: shift ? paiseToRupees(shift.openingCashPaise) : 0 }));
       }
       if (jobs[4].status === "fulfilled" && jobs[4].value) {
@@ -309,7 +314,7 @@ export default function Home() {
       if (!permissions.includes("menu.view")) setData((current) => ({ ...current, products: [] }));
       if (!permissions.includes("orders.read") && !permissions.includes("reports.view.sales") && !permissions.includes("kds.view")) setData((current) => ({ ...current, orders: [] }));
       const activeOutlet = cloudSession?.outlets.find((item) => item.id === outletId);
-      if (activeOutlet && cloudSession) void saveOfflineWorkspace({ userId: cloudSession.user.id, userName: cloudSession.user.name, outletId, outletName: activeOutlet.name, role: activeOutlet.role, permissions: activeOutlet.permissions }).catch(() => undefined);
+      if (activeOutlet && cloudSession) void saveOfflineWorkspace({ userId: cloudSession.user.id, userName: cloudSession.user.name, outletId, outletName: activeOutlet.name, role: activeOutlet.role, permissions: activeOutlet.permissions, ...(verifiedCashShiftOpen !== undefined ? { cashShiftOpen: verifiedCashShiftOpen } : {}) }).catch(() => undefined);
       const failures = jobs.filter((result) => result.status === "rejected");
       if (failures.length) setCloudError("Some cloud data could not be refreshed. Check your connection or access permissions.");
     } catch (error) {
@@ -407,6 +412,7 @@ export default function Home() {
       if (!currentOutlet.permissions.includes("shift.open")) return;
       void readJson<{ shift: Record<string, unknown> | null }>(`/api/shifts?outletId=${encodeURIComponent(selectedOutletId)}`).then(({ shift }) => {
         setData((current) => ({ ...current, shiftOpen: Boolean(shift), cashOpen: shift ? paiseToRupees(shift.openingCashPaise) : 0 }));
+        if (currentOutlet && cloudSession) void saveOfflineWorkspace({ userId: cloudSession.user.id, userName: cloudSession.user.name, outletId: selectedOutletId, outletName: currentOutlet.name, role: currentOutlet.role, permissions: currentOutlet.permissions, cashShiftOpen: Boolean(shift) }).catch(() => undefined);
       }).catch(() => undefined);
     };
     socket.on("order:new", updateOrders);
@@ -478,7 +484,14 @@ export default function Home() {
     if (receivedPaise > totals.totalPaise) { notify("Payment cannot exceed the bill total"); return; }
     const received = receivedPaise / 100;
     if (cloudMode && currentOutlet) {
-      if (offlineOnly && method === "Cash" && receivedPaise > 0) { notify("Offline cash collection needs an open server shift. Record the bill as pending, then settle it after reconnecting."); return; }
+      if (offlineOnly && method === "Cash" && receivedPaise > 0) {
+        const cached = await readOfflineWorkspace().catch(() => undefined);
+        const eligible = Boolean(cached && cloudSession && cached.userId === cloudSession.user.id && cached.outletId === selectedOutletId
+          && hasFreshOfflinePermissionSnapshot(cached.savedAt)
+          && canUseOfflineCashShift(cached.cashShiftOpen, cached.cashShiftSnapshotAt)
+          && cached.permissions?.includes("bills.settle") === true);
+        if (!eligible) { notify("Offline cash requires a recent server-verified open shift and billing access. Record the bill as pending, then settle it after reconnecting."); return; }
+      }
       setCloudSaving(true);
       const clientMutationId = crypto.randomUUID();
       const selectedTable = cloudTables.find((item) => item.label === table);
@@ -673,16 +686,19 @@ export default function Home() {
     setNewCustomer({ name: "", phone: "" }); setModal(""); notify("Customer profile created");
   };
   const openCashierShift = async () => {
+    if (cloudMode && offlineOnly) { notify("Reconnect before opening a cash shift."); return; }
     let paise: number;
     try { paise = parseRupeesToPaise(openingCash); } catch { notify("Enter a valid opening float with no more than two decimal places"); return; }
     if (cloudMode) {
       try {
         await readJson("/api/shifts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, action: "open", openingCashPaise: paise }) });
       } catch (error) { notify(error instanceof Error ? error.message : "Shift could not be opened."); return; }
+      if (currentOutlet && cloudSession) void saveOfflineWorkspace({ userId: cloudSession.user.id, userName: cloudSession.user.name, outletId: selectedOutletId, outletName: currentOutlet.name, role: currentOutlet.role, permissions: currentOutlet.permissions, cashShiftOpen: true }).catch(() => undefined);
     }
     setData((current) => ({ ...current, shiftOpen: true, cashOpen: paise / 100 })); setModal(""); notify(`Shift opened · opening float ${fmt(paise / 100)}${cloudMode ? " · cloud" : " · local demo"}`);
   };
   const closeCashierShift = async () => {
+    if (cloudMode && offlineOnly) { notify("Reconnect before closing or reconciling a cash shift."); return; }
     let countedPaise: number;
     try { countedPaise = parseRupeesToPaise(cashCounted); } catch { notify("Enter a valid cash count with no more than two decimal places"); return; }
     let variancePaise = countedPaise - Math.round(data.cashOpen * 100);
@@ -691,6 +707,7 @@ export default function Home() {
         const result = await readJson<{ reconciliation: { variancePaise: number } }>("/api/shifts", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ outletId: selectedOutletId, action: "close", countedCashPaise: countedPaise }) });
         variancePaise = result.reconciliation.variancePaise;
       } catch (error) { notify(error instanceof Error ? error.message : "Shift could not be closed."); return; }
+      if (currentOutlet && cloudSession) void saveOfflineWorkspace({ userId: cloudSession.user.id, userName: cloudSession.user.name, outletId: selectedOutletId, outletName: currentOutlet.name, role: currentOutlet.role, permissions: currentOutlet.permissions, cashShiftOpen: false }).catch(() => undefined);
     }
     setData((current) => ({ ...current, shiftOpen: false })); setModal(""); notify(`Shift closed · cash variance ${fmt(variancePaise / 100)}${cloudMode ? " · cloud" : " · local demo"}`);
   };
@@ -705,7 +722,7 @@ export default function Home() {
       </aside>
 
       <section className="main-area">
-        <header className="topbar"><div className="crumbs"><span>Workspace</span><ChevronRight size={13} /><strong>{page === "POS" ? "Point of sale" : page}</strong></div><div className="topbar-actions">{effectivePermissions.includes("shift.open") && <button className={`shift-pill ${data.shiftOpen ? "shift-open" : "shift-closed"}`} onClick={() => { if (data.shiftOpen) { setCashCounted(""); setModal("shift"); } else { setOpeningCash(""); setModal("openShift"); } }}><Clock3 size={13}/>{data.shiftOpen ? "Shift open" : "Open shift"}</button>}<span className={`sync-pill ${online ? "online" : "offline"}`}>{online ? <Wifi size={13} /> : <WifiOff size={13} />}{syncLabel}</span>{cloudMode ? <button className="secondary-button" onClick={() => setModal("outlet")}>{currentOutlet?.name ?? "Outlet"}</button> : <label className="demo-role-switch"><span className="sr-only">Demo role</span><select aria-label="Demo role" value={demoRole} onChange={(event) => setDemoRole(event.target.value as keyof typeof systemRolePermissions)}>{Object.keys(systemRolePermissions).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></label>} {cloudMode ? null : <button className="secondary-button" onClick={() => setModal("connect")}>Connect cloud</button>}<button className="icon-button notification-button" aria-label="Notifications" onClick={() => notify("You’re all caught up")}><Bell size={17} /><i /></button><span className="top-divider" /><button className="avatar avatar-small avatar-moss" onClick={() => cloudMode ? void disconnectCloud() : setPage("Settings")}>{initials(cloudSession?.user.name ?? "Arjun Sharma")}</button></div></header>
+        <header className="topbar"><div className="crumbs"><span>Workspace</span><ChevronRight size={13} /><strong>{page === "POS" ? "Point of sale" : page}</strong></div><div className="topbar-actions">{effectivePermissions.includes("shift.open") && <button disabled={cloudMode && offlineOnly} title={cloudMode && offlineOnly ? "Reconnect to open or reconcile a shift" : undefined} className={`shift-pill ${data.shiftOpen ? "shift-open" : "shift-closed"}`} onClick={() => { if (data.shiftOpen) { setCashCounted(""); setModal("shift"); } else { setOpeningCash(""); setModal("openShift"); } }}><Clock3 size={13}/>{data.shiftOpen ? "Shift open" : "Open shift"}</button>}<span className={`sync-pill ${online ? "online" : "offline"}`}>{online ? <Wifi size={13} /> : <WifiOff size={13} />}{syncLabel}</span>{cloudMode ? <button className="secondary-button" onClick={() => setModal("outlet")}>{currentOutlet?.name ?? "Outlet"}</button> : <label className="demo-role-switch"><span className="sr-only">Demo role</span><select aria-label="Demo role" value={demoRole} onChange={(event) => setDemoRole(event.target.value as keyof typeof systemRolePermissions)}>{Object.keys(systemRolePermissions).map((role) => <option key={role} value={role}>{role.replaceAll("_", " ")}</option>)}</select></label>} {cloudMode ? null : <button className="secondary-button" onClick={() => setModal("connect")}>Connect cloud</button>}<button className="icon-button notification-button" aria-label="Notifications" onClick={() => notify("You’re all caught up")}><Bell size={17} /><i /></button><span className="top-divider" /><button className="avatar avatar-small avatar-moss" onClick={() => cloudMode ? void disconnectCloud() : setPage("Settings")}>{initials(cloudSession?.user.name ?? "Arjun Sharma")}</button></div></header>
         <div className="page-content">
           {cloudMode && !online && <div className={`offline-permission-banner ${offlinePermissionExpiresAt === null ? "expired" : ""}`} role="status" aria-live="polite"><WifiOff size={18}/><div><b>{offlinePermissionExpiresAt === null ? "Offline permissions expired" : "Offline work is provisional"}</b><span>{offlinePermissionExpiresAt === null ? "Protected actions are disabled. Reconnect and sign in to refresh outlet access." : `Using the last server-verified outlet permissions until ${new Date(offlinePermissionExpiresAt).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}. Orders and recorded payments remain provisional; the server rechecks access, prices, stock and shift state on sync.`}</span></div>{pendingCount > 0 && <strong>{pendingCount} queued</strong>}</div>}
           {!canAccessPage(page) ? <div className="empty-state no-access"><ShieldCheck size={25}/><b>You don’t have access to this area</b><span>Ask an owner to assign the required outlet role.</span><button className="secondary-button" onClick={() => setPage("Overview")}>Back to overview</button></div> : <>

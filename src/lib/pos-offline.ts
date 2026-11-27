@@ -63,7 +63,7 @@ export type PendingKdsAction = {
 class KoraPosDatabase extends Dexie {
   pendingOrders!: Table<PendingOrder, string>;
   menuSnapshots!: Table<{ outletId: string; savedAt: number; categories: unknown[]; tables?: Array<{ id: string; label: string; section?: string | null; capacity: number; occupied?: boolean }>; serviceChargeBps?: number }, string>;
-  offlineWorkspace!: Table<{ id: "last"; userId: string; userName: string; outletId: string; outletName: string; role: string; permissions?: string[]; savedAt: number }, string>;
+  offlineWorkspace!: Table<{ id: "last"; userId: string; userName: string; outletId: string; outletName: string; role: string; permissions?: string[]; savedAt: number; cashShiftOpen?: boolean; cashShiftSnapshotAt?: number }, string>;
   kdsSnapshots!: Table<KdsTicketSnapshot, string>;
   kdsActions!: Table<PendingKdsAction, string>;
   constructor() {
@@ -113,8 +113,18 @@ export async function cacheTables(outletId: string, tables: NonNullable<Awaited<
   await database.menuSnapshots.put({ outletId, categories: existing?.categories ?? [], tables, serviceChargeBps, savedAt: Date.now() });
 }
 
-export async function cacheOfflineWorkspace(workspace: { userId: string; userName: string; outletId: string; outletName: string; role: string; permissions?: string[] }) {
-  await database.offlineWorkspace.put({ id: "last", ...workspace, savedAt: Date.now() });
+export async function cacheOfflineWorkspace(workspace: { userId: string; userName: string; outletId: string; outletName: string; role: string; permissions?: string[]; cashShiftOpen?: boolean }) {
+  const now = Date.now();
+  await database.transaction("rw", database.offlineWorkspace, async () => {
+    const existing = await database.offlineWorkspace.get("last");
+    const sameContext = existing?.userId === workspace.userId && existing.outletId === workspace.outletId;
+    const shiftSnapshot = typeof workspace.cashShiftOpen === "boolean"
+      ? { cashShiftOpen: workspace.cashShiftOpen, cashShiftSnapshotAt: now }
+      : sameContext && existing?.cashShiftSnapshotAt !== undefined
+        ? { cashShiftOpen: existing.cashShiftOpen, cashShiftSnapshotAt: existing.cashShiftSnapshotAt }
+        : {};
+    await database.offlineWorkspace.put({ id: "last", ...workspace, ...shiftSnapshot, savedAt: now });
+  });
 }
 
 export async function cacheKdsTickets(outletId: string, tickets: unknown[], metadata?: Pick<KdsTicketSnapshot, "stations" | "settings" | "outlet">) {
