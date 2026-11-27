@@ -2,6 +2,8 @@
 
 ## 2026-11-27
 
+- Hardened `/api/health/ready`: report PostgreSQL/Redis dependency states without connection details, use no-store headers, disable retries, and enforce a 1.5-second overall Redis probe deadline (with one-second connect/socket limits). The local production probe now identifies the actual blocker as `redis: required` while PostgreSQL is ready.
+- Added readiness policy, stalled-handshake, and live endpoint tests. Final full suite: 113 passed, 0 failed, 0 skipped; production build, lint/typecheck, and CSP smoke passed. Production mode remains not ready until Redis is provisioned.
 - Added cloud shift reconciliation reports with dual-permission and tenant/outlet guards, IST date validation, bounded cursor pagination, grouped ledger totals, open cash estimates, close mismatch detection, and formula-safe export. Non-cash refunds without shift IDs remain in outlet-level reporting rather than being assigned to a cashier retroactively.
 - Added migration `20261127270000_shift_report_outlet_date_index` for tenant/outlet/date ordered shift pagination; the existing local database now reports all 16 migrations applied.
 - Replayed all 16 migrations successfully in a fresh disposable local database and removed that exact database after verification.

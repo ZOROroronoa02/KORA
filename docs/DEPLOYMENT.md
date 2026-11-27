@@ -43,7 +43,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE kora_migrator IN SCHEMA public
 5. Apply reviewed migrations with `MIGRATION_DATABASE_URL` set to the deploy-only role: `npm run db:migrate:deploy`.
 6. For the invoice financial-year sequence migration, briefly quiesce order creation while deploying: stop old app writers, apply the migration, then deploy the new code before accepting orders again. This prevents old and new invoice-number formats from allocating concurrently. Existing invoices are retained and the first new financial-year sequence continues from the highest existing numeric suffix for that year.
 7. Deploy application code and background workers using only the restricted `DATABASE_URL` runtime credential.
-8. Check `/api/health/live`, `/api/health/ready`, `/health/live`, and `/health/ready`, then run a smoke order in staging. Realtime readiness requires a live PostgreSQL connection and connected Redis publisher/subscriber.
+8. Check `/api/health/live`, `/api/health/ready`, `/health/live`, and `/health/ready`, then run a smoke order in staging. Web readiness reports redacted `database` and `redis` states; production requires both ready. Realtime readiness requires a live PostgreSQL connection and connected Redis publisher/subscriber.
 9. Monitor error rate, DB connections, sync backlog, Redis and order latency.
 10. Roll back application code first when compatible; use forward migrations for data changes. Restore a backup only through a tested incident procedure.
 
