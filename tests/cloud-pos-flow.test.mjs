@@ -62,10 +62,39 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(categories.length, 5);
     const item = categories.flatMap((category) => category.items)[0];
     assert.ok(item?.id);
+    const unclassifiedSale = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `missing-tax-code-${suffix}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    assert.equal(unclassifiedSale.status, 409, 'a registered Tax Invoice cannot be issued with an unclassified menu item');
+    const sampleClassificationResponse = await fetch(`${api}/api/menu`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, menuItemId: item.id, taxCodeKind: 'SAC', taxCode: '996331' }),
+    });
+    assert.equal(sampleClassificationResponse.status, 200, await sampleClassificationResponse.text());
+    await fetch(`${api}/api/menu`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, menuItemId: item.id, taxCodeKind: 'HSN', taxCode: '21069099' }),
+    });
+    const deliveryWithoutAddress = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `delivery-no-address-${suffix}`, type: 'Delivery', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    assert.equal(deliveryWithoutAddress.status, 400, 'packaged-goods delivery needs a destination address');
+    const interstateDelivery = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `delivery-interstate-${suffix}`, type: 'Delivery', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0, buyerDetails: { address: { line1: '1 Lake Road', city: 'Hyderabad', state: 'Telangana', pincode: '500001' } } }),
+    });
+    assert.equal(interstateDelivery.status, 409, 'inter-state packaged-goods delivery must not receive an incorrect local tax split');
+    const restoreServiceCode = await fetch(`${api}/api/menu`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, menuItemId: item.id, taxCodeKind: 'SAC', taxCode: '996331' }),
+    });
+    assert.equal(restoreServiceCode.status, 200);
     await prisma.outlet.update({ where: { id: registration.outlet.id }, data: { serviceChargeBps: 500 } });
     const menuCreateResponse = await fetch(`${api}/api/menu`, {
       method: 'POST', headers: { ...ownerHeaders, 'content-type': 'application/json' },
-      body: JSON.stringify({ outletId: registration.outlet.id, categoryId: categories[0].id, name: `Cloud special ${suffix}`, pricePaise: 7650 }),
+      body: JSON.stringify({ outletId: registration.outlet.id, categoryId: categories[0].id, name: `Cloud special ${suffix}`, pricePaise: 7650, taxCodeKind: 'SAC', taxCode: '996331' }),
     });
     const addedMenuItem = await menuCreateResponse.json();
     assert.equal(menuCreateResponse.status, 201, JSON.stringify(addedMenuItem));
@@ -101,7 +130,13 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
       outletId: registration.outlet.id, clientMutationId, deviceId: `device-${suffix}`,
       type: 'Dine in', tableId: firstTable.id, items: [{ menuItemId: item.id, quantity: 2 }],
       paidPaise: 0, discountBps: 0,
+      buyerDetails: { name: 'Aarav Shah', gstin: '29ABCDE1234F1Z5', address: { line1: '20 Main Road', line2: '', city: 'Bengaluru', state: 'Karnataka', pincode: '560038' } },
     };
+    const wrongBuyerStateResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ ...orderPayload, clientMutationId: `bad-buyer-${suffix}`, buyerDetails: { ...orderPayload.buyerDetails, gstin: '27ABCDE1234F1Z5' } }),
+    });
+    assert.equal(wrongBuyerStateResponse.status, 400);
     const orderResponse = await fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(orderPayload),
     });
@@ -112,8 +147,13 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(created.kot.sequence, 1);
     assert.equal(created.bill.paymentStatus, 'PENDING');
     assert.equal(created.bill.documentType, 'TAX_INVOICE');
+    assert.ok(created.bill.invoiceNumber.length <= 16, 'GST invoice serial stays within the 16-character limit');
     assert.equal(created.bill.gstProfile, 'STANDARD_RESTAURANT');
     assert.equal(created.bill.gstinSnapshot, '29ABCDE1234F1Z5');
+    assert.equal(created.bill.recipientNameSnapshot, 'Aarav Shah');
+    assert.equal(created.bill.recipientGstinSnapshot, '29ABCDE1234F1Z5');
+    assert.equal(created.order.items[0].taxCodeKindSnapshot, 'SAC');
+    assert.equal(created.order.items[0].taxCodeSnapshot, '996331');
     assert.equal(created.bill.supplierNameSnapshot, registration.tenant.name);
     const unitPricePaise = BigInt(item.outletPrices[0]?.pricePaise ?? item.basePricePaise);
     const expectedSubtotalPaise = unitPricePaise * 2n;
@@ -124,6 +164,20 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(created.bill.serviceChargePaise, expectedServiceChargePaise.toString());
     assert.equal((BigInt(created.bill.cgstPaise) + BigInt(created.bill.sgstPaise)).toString(), expectedTaxPaise.toString());
     assert.equal(created.bill.totalPaise, (expectedTaxablePaise + expectedTaxPaise).toString());
+
+    await fetch(`${api}/api/menu`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, menuItemId: item.id, taxCodeKind: 'HSN', taxCode: '21069099' }),
+    });
+    const invoiceResponse = await fetch(`${api}/api/bills/${created.bill.id}/invoice?outletId=${registration.outlet.id}`, { headers });
+    const invoice = await invoiceResponse.json();
+    assert.equal(invoiceResponse.status, 200, JSON.stringify(invoice));
+    assert.equal(invoice.documentType, 'TAX_INVOICE');
+    assert.equal(invoice.recipientGstin, '29ABCDE1234F1Z5');
+    assert.equal(invoice.placeOfSupply, 'Karnataka');
+    assert.equal(invoice.lines[0].taxCode, '996331', 'printed line retains the code snapshot even after menu reclassification');
+    assert.equal(invoice.taxBreakdown[0].gstBps, 500);
+    assert.equal(invoice.totals.totalPaise, created.bill.totalPaise);
 
     const replayResponse = await fetch(`${api}/api/orders`, {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(orderPayload),

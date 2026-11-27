@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addPaymentWithinBalance, addRefundWithinPaidBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, indianFinancialYear, parseRupeesToPaise, paymentStatus, paymentStatusAfterRefund, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
+import { addPaymentWithinBalance, addRefundWithinPaidBalance, allocatePaise, applyIdempotently, applyStockChange, calculateSale, calculateSaleBreakdown, formatInvoiceNumber, indianFinancialYear, parseRupeesToPaise, paymentStatus, paymentStatusAfterRefund, reconcileCash, splitByAmounts, transitionOrder } from '../src/lib/billing.ts';
 
 test('rupee parsing uses integer paise and rejects precision loss', () => {
   assert.equal(parseRupeesToPaise('0'), 0);
@@ -15,6 +15,14 @@ test('Indian invoice financial year changes at midnight IST on 1 April', () => {
   assert.deepEqual(indianFinancialYear(new Date('2026-03-31T18:29:59.999Z')), { startYear: 2025, label: '2025-26' });
   assert.deepEqual(indianFinancialYear(new Date('2026-03-31T18:30:00.000Z')), { startYear: 2026, label: '2026-27' });
   assert.throws(() => indianFinancialYear(new Date(Number.NaN)), /valid date/);
+});
+
+test('GST invoice serial includes the financial year and stays within 16 characters', () => {
+  assert.equal(formatInvoiceNumber('K', '2026-27', 1), 'K-FY2627-000001');
+  assert.equal(formatInvoiceNumber('K1', '2026-27', 999999), 'K1-FY2627-999999');
+  assert.equal(formatInvoiceNumber('K', '2026-27', 9999999), 'K-FY2627-9999999');
+  assert.throws(() => formatInvoiceNumber('KORA', '2026-27', 1), /one or two/);
+  assert.throws(() => formatInvoiceNumber('K', '2026-27', 10000000), /16-character/);
 });
 
 test('order workflow rejects cancelled-order revival and out-of-order kitchen actions', () => {
@@ -66,6 +74,17 @@ test('service charge is included in the taxable base at each line GST rate', () 
     serviceChargePaise: 2000,
     totalPaise: 23870,
   });
+});
+
+test('invoice line breakdown reconciles every paise to the server-calculated bill totals', () => {
+  const sale = calculateSaleBreakdown([
+    { quantity: 2, unitPricePaise: 10_000, gstBps: 500, discountPaise: 101 },
+    { quantity: 1, unitPricePaise: 5_000, gstBps: 1800 },
+  ], { discountPaise: 200, serviceChargeBps: 500 });
+  assert.equal(sale.lines.reduce((sum, line) => sum + line.taxablePaise, 0), sale.taxablePaise);
+  assert.equal(sale.lines.reduce((sum, line) => sum + line.taxPaise, 0), sale.taxPaise);
+  assert.equal(sale.lines.reduce((sum, line) => sum + line.totalPaise, 0), sale.totalPaise);
+  assert.equal(sale.lines.reduce((sum, line) => sum + line.serviceChargePaise, 0), sale.serviceChargePaise);
 });
 
 test('line discounts and mixed GST rates preserve taxable totals', () => {

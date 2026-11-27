@@ -136,7 +136,11 @@ test('API security integration: tenant isolation, concurrent billing, and paymen
       method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
       body: JSON.stringify({ outletId: registered.outlet.id, clientMutationId: 'security-split-' + suffix, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),
     }));
-    assert.ok(order.bill.invoiceNumber.includes(`-FY${indianFinancialYear(new Date()).label}-`), 'invoice number must use the current India financial year');
+    const fiscalYear = indianFinancialYear(new Date());
+    assert.ok(order.bill.invoiceNumber.includes(`-FY${fiscalYear.label.slice(2, 4)}${fiscalYear.label.slice(5, 7)}-`), 'invoice number must use the current India financial year');
+    assert.ok(order.bill.invoiceNumber.length <= 16, 'GST invoice serial must be no longer than 16 characters');
+    const wrongOutletInvoice = await fetch(api + '/api/bills/' + order.bill.id + '/invoice?outletId=' + outletB.id, { headers: ownerHeaders });
+    assert.equal(wrongOutletInvoice.status, 404, 'invoice details must be scoped to the selected outlet even for an owner on both outlets');
     const concurrentOrders = await Promise.all([1, 2].map(async (index) => readJson(await fetch(api + '/api/orders', {
       method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + registered.accessToken },
       body: JSON.stringify({ outletId: registered.outlet.id, clientMutationId: `security-invoice-${suffix}-${index}`, type: 'Takeaway', items: [{ menuItemId: item.id, quantity: 1 }], paidPaise: 0 }),

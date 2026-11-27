@@ -3,7 +3,7 @@ import { requirePermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
-import { gstRateForItem } from "@/lib/domain/gst-profile";
+import { gstRateForItem, validateTaxCode } from "@/lib/domain/gst-profile";
 
 export const runtime = "nodejs";
 const jsonSafe = (value: unknown) => JSON.parse(JSON.stringify(value, (_key, entry) => typeof entry === "bigint" ? entry.toString() : entry));
@@ -32,19 +32,24 @@ async function POSTHandler(request: NextRequest) {
   const pricePaise = Number(body.pricePaise);
   const taxRateProvided = Object.hasOwn(body, "gstBps");
   const gstBps = body.gstBps === null || body.gstBps === undefined ? null : Number(body.gstBps);
+  const taxCodeProvided = Object.hasOwn(body, "taxCodeKind") || Object.hasOwn(body, "taxCode");
+  const taxCodeKind = body.taxCodeKind === null || body.taxCodeKind === undefined ? null : body.taxCodeKind;
+  const taxCode = body.taxCode === null || body.taxCode === undefined ? null : typeof body.taxCode === "string" ? body.taxCode.trim() : body.taxCode;
   if (name.length < 2 || name.length > 120 || !Number.isSafeInteger(pricePaise) || pricePaise < 0) return NextResponse.json({ error: "Provide a dish name and non-negative price in paise." }, { status: 400 });
   if (taxRateProvided && gstBps !== null && (!Number.isSafeInteger(gstBps) || gstBps < 0 || gstBps > 10000)) return NextResponse.json({ error: "Item GST rate must be an integer from 0 to 10000 basis points or inherit the tenant rate." }, { status: 400 });
+  const taxCodeError = validateTaxCode({ kind: taxCodeKind, code: taxCode });
+  if (taxCodeError) return NextResponse.json({ error: taxCodeError }, { status: 400 });
   const category = await prisma.menuCategory.findFirst({ where: { id: categoryId, tenantId: access.tenantId, OR: [{ outletId }, { outletId: null }] } });
   if (!category) return NextResponse.json({ error: "Category not found in this outlet." }, { status: 404 });
   const pricePermission = await requirePermission(request, outletId, "menu.price_edit");
   if ("error" in pricePermission) return NextResponse.json({ error: "Menu price edit permission required." }, { status: 403 });
-  if (taxRateProvided) {
+  if (taxRateProvided || taxCodeProvided) {
     const taxPermission = await requirePermission(request, outletId, "menu.tax_edit");
     if ("error" in taxPermission) return NextResponse.json({ error: "Menu tax edit permission required." }, { status: 403 });
   }
   const item = await prisma.$transaction(async (tx) => {
-    const created = await tx.menuItem.create({ data: { tenantId: access.tenantId, categoryId, name, basePricePaise: BigInt(pricePaise), gstBps: taxRateProvided ? gstBps : null, outletPrices: { create: { outletId } } } });
-    await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "MENU_ITEM_CREATED", entityType: "MenuItem", entityId: created.id, after: { name, categoryId, pricePaise, gstBps: created.gstBps } } });
+    const created = await tx.menuItem.create({ data: { tenantId: access.tenantId, categoryId, name, basePricePaise: BigInt(pricePaise), gstBps: taxRateProvided ? gstBps : null, ...(taxCodeProvided ? { taxCodeKind: taxCodeKind as "HSN" | "SAC" | null, taxCode: taxCode as string | null } : {}), outletPrices: { create: { outletId } } } });
+    await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "MENU_ITEM_CREATED", entityType: "MenuItem", entityId: created.id, after: { name, categoryId, pricePaise, gstBps: created.gstBps, taxCodeKind: created.taxCodeKind, taxCode: created.taxCode } } });
     return created;
   });
   void publishOutletEvent(access.tenantId, outletId, "menu:updated", { menuItemId: item.id, action: "created" });
@@ -61,9 +66,14 @@ async function PATCHHandler(request: NextRequest) {
   const pricePaise = body.pricePaise === undefined ? undefined : Number(body.pricePaise);
   const taxRateProvided = Object.hasOwn(body, "gstBps");
   const gstBps = body.gstBps === null || body.gstBps === undefined ? null : Number(body.gstBps);
-  if (!menuItemId || (available === undefined && pricePaise === undefined && !taxRateProvided)) return NextResponse.json({ error: "Provide an item ID and availability, price, or tax rate." }, { status: 400 });
+  const taxCodeProvided = Object.hasOwn(body, "taxCodeKind") || Object.hasOwn(body, "taxCode");
+  const taxCodeKind = body.taxCodeKind === null || body.taxCodeKind === undefined ? null : body.taxCodeKind;
+  const taxCode = body.taxCode === null || body.taxCode === undefined ? null : typeof body.taxCode === "string" ? body.taxCode.trim() : body.taxCode;
+  if (!menuItemId || (available === undefined && pricePaise === undefined && !taxRateProvided && !taxCodeProvided)) return NextResponse.json({ error: "Provide an item ID, availability, price, tax rate, or HSN/SAC code." }, { status: 400 });
   if (pricePaise !== undefined && (!Number.isSafeInteger(pricePaise) || pricePaise < 0)) return NextResponse.json({ error: "Price must be a non-negative integer number of paise." }, { status: 400 });
   if (taxRateProvided && gstBps !== null && (!Number.isSafeInteger(gstBps) || gstBps < 0 || gstBps > 10000)) return NextResponse.json({ error: "Item GST rate must be an integer from 0 to 10000 basis points or inherit the tenant rate." }, { status: 400 });
+  const taxCodeError = validateTaxCode({ kind: taxCodeKind, code: taxCode });
+  if (taxCodeProvided && taxCodeError) return NextResponse.json({ error: taxCodeError }, { status: 400 });
   if (available !== undefined) {
     const editAccess = await requirePermission(request, outletId, "menu.edit");
     if ("error" in editAccess) return NextResponse.json({ error: editAccess.error }, { status: editAccess.error === "Unauthenticated" ? 401 : 403 });
@@ -72,7 +82,7 @@ async function PATCHHandler(request: NextRequest) {
     const priceAccess = await requirePermission(request, outletId, "menu.price_edit");
     if ("error" in priceAccess) return NextResponse.json({ error: priceAccess.error }, { status: priceAccess.error === "Unauthenticated" ? 401 : 403 });
   }
-  if (taxRateProvided) {
+  if (taxRateProvided || taxCodeProvided) {
     const taxAccess = await requirePermission(request, outletId, "menu.tax_edit");
     if ("error" in taxAccess) return NextResponse.json({ error: "Menu tax edit permission required." }, { status: 403 });
   }
@@ -87,11 +97,11 @@ async function PATCHHandler(request: NextRequest) {
       await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: pricePaise !== undefined ? "MENU_PRICE_CHANGED" : "MENU_AVAILABILITY_CHANGED", entityType: "MenuItem", entityId: menuItemId, ...(previous ? { before: { available: previous.available, pricePaise: previous.pricePaise?.toString() ?? null } } : {}), after: { available: updated.available, pricePaise: updated.pricePaise?.toString() ?? null } } });
     }
     let menuItem = item;
-    if (taxRateProvided) {
-      menuItem = await tx.menuItem.update({ where: { id: menuItemId }, data: { gstBps } });
-      await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: "MENU_TAX_RATE_CHANGED", entityType: "MenuItem", entityId: menuItemId, before: { gstBps: item.gstBps }, after: { gstBps: menuItem.gstBps } } });
+    if (taxRateProvided || taxCodeProvided) {
+      menuItem = await tx.menuItem.update({ where: { id: menuItemId }, data: { ...(taxRateProvided ? { gstBps } : {}), ...(taxCodeProvided ? { taxCodeKind: taxCodeKind as "HSN" | "SAC" | null, taxCode: taxCode as string | null } : {}) } });
+      await tx.auditLog.create({ data: { tenantId: access.tenantId, outletId, userId: access.user.id, action: taxCodeProvided ? "MENU_TAX_CLASSIFICATION_CHANGED" : "MENU_TAX_RATE_CHANGED", entityType: "MenuItem", entityId: menuItemId, before: { ...(taxRateProvided ? { gstBps: item.gstBps } : {}), ...(taxCodeProvided ? { taxCodeKind: item.taxCodeKind, taxCode: item.taxCode } : {}) }, after: { ...(taxRateProvided ? { gstBps: menuItem.gstBps } : {}), ...(taxCodeProvided ? { taxCodeKind: menuItem.taxCodeKind, taxCode: menuItem.taxCode } : {}) } } });
     }
-    return { ...updated, gstBps: menuItem.gstBps };
+    return { ...updated, gstBps: menuItem.gstBps, taxCodeKind: menuItem.taxCodeKind, taxCode: menuItem.taxCode };
   });
   void publishOutletEvent(access.tenantId, outletId, "menu:updated", { menuItemId, action: "changed" });
   return NextResponse.json(jsonSafe(saved));

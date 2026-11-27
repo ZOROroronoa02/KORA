@@ -2,12 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { OrderStatus, OrderType, PaymentMethod, PaymentStatus, Prisma } from "@prisma/client";
 import { authorizeAnyOutletPermission, requirePermission, verifyManagerApprovalPin, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
-import { allocatePaise, calculateSale, indianFinancialYear, paymentStatus } from "@/lib/billing";
+import { allocatePaise, calculateSale, formatInvoiceNumber, indianFinancialYear, paymentStatus } from "@/lib/billing";
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { requiresDiscountApproval, settingsForOutlet } from "@/lib/domain/discount-approval";
 import { isTransactionConflict } from "@/lib/db-conflicts";
-import { gstProfileDefaults, gstRateForItem, gstinStateMatchesAddress, hasInvoiceAddress } from "@/lib/domain/gst-profile";
+import { gstProfileDefaults, gstRateForItem, gstStateCodeForName, gstinStateMatchesAddress, hasInvoiceAddress, validateRecipientInvoiceDetails } from "@/lib/domain/gst-profile";
 
 export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI, Other: PaymentMethod.OTHER };
@@ -97,6 +97,9 @@ async function POSTHandler(request: NextRequest) {
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999 || price > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Invalid quantity or price");
       return { product, quantity, pricePaise: Number(price), gstBps: gstRateForItem(taxProfile, outlet.tenant.gstRateBps, product.gstBps), note: typeof input.note === "string" ? input.note.slice(0, 300) : undefined };
     });
+    if (taxTemplate.documentType === "TAX_INVOICE" && items.some((item) => !item.product.taxCodeKind || !item.product.taxCode)) {
+      return NextResponse.json({ error: "Assign an HSN/SAC code to every menu item before issuing tax invoices." }, { status: 409 });
+    }
     const requestedDiscountBps = Number(body.discountBps ?? 0);
     if (!Number.isInteger(requestedDiscountBps) || requestedDiscountBps < 0 || requestedDiscountBps > 10000) return NextResponse.json({ error: "Discount rate must be between 0 and 10000 basis points." }, { status: 400 });
     if (requestedDiscountBps > 0) {
@@ -124,11 +127,21 @@ async function POSTHandler(request: NextRequest) {
     const itemDiscounts = allocatePaise(BigInt(discountPaise), items.map((item) => BigInt(item.pricePaise) * BigInt(item.quantity)));
     const serviceChargeBps = type === OrderType.DINE_IN ? outlet.serviceChargeBps : 0;
     const totals = calculateSale(saleLines, { discountPaise, serviceChargeBps });
+    const recipient = validateRecipientInvoiceDetails(body.buyerDetails, totals.taxablePaise);
+    if (recipient.error || !recipient.value) return NextResponse.json({ error: recipient.error ?? "Buyer billing details are invalid." }, { status: 400 });
+    const recipientDetails = recipient.value;
+    const deliveryGoods = taxTemplate.documentType === "TAX_INVOICE" && type === OrderType.DELIVERY && items.some((item) => item.product.taxCodeKind === "HSN");
+    if (deliveryGoods && !recipientDetails.address) return NextResponse.json({ error: "Enter the delivery address before billing a packaged-goods delivery." }, { status: 400 });
+    if (deliveryGoods && recipientDetails.address && hasInvoiceAddress(outlet.address)
+      && gstStateCodeForName(recipientDetails.address.state) !== gstStateCodeForName(outlet.address.state)) {
+      return NextResponse.json({ error: "Inter-state packaged-goods tax is not supported yet. This delivery is blocked so KORA cannot issue an invoice with the wrong tax split." }, { status: 409 });
+    }
     if (paidPaise > totals.totalPaise) return NextResponse.json({ error: "Payment must be between zero and the bill total." }, { status: 400 });
     const paidStatus = paymentStatus(totals.totalPaise, paidPaise) as PaymentStatus;
     const method = typeof body.paymentMethod === "string" ? methods[body.paymentMethod] : undefined;
     if (paidPaise > 0 && !method) return NextResponse.json({ error: "A payment method is required for a recorded payment." }, { status: 400 });
     const customerId = typeof body.customerId === "string" ? body.customerId : undefined;
+    let recipientNameSnapshot = recipientDetails.name;
     const tableId = typeof body.tableId === "string" ? body.tableId : undefined;
     if (type === OrderType.DINE_IN && !tableId) return NextResponse.json({ error: "A table is required for dine-in orders." }, { status: 400 });
     if (type !== OrderType.DINE_IN && tableId) return NextResponse.json({ error: "Tables can only be assigned to dine-in orders." }, { status: 400 });
@@ -136,6 +149,7 @@ async function POSTHandler(request: NextRequest) {
       if (customerId) {
         const customer = await tx.customer.findFirst({ where: { id: customerId, tenantId: access.tenantId } });
         if (!customer) throw new ReferenceError("Customer not found in this restaurant.");
+        recipientNameSnapshot ??= customer.name;
       }
       if (tableId) {
         const lockedTables = await tx.$queryRaw<Array<{ id: string }>>`SELECT t."id" FROM "restaurant_tables" AS t JOIN "outlets" AS o ON o."id" = t."outletId" WHERE t."id" = ${tableId} AND o."tenantId" = ${access.tenantId} AND t."outletId" = ${outletId} AND t."active" = true FOR UPDATE OF t`;
@@ -169,11 +183,11 @@ async function POSTHandler(request: NextRequest) {
         throw new RangeError("Invoice sequence is outside the supported range.");
       }
       await tx.outlet.update({ where: { id: outletId }, data: { invoiceFinancialYear: fiscalYear.label, invoiceNextNumber: invoiceSequenceNumber + 1 } });
-      const invoiceNumber = `${sequence.invoicePrefix}-FY${fiscalYear.label}-${String(invoiceSequenceNumber).padStart(6, "0")}`;
+      const invoiceNumber = formatInvoiceNumber(sequence.invoicePrefix, fiscalYear.label, invoiceSequenceNumber);
       const order = await tx.order.create({ data: {
         tenantId: access.tenantId, outletId, orderNumber: sequence.orderNextNumber - 1, type, status: "PREPARING", customerId, tableId, createdById: access.user.id,
         deviceId, idempotencyKey, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),
-        items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.gstBps, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
+         items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.gstBps, taxCodeKindSnapshot: i.product.taxCodeKind, taxCodeSnapshot: i.product.taxCode, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
       }, include: { items: true } });
       const tableLabel = tableId ? (await tx.restaurantTable.findUnique({ where: { id: tableId }, select: { label: true } }))?.label ?? null : null;
       const routedItems = order.items.map((orderItem, index) => ({ orderItem, stationId: items[index].product.outletPrices[0]?.stationId ?? defaultStation?.id ?? null }));
@@ -205,6 +219,10 @@ async function POSTHandler(request: NextRequest) {
         gstinSnapshot: outlet.tenant.gstin, supplierNameSnapshot: outlet.tenant.name,
         supplierAddressSnapshot: outlet.address ? outlet.address as Prisma.InputJsonValue : Prisma.JsonNull,
         serviceChargeBpsSnapshot: serviceChargeBps,
+         recipientNameSnapshot,
+         recipientGstinSnapshot: recipientDetails.gstin,
+         recipientAddressSnapshot: recipientDetails.address ? recipientDetails.address as Prisma.InputJsonValue : Prisma.JsonNull,
+         placeOfSupplySnapshot: hasInvoiceAddress(outlet.address) ? outlet.address.state : null,
         subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxablePaise: BigInt(totals.taxablePaise),
         cgstPaise: BigInt(Math.floor(totals.taxPaise / 2)), sgstPaise: BigInt(totals.taxPaise - Math.floor(totals.taxPaise / 2)), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise), paymentStatus: paidStatus,
         payments: paidPaise > 0 ? { create: { method: method!, amountPaise: BigInt(paidPaise), status: PaymentStatus.PAID, shiftId: activeShift?.id } } : undefined,

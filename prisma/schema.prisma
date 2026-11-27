@@ -26,6 +26,11 @@ enum InvoiceDocumentType {
   BILL_OF_SUPPLY
 }
 
+enum TaxCodeKind {
+  HSN
+  SAC
+}
+
 enum OrderType {
   DINE_IN
   TAKEAWAY
@@ -346,6 +351,8 @@ model MenuItem {
   basePricePaise BigInt
   /// Null means inherit the tenant's configured GST rate; non-null is an item override.
   gstBps         Int?
+  taxCodeKind    TaxCodeKind?
+  taxCode        String?
   isVeg          Boolean          @default(true)
   active         Boolean          @default(true)
   createdAt      DateTime         @default(now())
@@ -469,22 +476,24 @@ model Order {
 }
 
 model OrderItem {
-  id              String          @id @default(cuid())
-  orderId         String
-  menuItemId      String?
-  nameSnapshot    String
-  variantSnapshot String?
-  addonsSnapshot  Json?
-  quantity        Int
-  unitPricePaise  BigInt
-  gstBps          Int
-  discountPaise   BigInt          @default(0)
-  totalPaise      BigInt
-  notes           String?
-  order           Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  menuItem        MenuItem?       @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
-  kotItems        KOTItem[]
-  splitItems      BillSplitItem[]
+  id                  String          @id @default(cuid())
+  orderId             String
+  menuItemId          String?
+  nameSnapshot        String
+  variantSnapshot     String?
+  addonsSnapshot      Json?
+  quantity            Int
+  unitPricePaise      BigInt
+  gstBps              Int
+  taxCodeKindSnapshot TaxCodeKind?
+  taxCodeSnapshot     String?
+  discountPaise       BigInt          @default(0)
+  totalPaise          BigInt
+  notes               String?
+  order               Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  menuItem            MenuItem?       @relation(fields: [menuItemId], references: [id], onDelete: SetNull)
+  kotItems            KOTItem[]
+  splitItems          BillSplitItem[]
 
   @@index([orderId])
   @@map("order_items")
@@ -587,6 +596,10 @@ model Bill {
   supplierNameSnapshot     String
   supplierAddressSnapshot  Json?
   serviceChargeBpsSnapshot Int                 @default(0)
+  recipientNameSnapshot    String?
+  recipientGstinSnapshot   String?
+  recipientAddressSnapshot Json?
+  placeOfSupplySnapshot    String?
   subtotalPaise            BigInt
   discountPaise            BigInt              @default(0)
   taxablePaise             BigInt

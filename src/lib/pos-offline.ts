@@ -9,6 +9,11 @@ export type CloudOrderPayload = {
   type: "Dine in" | "Takeaway" | "Delivery";
   tableId?: string;
   customerId?: string;
+  buyerDetails?: {
+    name?: string;
+    gstin?: string;
+    address?: { line1?: string; line2?: string; city?: string; state?: string; pincode?: string };
+  };
   items: Array<{ menuItemId: string; quantity: number; note?: string }>;
   paidPaise: number;
   discountBps?: number;

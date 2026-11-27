@@ -1,5 +1,6 @@
 export type SaleLine = { quantity: number; unitPricePaise: number; gstBps?: number; discountPaise?: number };
 export type SaleTotals = { subtotalPaise: number; discountPaise: number; taxablePaise: number; taxPaise: number; serviceChargePaise: number; totalPaise: number };
+export type SaleLineBreakdown = { taxablePaise: number; serviceChargePaise: number; gstBps: number; taxPaise: number; totalPaise: number };
 
 /** Parse a rupee input without passing money through binary floating point. */
 export function parseRupeesToPaise(value: string): number {
@@ -20,6 +21,19 @@ export function indianFinancialYear(date: Date): { label: string; startYear: num
   if (!Number.isInteger(year) || !Number.isInteger(month)) throw new RangeError("Could not determine Indian financial year");
   const startYear = month >= 4 ? year : year - 1;
   return { startYear, label: `${startYear}-${String((startYear + 1) % 100).padStart(2, "0")}` };
+}
+
+/** Format a GST invoice serial within Rule 46's 16-character limit. */
+export function formatInvoiceNumber(prefix: string, financialYear: string, sequence: number): string {
+  if (!/^[A-Z0-9]{1,2}$/.test(prefix)) throw new RangeError("Invoice prefix must be one or two uppercase letters or digits.");
+  const year = /^(\d{4})-(\d{2})$/.exec(financialYear);
+  if (!year || Number(year[2]) !== (Number(year[1]) + 1) % 100) throw new RangeError("Financial year label is invalid.");
+  if (!Number.isSafeInteger(sequence) || sequence < 1) throw new RangeError("Invoice sequence is invalid.");
+  const compactYear = `${year[1].slice(-2)}${year[2]}`;
+  const serial = String(sequence).padStart(6, "0");
+  const invoiceNumber = `${prefix}-FY${compactYear}-${serial}`;
+  if (invoiceNumber.length > 16) throw new RangeError("Invoice sequence has reached the 16-character GST serial limit for this prefix.");
+  return invoiceNumber;
 }
 
 export type OrderWorkflowStatus = "OPEN" | "SENT" | "PREPARING" | "READY" | "SERVED" | "COMPLETED" | "CANCELLED";
@@ -49,7 +63,7 @@ function applyBasisPoints(amountPaise: number, basisPoints: number, label: strin
   return Number(rounded);
 }
 
-export function calculateSale(lines: SaleLine[], options: { discountPaise?: number; serviceChargeBps?: number } = {}): SaleTotals {
+export function calculateSaleBreakdown(lines: SaleLine[], options: { discountPaise?: number; serviceChargeBps?: number } = {}): SaleTotals & { lines: SaleLineBreakdown[] } {
   if (!lines.length) throw new RangeError("A sale needs at least one item");
   const checked = lines.map((line) => {
     safeInteger(line.quantity, "quantity"); safeInteger(line.unitPricePaise, "unit price");
@@ -77,13 +91,21 @@ export function calculateSale(lines: SaleLine[], options: { discountPaise?: numb
   const serviceChargePaise = applyBasisPoints(itemTaxablePaise, serviceChargeBps, "Service charge");
   // Treat service charge as part of the taxable consideration and apply each line's GST rate.
   const serviceChargeShares = allocatePaise(BigInt(serviceChargePaise), taxableLines.map((amount) => BigInt(amount)));
-  const taxPaise = safeInteger(checked.reduce((sum, line, index) => {
-    const lineTaxablePaise = taxableLines[index] + Number(serviceChargeShares[index]);
-    return sum + applyBasisPoints(lineTaxablePaise, line.rate, "GST");
-  }, 0), "GST total");
+  const lineBreakdown = checked.map((line, index) => {
+    const lineServiceChargePaise = Number(serviceChargeShares[index]);
+    const lineTaxablePaise = taxableLines[index] + lineServiceChargePaise;
+    const lineTaxPaise = applyBasisPoints(lineTaxablePaise, line.rate, "GST");
+    return { taxablePaise: lineTaxablePaise, serviceChargePaise: lineServiceChargePaise, gstBps: line.rate, taxPaise: lineTaxPaise, totalPaise: lineTaxablePaise + lineTaxPaise };
+  });
+  const taxPaise = safeInteger(lineBreakdown.reduce((sum, line) => sum + line.taxPaise, 0), "GST total");
   const taxablePaise = safeInteger(itemTaxablePaise + serviceChargePaise, "taxable subtotal");
   const totalPaise = safeInteger(taxablePaise + taxPaise, "total");
-  return { subtotalPaise, discountPaise, taxablePaise, taxPaise, serviceChargePaise, totalPaise };
+  return { subtotalPaise, discountPaise, taxablePaise, taxPaise, serviceChargePaise, totalPaise, lines: lineBreakdown };
+}
+
+export function calculateSale(lines: SaleLine[], options: { discountPaise?: number; serviceChargeBps?: number } = {}): SaleTotals {
+  const { lines: _lineBreakdown, ...totals } = calculateSaleBreakdown(lines, options);
+  return totals;
 }
 
 export function paymentStatus(totalPaise: number, paidPaise: number): "PENDING" | "PARTIAL" | "PAID" {

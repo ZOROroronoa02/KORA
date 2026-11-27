@@ -7,7 +7,7 @@ import { allocatePaise, calculateSale, paymentStatusAfterRefund } from "@/lib/bi
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { isTransactionConflict } from "@/lib/db-conflicts";
-import { gstRateForItem } from "@/lib/domain/gst-profile";
+import { gstProfileDefaults, gstRateForItem, gstStateCodeForName, hasInvoiceAddress } from "@/lib/domain/gst-profile";
 
 export const runtime = "nodejs";
 class KdsOrderConflict extends Error { constructor(message: string) { super(message); this.name = "KdsOrderConflict"; } }
@@ -66,6 +66,17 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
       ]);
       const generalStation = stationRows.find((station) => station.name === "General") ?? stationRows[0] ?? null;
       const profile = order.bill?.gstProfile ?? outlet.tenant.gstProfile;
+      if (gstProfileDefaults[profile].documentType === "TAX_INVOICE" && lines.some((line) => !line.product.taxCodeKind || !line.product.taxCode)) {
+        throw new KdsOrderConflict("Assign an HSN/SAC code to every added menu item before sending it to a tax-invoiced order.");
+      }
+      if (gstProfileDefaults[profile].documentType === "TAX_INVOICE" && order.type === "DELIVERY" && lines.some((line) => line.product.taxCodeKind === "HSN")) {
+        const supplierAddress = order.bill?.supplierAddressSnapshot;
+        const recipientAddress = order.bill?.recipientAddressSnapshot;
+        if (!hasInvoiceAddress(recipientAddress)) throw new KdsOrderConflict("Enter the delivery address before adding packaged goods to this tax-invoiced delivery.");
+        if (!hasInvoiceAddress(supplierAddress) || gstStateCodeForName(recipientAddress.state) !== gstStateCodeForName(supplierAddress.state)) {
+          throw new KdsOrderConflict("Inter-state packaged-goods tax is not supported yet; KORA blocked the change to prevent a wrong invoice tax split.");
+        }
+      }
       const rateBps = order.bill?.gstRateBpsSnapshot ?? outlet.tenant.gstRateBps;
       const effectiveLines = lines.map((line) => ({ ...line, gstBps: gstRateForItem(profile, rateBps, line.product.gstBps) }));
       const serviceChargeBps = order.bill?.serviceChargeBpsSnapshot ?? (order.type === "DINE_IN" ? outlet.serviceChargeBps : 0);
@@ -86,7 +97,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
         const discount = lineDiscounts[index];
         const orderItem = await tx.orderItem.create({ data: {
           orderId, menuItemId: line.product.id, nameSnapshot: line.product.name, quantity: line.input.quantity,
-          unitPricePaise: BigInt(line.pricePaise), gstBps: line.gstBps, discountPaise: discount,
+          unitPricePaise: BigInt(line.pricePaise), gstBps: line.gstBps, taxCodeKindSnapshot: line.product.taxCodeKind, taxCodeSnapshot: line.product.taxCode, discountPaise: discount,
           totalPaise: BigInt(line.pricePaise * line.input.quantity) - discount, notes: line.input.note,
         } });
         addedOrderItems.push({ orderItem, stationId: line.product.outletPrices[0].stationId ?? generalStation?.id ?? null });

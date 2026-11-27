@@ -7,6 +7,7 @@ export const gstProfileDefaults = {
 
 export type GstProfile = keyof typeof gstProfileDefaults;
 export type InvoiceDocumentType = typeof gstProfileDefaults[GstProfile]["documentType"];
+export type TaxCodeKind = "HSN" | "SAC";
 
 const gstinPattern = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][A-Z0-9]Z[A-Z0-9]$/;
 
@@ -54,14 +55,17 @@ const stateCodes: Record<string, string[]> = {
 
 const normalizeState = (state: string) => state.toLowerCase().replace(/[^a-z0-9]/g, "");
 
+export function gstStateCodeForName(state: string): string | null {
+  const normalized = normalizeState(state);
+  return Object.entries(stateCodes).find(([, aliases]) => aliases.includes(normalized))?.[0] ?? null;
+}
+
 export function isValidGstin(value: string) {
   return gstinPattern.test(value.trim().toUpperCase());
 }
 
 export function gstinStateMatchesAddress(gstin: string, state: string) {
-  const code = gstin.slice(0, 2);
-  const normalized = normalizeState(state);
-  return (stateCodes[code] ?? []).includes(normalized);
+  return gstStateCodeForName(state) === gstin.slice(0, 2);
 }
 
 export function gstRateForItem(profile: GstProfile, configuredRateBps: number, itemOverrideBps?: number | null) {
@@ -88,4 +92,52 @@ export function hasInvoiceAddress(value: unknown): value is Record<string, unkno
   const address = value as Record<string, unknown>;
   return [address.line1, address.city, address.state].every((field) => typeof field === "string" && field.trim().length > 0)
     && typeof address.pincode === "string" && /^\d{6}$/.test(address.pincode);
+}
+
+export function validateTaxCode(input: { kind: unknown; code: unknown }) {
+  if (input.kind === null && input.code === null) return null;
+  if (input.kind !== "HSN" && input.kind !== "SAC") return "Select HSN or SAC for the menu item's tax code.";
+  if (typeof input.code !== "string") return "Enter the menu item's HSN/SAC code.";
+  const code = input.code.trim();
+  const valid = input.kind === "HSN" ? /^\d{2,8}$/.test(code) : /^\d{6}$/.test(code);
+  if (!valid) return input.kind === "HSN" ? "HSN must contain 2–8 digits." : "SAC must contain 6 digits.";
+  return null;
+}
+
+export type RecipientInvoiceDetails = {
+  name: string | null;
+  gstin: string | null;
+  address: { line1: string; line2: string; city: string; state: string; pincode: string } | null;
+};
+
+/** Validate optional buyer details and Rule 46's recipient details for high-value B2C invoices. */
+export function validateRecipientInvoiceDetails(input: unknown, taxablePaise: number): { value?: RecipientInvoiceDetails; error?: string } {
+  if (!Number.isSafeInteger(taxablePaise) || taxablePaise < 0) return { error: "Taxable value is invalid." };
+  if (input === undefined || input === null) input = {};
+  if (typeof input !== "object" || Array.isArray(input)) return { error: "Buyer billing details must be an object." };
+  const raw = input as Record<string, unknown>;
+  const name = typeof raw.name === "string" ? raw.name.trim() : "";
+  const gstin = typeof raw.gstin === "string" ? raw.gstin.trim().toUpperCase() : "";
+  if (raw.name !== undefined && typeof raw.name !== "string") return { error: "Buyer name is invalid." };
+  if (name.length > 150) return { error: "Buyer name must be 150 characters or fewer." };
+  if (raw.gstin !== undefined && typeof raw.gstin !== "string") return { error: "Buyer GSTIN is invalid." };
+  if (gstin && !isValidGstin(gstin)) return { error: "Buyer GSTIN must contain a valid 15-character format." };
+
+  let address: RecipientInvoiceDetails["address"] = null;
+  if (raw.address !== undefined && raw.address !== null) {
+    if (typeof raw.address !== "object" || Array.isArray(raw.address)) return { error: "Buyer address is invalid." };
+    const source = raw.address as Record<string, unknown>;
+    const keys = ["line1", "line2", "city", "state", "pincode"] as const;
+    if (keys.some((key) => source[key] !== undefined && typeof source[key] !== "string")) return { error: "Buyer address fields must be text." };
+    const value = Object.fromEntries(keys.map((key) => [key, typeof source[key] === "string" ? (source[key] as string).trim() : ""])) as Record<(typeof keys)[number], string>;
+    if (Object.values(value).some(Boolean)) {
+      if (value.line1.length > 120 || value.line2.length > 120 || value.city.length > 80 || value.state.length > 80 || !/^\d{6}$/.test(value.pincode)) return { error: "Complete the buyer address and enter a 6-digit PIN code." };
+      if (!gstStateCodeForName(value.state)) return { error: "Enter a recognized Indian State or Union Territory in the buyer address." };
+      address = value;
+    }
+  }
+  if (gstin && (!name || !address)) return { error: "Buyer name and complete billing address are required when a GSTIN is entered." };
+  if (gstin && address && !gstinStateMatchesAddress(gstin, address.state)) return { error: "Buyer address state does not match the GSTIN registration state." };
+  if (!gstin && taxablePaise >= 5_000_000 && (!name || !address)) return { error: "Buyer name and complete billing address are required for taxable supplies of ₹50,000 or more." };
+  return { value: { name: name || null, gstin: gstin || null, address } };
 }

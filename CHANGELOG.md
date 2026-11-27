@@ -12,9 +12,11 @@
 - Included service charge in the GST taxable base, allocated it across contributing lines, and applied each line's GST rate; added unit and cloud-invoice regression coverage. See [CBIC FAQ 142](https://cbic-gst.gov.in/hindi/faq.html).
 - Added per-outlet Indian financial-year invoice numbering, continuing from existing invoices in the active financial year.
 - Added tenant-scoped append-only payment and refund ledgers, idempotent partial refunds, net bill status, paid-order void gating, and cash refund reconciliation.
+- Added per-item HSN/SAC classification and immutable order/bill snapshots for supplier, buyer, and place-of-supply details; added a tenant/outlet-scoped invoice-data endpoint and 58 mm/80 mm browser print layouts for receipts, tax invoices, and Bills of Supply.
+- Kept newly issued GST serials within 16 characters, fail-closed cross-state packaged-goods delivery until IGST treatment is supported, and blocked printing of overlength historical tax-document numbers instead of rewriting them.
 - Added tenant predicates to raw SQL row locks and financial-year invoice scans; cash refunds now fail if the cashier shift closes before its row lock is acquired.
 - Normalized Prisma serialization/deadlock failures from raw SQL locks into retryable 409 conflicts instead of internal-server errors.
 - Made the Orders “New order” action open POS only for roles with `orders.create`, and changed the production start command to launch the configured standalone server.
 - Tightened the mobile POS top bar so sync, role, and connect controls fit without hiding the sync label from assistive technology.
-- Verified seven local migrations, the production Next.js build, and the live suite (52 passed, 0 failed, 0 skipped). Realtime security ran against the development in-memory adapter; production Redis fan-out remains unverified. Full dependency audit reported 0 advisories.
+- Verified ten local migrations, the production Next.js build, and the live suite (66 passed, 0 failed, 0 skipped). Realtime security ran against the development in-memory adapter; production Redis fan-out remains unverified. Production dependency audit reported 0 advisories.
 - Production Docker targets and the GitHub Actions workflow still need execution in a clean Linux/GitHub environment.

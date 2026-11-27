@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import {
   gstProfileDefaults,
   gstRateForItem,
+  gstStateCodeForName,
   gstinStateMatchesAddress,
   hasInvoiceAddress,
   isValidGstin,
   validateGstConfiguration,
+  validateRecipientInvoiceDetails,
+  validateTaxCode,
 } from '../src/lib/domain/gst-profile.ts';
 
 test('built-in GST profiles choose invoice document and default rates', () => {
@@ -37,4 +40,25 @@ test('invoice supplier address must contain a usable state, city, street, and In
   assert.equal(hasInvoiceAddress({ line1: '12 Main Rd', city: 'Bengaluru', state: 'Karnataka', pincode: '56003' }), false);
   assert.equal(gstinStateMatchesAddress('29ABCDE1234F1Z5', 'Karnataka'), true);
   assert.equal(gstinStateMatchesAddress('27ABCDE1234F1Z5', 'Karnataka'), false);
+  assert.equal(gstStateCodeForName('Karnataka'), '29');
+  assert.equal(gstStateCodeForName('not a state'), null);
+});
+
+test('per-item HSN/SAC validation accepts only complete supported classifications', () => {
+  assert.equal(validateTaxCode({ kind: 'HSN', code: '21069099' }), null);
+  assert.equal(validateTaxCode({ kind: 'SAC', code: '996331' }), null);
+  assert.match(validateTaxCode({ kind: 'SAC', code: '99633' }) ?? '', /6 digits/);
+  assert.match(validateTaxCode({ kind: 'HSN', code: '21A6' }) ?? '', /digits/);
+  assert.match(validateTaxCode({ kind: null, code: '2106' }) ?? '', /Select HSN or SAC/);
+  assert.equal(validateTaxCode({ kind: null, code: null }), null);
+});
+
+test('recipient GST details are structurally validated and high-value B2C requires a full address', () => {
+  const address = { line1: '12 Main Road', line2: '', city: 'Bengaluru', state: 'Karnataka', pincode: '560038' };
+  assert.equal(validateRecipientInvoiceDetails({ name: 'Aarav Shah', gstin: '29ABCDE1234F1Z5', address }, 100_000).error, undefined);
+  assert.match(validateRecipientInvoiceDetails({ name: 'Aarav Shah', gstin: '27ABCDE1234F1Z5', address }, 100_000).error ?? '', /state does not match/);
+  assert.match(validateRecipientInvoiceDetails({}, 5_000_000).error ?? '', /₹50,000/);
+  assert.equal(validateRecipientInvoiceDetails({ name: 'Walk-in', address }, 5_000_000).error, undefined);
+  assert.match(validateRecipientInvoiceDetails({ name: 'Walk-in', address: { ...address, state: 'Atlantis' } }, 5_000_000).error ?? '', /recognized Indian State/);
+  assert.equal(validateRecipientInvoiceDetails({}, 4_999_999).error, undefined);
 });
