@@ -7,12 +7,15 @@ test('system role defaults match the restaurant access boundaries', () => {
   const owner = new Set(systemRolePermissions.OWNER);
   assert.equal(owner.has('orders.create'), false);
   assert.equal(owner.has('roles.manage'), true);
+  assert.equal(owner.has('tax.profile.manage'), true);
   assert.equal(owner.has('bills.day_close'), true);
 
   const manager = new Set(systemRolePermissions.RESTAURANT_MANAGER);
   assert.equal(manager.has('orders.create'), true);
   assert.equal(manager.has('inventory.adjust'), true);
   assert.equal(manager.has('staff.manage'), true);
+  assert.equal(manager.has('menu.tax_edit'), false);
+  assert.equal(manager.has('tax.profile.manage'), false);
   assert.equal(manager.has('roles.manage'), false);
   assert.equal(manager.has('outlets.manage'), false);
 

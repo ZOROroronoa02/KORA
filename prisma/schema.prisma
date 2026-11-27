@@ -13,6 +13,19 @@ enum Plan {
   PRO
 }
 
+enum GstProfile {
+  NOT_REGISTERED
+  STANDARD_RESTAURANT
+  SPECIFIED_PREMISES
+  COMPOSITION
+}
+
+enum InvoiceDocumentType {
+  RECEIPT
+  TAX_INVOICE
+  BILL_OF_SUPPLY
+}
+
 enum OrderType {
   DINE_IN
   TAKEAWAY
@@ -91,6 +104,9 @@ model Tenant {
   name             String
   slug             String            @unique
   plan             Plan              @default(FREE)
+  gstin            String?           @unique
+  gstProfile       GstProfile        @default(NOT_REGISTERED)
+  gstRateBps       Int               @default(0)
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
   outlets          Outlet[]
@@ -121,7 +137,6 @@ model Outlet {
   code                 String
   timezone             String            @default("Asia/Kolkata")
   currency             String            @default("INR")
-  gstin                String?
   fssaiLicense         String?
   address              Json?
   invoicePrefix        String            @default("K")
@@ -329,7 +344,8 @@ model MenuItem {
   description    String?
   imageUrl       String?
   basePricePaise BigInt
-  gstBps         Int              @default(500)
+  /// Null means inherit the tenant's configured GST rate; non-null is an item override.
+  gstBps         Int?
   isVeg          Boolean          @default(true)
   active         Boolean          @default(true)
   createdAt      DateTime         @default(now())
@@ -559,26 +575,33 @@ model KOTMutation {
 }
 
 model Bill {
-  id                 String        @id @default(cuid())
-  tenantId           String
-  outletId           String
-  orderId            String        @unique
-  invoiceNumber      String
-  subtotalPaise      BigInt
-  discountPaise      BigInt        @default(0)
-  taxablePaise       BigInt
-  cgstPaise          BigInt        @default(0)
-  sgstPaise          BigInt        @default(0)
-  igstPaise          BigInt        @default(0)
-  serviceChargePaise BigInt        @default(0)
-  totalPaise         BigInt
-  paymentStatus      PaymentStatus @default(PENDING)
-  issuedAt           DateTime      @default(now())
-  tenant             Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  outlet             Outlet        @relation(fields: [outletId], references: [id], onDelete: Cascade)
-  order              Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  payments           Payment[]
-  splits             BillSplit[]
+  id                       String              @id @default(cuid())
+  tenantId                 String
+  outletId                 String
+  orderId                  String              @unique
+  invoiceNumber            String
+  documentType             InvoiceDocumentType @default(RECEIPT)
+  gstProfile               GstProfile          @default(NOT_REGISTERED)
+  gstRateBpsSnapshot       Int                 @default(0)
+  gstinSnapshot            String?
+  supplierNameSnapshot     String
+  supplierAddressSnapshot  Json?
+  serviceChargeBpsSnapshot Int                 @default(0)
+  subtotalPaise            BigInt
+  discountPaise            BigInt              @default(0)
+  taxablePaise             BigInt
+  cgstPaise                BigInt              @default(0)
+  sgstPaise                BigInt              @default(0)
+  igstPaise                BigInt              @default(0)
+  serviceChargePaise       BigInt              @default(0)
+  totalPaise               BigInt
+  paymentStatus            PaymentStatus       @default(PENDING)
+  issuedAt                 DateTime            @default(now())
+  tenant                   Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet                   Outlet              @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  order                    Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  payments                 Payment[]
+  splits                   BillSplit[]
 
   @@unique([outletId, invoiceNumber])
   @@index([tenantId, outletId, issuedAt])

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { PrismaClient } from '@prisma/client';
+import { hash } from 'bcryptjs';
 
 const api = process.env.KORA_SECURITY_TEST_URL;
 const enabled = Boolean(api && process.env.DATABASE_URL);
@@ -21,6 +22,11 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const registration = await registrationResponse.json();
     assert.equal(registrationResponse.status, 201, JSON.stringify(registration));
     tenantId = registration.tenant.id;
+    const taxProfileResponse = await fetch(`${api}/api/outlet-profile`, {
+      method: 'PATCH', headers: { authorization: `Bearer ${registration.accessToken}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, outletName: 'Test Outlet', gstin: '29ABCDE1234F1Z5', gstProfile: 'STANDARD_RESTAURANT', gstRateBps: 500, fssaiLicense: '', address: { line1: '12 Main Road', line2: '', city: 'Bengaluru', state: 'Karnataka', pincode: '560038' } }),
+    });
+    assert.equal(taxProfileResponse.status, 200, await taxProfileResponse.text());
 
     const loginResponse = await fetch(`${api}/api/auth/login`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
@@ -30,16 +36,25 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(loginResponse.status, 200, JSON.stringify(login));
     assert.ok(login.accessToken);
     assert.match(loginResponse.headers.get('set-cookie') ?? '', /HttpOnly/);
-    const headers = { authorization: `Bearer ${login.accessToken}` };
+    const ownerHeaders = { authorization: `Bearer ${login.accessToken}` };
 
-    const sessionResponse = await fetch(`${api}/api/auth/me`, { headers });
+    const sessionResponse = await fetch(`${api}/api/auth/me`, { headers: ownerHeaders });
     const session = await sessionResponse.json();
     assert.equal(sessionResponse.status, 200);
     assert.equal(session.user.id, registration.user.id);
     assert.ok(session.outlets[0].permissions.includes('orders.create') === false, 'owner should not receive day-to-day order-taking access');
     assert.ok(session.outlets[0].permissions.includes('roles.manage'));
-    const cashierRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId: registration.tenant.id, name: 'CASHIER' } } });
-    await prisma.userOutletRole.create({ data: { userId: registration.user.id, outletId: registration.outlet.id, roleId: cashierRole.id } });
+    const managerRole = await prisma.role.findUniqueOrThrow({ where: { tenantId_name: { tenantId: registration.tenant.id, name: 'RESTAURANT_MANAGER' } } });
+    const managerEmail = `manager-${suffix}@example.test`;
+    const manager = await prisma.user.create({ data: { tenantId, name: 'POS Test Manager', email: managerEmail, passwordHash: await hash('ManagerTest123!Secure', 4) } });
+    await prisma.userOutletRole.create({ data: { userId: manager.id, outletId: registration.outlet.id, roleId: managerRole.id } });
+    const managerLoginResponse = await fetch(`${api}/api/auth/login`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-forwarded-for': testIp },
+      body: JSON.stringify({ tenantSlug: registration.tenant.slug, email: managerEmail, password: 'ManagerTest123!Secure' }),
+    });
+    const managerLogin = await managerLoginResponse.json();
+    assert.equal(managerLoginResponse.status, 200, JSON.stringify(managerLogin));
+    const headers = { authorization: `Bearer ${managerLogin.accessToken}` };
 
     const menuResponse = await fetch(`${api}/api/menu?outletId=${registration.outlet.id}`, { headers });
     const categories = await menuResponse.json();
@@ -49,11 +64,23 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.ok(item?.id);
     await prisma.outlet.update({ where: { id: registration.outlet.id }, data: { serviceChargeBps: 500 } });
     const menuCreateResponse = await fetch(`${api}/api/menu`, {
-      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      method: 'POST', headers: { ...ownerHeaders, 'content-type': 'application/json' },
       body: JSON.stringify({ outletId: registration.outlet.id, categoryId: categories[0].id, name: `Cloud special ${suffix}`, pricePaise: 7650 }),
     });
     const addedMenuItem = await menuCreateResponse.json();
     assert.equal(menuCreateResponse.status, 201, JSON.stringify(addedMenuItem));
+    assert.equal(addedMenuItem.gstBps, null, 'new menu items inherit the tenant rate until a tax override is set');
+    const menuTaxUpdateResponse = await fetch(`${api}/api/menu`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, menuItemId: addedMenuItem.id, gstBps: 1200 }),
+    });
+    const menuTaxUpdate = await menuTaxUpdateResponse.json();
+    assert.equal(menuTaxUpdateResponse.status, 200, JSON.stringify(menuTaxUpdate));
+    assert.equal(menuTaxUpdate.gstBps, 1200);
+    const taxAudit = await prisma.auditLog.findFirst({ where: { tenantId, outletId: registration.outlet.id, action: 'MENU_TAX_RATE_CHANGED', entityId: addedMenuItem.id } });
+    assert.equal(taxAudit?.after?.gstBps, 1200);
+    const effectiveMenu = await (await fetch(`${api}/api/menu?outletId=${registration.outlet.id}`, { headers })).json();
+    assert.equal(effectiveMenu.flatMap(({ items }) => items).find(({ id }) => id === addedMenuItem.id).gstBps, 1200);
 
     const tablesResponse = await fetch(`${api}/api/tables?outletId=${registration.outlet.id}`, { headers });
     const { tables } = await tablesResponse.json();
@@ -84,6 +111,10 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     assert.equal(created.order.items[0].quantity, 2);
     assert.equal(created.kot.sequence, 1);
     assert.equal(created.bill.paymentStatus, 'PENDING');
+    assert.equal(created.bill.documentType, 'TAX_INVOICE');
+    assert.equal(created.bill.gstProfile, 'STANDARD_RESTAURANT');
+    assert.equal(created.bill.gstinSnapshot, '29ABCDE1234F1Z5');
+    assert.equal(created.bill.supplierNameSnapshot, registration.tenant.name);
     const unitPricePaise = BigInt(item.outletPrices[0]?.pricePaise ?? item.basePricePaise);
     const expectedSubtotalPaise = unitPricePaise * 2n;
     const expectedServiceChargePaise = (expectedSubtotalPaise * 500n + 5000n) / 10000n;
@@ -222,6 +253,41 @@ test('cloud POS flow: authenticated outlet menu, shift, idempotent order, KOT, g
     const shiftClose = await shiftCloseResponse.json();
     assert.equal(shiftCloseResponse.status, 200, JSON.stringify(shiftClose));
     assert.equal(shiftClose.reconciliation.variancePaise, 0);
+
+    const compositionProfileResponse = await fetch(`${api}/api/outlet-profile`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, outletName: 'Test Outlet', gstin: '29ABCDE1234F1Z5', gstProfile: 'COMPOSITION', gstRateBps: 0, fssaiLicense: '', address: { line1: '12 Main Road', line2: '', city: 'Bengaluru', state: 'Karnataka', pincode: '560038' } }),
+    });
+    assert.equal(compositionProfileResponse.status, 200, await compositionProfileResponse.text());
+    const compositionMenu = await (await fetch(`${api}/api/menu?outletId=${registration.outlet.id}`, { headers })).json();
+    const compositionItem = compositionMenu.flatMap(({ items }) => items).find(({ id }) => id === addedMenuItem.id);
+    assert.equal(compositionItem.gstBps, 0, 'composition profile must not expose customer GST on menu items');
+    const compositionOrderResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `composition-${suffix}`, deviceId: `device-${suffix}`, type: 'Takeaway', items: [{ menuItemId: addedMenuItem.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    const compositionOrder = await compositionOrderResponse.json();
+    assert.equal(compositionOrderResponse.status, 201, JSON.stringify(compositionOrder));
+    assert.equal(compositionOrder.bill.documentType, 'BILL_OF_SUPPLY');
+    assert.equal(compositionOrder.bill.gstProfile, 'COMPOSITION');
+    assert.equal(BigInt(compositionOrder.bill.cgstPaise) + BigInt(compositionOrder.bill.sgstPaise), 0n);
+    assert.equal(compositionOrder.bill.totalPaise, compositionOrder.bill.subtotalPaise);
+
+    const unregisteredProfileResponse = await fetch(`${api}/api/outlet-profile`, {
+      method: 'PATCH', headers: { ...ownerHeaders, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, outletName: 'Test Outlet', gstin: '', gstProfile: 'NOT_REGISTERED', gstRateBps: 0, fssaiLicense: '', address: { line1: '12 Main Road', line2: '', city: 'Bengaluru', state: 'Karnataka', pincode: '560038' } }),
+    });
+    assert.equal(unregisteredProfileResponse.status, 200, await unregisteredProfileResponse.text());
+    const receiptOrderResponse = await fetch(`${api}/api/orders`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ outletId: registration.outlet.id, clientMutationId: `receipt-${suffix}`, deviceId: `device-${suffix}`, type: 'Takeaway', items: [{ menuItemId: addedMenuItem.id, quantity: 1 }], paidPaise: 0 }),
+    });
+    const receiptOrder = await receiptOrderResponse.json();
+    assert.equal(receiptOrderResponse.status, 201, JSON.stringify(receiptOrder));
+    assert.equal(receiptOrder.bill.documentType, 'RECEIPT');
+    assert.equal(receiptOrder.bill.gstProfile, 'NOT_REGISTERED');
+    assert.equal(BigInt(receiptOrder.bill.cgstPaise) + BigInt(receiptOrder.bill.sgstPaise), 0n);
+    assert.equal(receiptOrder.bill.totalPaise, receiptOrder.bill.subtotalPaise);
   } finally {
     if (tenantId) await prisma.tenant.deleteMany({ where: { id: tenantId } });
     await prisma.$disconnect();

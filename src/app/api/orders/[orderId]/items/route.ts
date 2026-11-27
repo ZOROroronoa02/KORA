@@ -7,6 +7,7 @@ import { allocatePaise, calculateSale, paymentStatusAfterRefund } from "@/lib/bi
 import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { isTransactionConflict } from "@/lib/db-conflicts";
+import { gstRateForItem } from "@/lib/domain/gst-profile";
 
 export const runtime = "nodejs";
 class KdsOrderConflict extends Error { constructor(message: string) { super(message); this.name = "KdsOrderConflict"; } }
@@ -42,7 +43,7 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
     }
 
     const [outlet, products] = await Promise.all([
-      prisma.outlet.findFirst({ where: { id: outletId, tenantId: access.tenantId }, select: { id: true, serviceChargeBps: true } }),
+      prisma.outlet.findFirst({ where: { id: outletId, tenantId: access.tenantId }, select: { id: true, serviceChargeBps: true, tenant: { select: { gstProfile: true, gstRateBps: true } } } }),
       prisma.menuItem.findMany({ where: { id: { in: productIds }, tenantId: access.tenantId, active: true }, include: { outletPrices: { where: { outletId } } } }),
     ]);
     if (!outlet) return NextResponse.json({ error: "Outlet not found." }, { status: 404 });
@@ -64,10 +65,14 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
         tx.station.findMany({ where: { outletId, active: true }, select: { id: true, name: true } }),
       ]);
       const generalStation = stationRows.find((station) => station.name === "General") ?? stationRows[0] ?? null;
-      const rawSubtotal = lines.reduce((sum, line) => sum + line.pricePaise * line.input.quantity, 0);
+      const profile = order.bill?.gstProfile ?? outlet.tenant.gstProfile;
+      const rateBps = order.bill?.gstRateBpsSnapshot ?? outlet.tenant.gstRateBps;
+      const effectiveLines = lines.map((line) => ({ ...line, gstBps: gstRateForItem(profile, rateBps, line.product.gstBps) }));
+      const serviceChargeBps = order.bill?.serviceChargeBpsSnapshot ?? (order.type === "DINE_IN" ? outlet.serviceChargeBps : 0);
+      const rawSubtotal = effectiveLines.reduce((sum, line) => sum + line.pricePaise * line.input.quantity, 0);
       if (!Number.isSafeInteger(rawSubtotal)) throw new RangeError("Added item subtotal exceeds the supported range.");
-      const lineDiscounts = lines.map(() => 0n);
-      const additions = calculateSale(lines.map((line, index) => ({ quantity: line.input.quantity, unitPricePaise: line.pricePaise, gstBps: line.product.gstBps, discountPaise: Number(lineDiscounts[index]) })), { serviceChargeBps: order.type === "DINE_IN" ? outlet.serviceChargeBps : 0 });
+      const lineDiscounts = effectiveLines.map(() => 0n);
+      const additions = calculateSale(effectiveLines.map((line, index) => ({ quantity: line.input.quantity, unitPricePaise: line.pricePaise, gstBps: line.gstBps, discountPaise: Number(lineDiscounts[index]) })), { serviceChargeBps });
       const oldTotal = Number(order.totalPaise);
       const grossPaidPaise = order.bill?.payments.filter((payment) => payment.status === PaymentStatus.PAID).reduce((sum, payment) => sum + payment.amountPaise, 0n) ?? 0n;
       const refundAggregate = order.bill ? await tx.paymentReversal.aggregate({ where: { payment: { billId: order.bill.id } }, _sum: { amountPaise: true } }) : null;
@@ -76,12 +81,12 @@ async function POSTHandler(request: NextRequest, context: { params: Promise<{ or
       const newTotal = oldTotal + additions.totalPaise;
       if (!Number.isSafeInteger(newTotal)) throw new RangeError("Updated order total exceeds the supported range.");
       const addedOrderItems = [];
-      for (let index = 0; index < lines.length; index++) {
-        const line = lines[index];
+      for (let index = 0; index < effectiveLines.length; index++) {
+        const line = effectiveLines[index];
         const discount = lineDiscounts[index];
         const orderItem = await tx.orderItem.create({ data: {
           orderId, menuItemId: line.product.id, nameSnapshot: line.product.name, quantity: line.input.quantity,
-          unitPricePaise: BigInt(line.pricePaise), gstBps: line.product.gstBps, discountPaise: discount,
+          unitPricePaise: BigInt(line.pricePaise), gstBps: line.gstBps, discountPaise: discount,
           totalPaise: BigInt(line.pricePaise * line.input.quantity) - discount, notes: line.input.note,
         } });
         addedOrderItems.push({ orderItem, stationId: line.product.outletPrices[0].stationId ?? generalStation?.id ?? null });

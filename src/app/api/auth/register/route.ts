@@ -48,7 +48,7 @@ export async function POST(request: Request) {
           ["Mango Lassi", "Drinks", 14000, true], ["Filter Coffee", "Drinks", 9000, true],
         ] as const;
         for (const [itemName, categoryName, pricePaise, isVeg] of sampleItems) {
-          const item = await tx.menuItem.create({ data: { tenantId: tenant.id, categoryId: categoryIds.get(categoryName)!, name: itemName, basePricePaise: BigInt(pricePaise), gstBps: 500, isVeg } });
+          const item = await tx.menuItem.create({ data: { tenantId: tenant.id, categoryId: categoryIds.get(categoryName)!, name: itemName, basePricePaise: BigInt(pricePaise), gstBps: null, isVeg } });
           await tx.outletMenuItem.create({ data: { outletId: outlet.id, menuItemId: item.id, stationId: generalStation.id, available: true } });
         }
       }

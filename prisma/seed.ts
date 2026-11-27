@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 import { PrismaClient, Plan, OrderType, OrderStatus, KOTStatus, PaymentStatus } from "@prisma/client";
 import { hash } from "bcryptjs";
 import { ensureKdsStations, ensureOutletSettings, ensureTenantSystemRoles } from "../src/lib/role-seed.js";
+import { calculateSale } from "../src/lib/billing.js";
+import { gstRateForItem } from "../src/lib/domain/gst-profile.js";
 
 const prisma = new PrismaClient();
 
@@ -54,7 +56,7 @@ async function seedMenu(tenantId: string, outletId: string) {
   for (const item of sampleMenu) {
     const categoryId = categoryIds.get(item.category)!;
     const existing = await prisma.menuItem.findFirst({ where: { tenantId, categoryId, name: item.name } });
-    const saved = existing ?? await prisma.menuItem.create({ data: { tenantId, categoryId, name: item.name, basePricePaise: BigInt(item.price), isVeg: item.isVeg, gstBps: 500 } });
+    const saved = existing ?? await prisma.menuItem.create({ data: { tenantId, categoryId, name: item.name, basePricePaise: BigInt(item.price), isVeg: item.isVeg, gstBps: null } });
     const stationName = item.category === "Starters" || item.category === "Mains" || item.category === "Breads" ? "Grill" : "General";
     await prisma.outletMenuItem.upsert({
       where: { outletId_menuItemId: { outletId, menuItemId: saved.id } },
@@ -96,6 +98,9 @@ async function seedTicket(input: {
   const orderNumber = sequence.orderNextNumber - 1;
   const kotSequence = await prisma.outlet.update({ where: { id: input.outletId }, data: { kotNextNumber: { increment: 1 } }, select: { kotNextNumber: true } });
   const item = await prisma.menuItem.findUniqueOrThrow({ where: { id: input.menuItemId }, select: { id: true, name: true, basePricePaise: true, gstBps: true } });
+  const taxProfile = await prisma.tenant.findUniqueOrThrow({ where: { id: input.tenantId }, select: { gstProfile: true, gstRateBps: true } });
+  const gstBps = gstRateForItem(taxProfile.gstProfile, taxProfile.gstRateBps, item.gstBps);
+  const totals = calculateSale([{ quantity: 1, unitPricePaise: Number(item.basePricePaise), gstBps }]);
   const createdAt = new Date(Date.now() - (input.index * 4 + 2) * 60_000);
   const order = await prisma.order.create({
     data: {
@@ -110,10 +115,10 @@ async function seedTicket(input: {
       deviceId: "seed-device",
       idempotencyKey,
       subtotalPaise: item.basePricePaise,
-      taxPaise: BigInt(Math.round(Number(item.basePricePaise) * item.gstBps / 10_000)),
-      totalPaise: item.basePricePaise + BigInt(Math.round(Number(item.basePricePaise) * item.gstBps / 10_000)),
+      taxPaise: BigInt(totals.taxPaise),
+      totalPaise: BigInt(totals.totalPaise),
       createdAt,
-      items: { create: { menuItemId: item.id, nameSnapshot: item.name, quantity: 1, unitPricePaise: item.basePricePaise, gstBps: item.gstBps, totalPaise: item.basePricePaise } },
+      items: { create: { menuItemId: item.id, nameSnapshot: item.name, quantity: 1, unitPricePaise: item.basePricePaise, gstBps, totalPaise: item.basePricePaise } },
     },
     include: { items: true },
   });
@@ -146,19 +151,19 @@ async function main() {
 
   const tenant = await prisma.tenant.upsert({
     where: { slug: "saffron-room-demo" },
-    update: { name: "The Saffron Room" },
-    create: { name: "The Saffron Room", slug: "saffron-room-demo", plan: Plan.FREE },
+    update: { name: "The Saffron Room", gstin: "29AAXXX1234X1Z5", gstProfile: "STANDARD_RESTAURANT", gstRateBps: 500 },
+    create: { name: "The Saffron Room", slug: "saffron-room-demo", plan: Plan.FREE, gstin: "29AAXXX1234X1Z5", gstProfile: "STANDARD_RESTAURANT", gstRateBps: 500 },
   });
   const outlets = await Promise.all([
     prisma.outlet.upsert({
       where: { tenantId_code: { tenantId: tenant.id, code: "BLR-IND" } },
       update: { name: "Indiranagar" },
-      create: { tenantId: tenant.id, name: "Indiranagar", code: "BLR-IND", gstin: "29AAXXX1234X1Z5", address: { line1: "12th Main Road", city: "Bengaluru", state: "Karnataka", pincode: "560038" } },
+      create: { tenantId: tenant.id, name: "Indiranagar", code: "BLR-IND", address: { line1: "12th Main Road", city: "Bengaluru", state: "Karnataka", pincode: "560038" } },
     }),
     prisma.outlet.upsert({
       where: { tenantId_code: { tenantId: tenant.id, code: "BLR-KOR" } },
       update: { name: "Koramangala" },
-      create: { tenantId: tenant.id, name: "Koramangala", code: "BLR-KOR", gstin: "29AAXXX1234X1Z5", address: { line1: "80 Feet Road", city: "Bengaluru", state: "Karnataka", pincode: "560095" } },
+      create: { tenantId: tenant.id, name: "Koramangala", code: "BLR-KOR", address: { line1: "80 Feet Road", city: "Bengaluru", state: "Karnataka", pincode: "560095" } },
     }),
   ]);
   await prisma.$transaction(async (tx) => {

@@ -7,6 +7,7 @@ import { publishOutletEvent } from "@/lib/realtime";
 import { readJsonObject, RequestInputError } from "@/lib/http";
 import { requiresDiscountApproval, settingsForOutlet } from "@/lib/domain/discount-approval";
 import { isTransactionConflict } from "@/lib/db-conflicts";
+import { gstProfileDefaults, gstRateForItem, gstinStateMatchesAddress, hasInvoiceAddress } from "@/lib/domain/gst-profile";
 
 export const runtime = "nodejs";
 const methods: Record<string, PaymentMethod> = { Cash: PaymentMethod.CASH, Card: PaymentMethod.CARD, UPI: PaymentMethod.UPI, Other: PaymentMethod.OTHER };
@@ -77,8 +78,16 @@ async function POSTHandler(request: NextRequest) {
     if (existing) return NextResponse.json({ order: jsonSafe(maySeeFinancials ? existing : redactOrder(existing)), kot: jsonSafe(existing.kots.at(-1) ?? null), ...(maySeeFinancials ? { bill: jsonSafe(existing.bill) } : {}), replayed: true });
     const uniqueIds: string[] = [...new Set(inputItems.map((item) => typeof item.menuItemId === "string" ? item.menuItemId : ""))].filter((id) => id.length > 0);
     if (uniqueIds.length !== inputItems.length) return NextResponse.json({ error: "Every order line needs a menu item ID." }, { status: 400 });
-    const outlet = await prisma.outlet.findFirst({ where: { id: outletId, tenantId: access.tenantId } });
+    const outlet = await prisma.outlet.findFirst({
+      where: { id: outletId, tenantId: access.tenantId },
+      include: { tenant: { select: { name: true, gstin: true, gstProfile: true, gstRateBps: true } } },
+    });
     if (!outlet) return NextResponse.json({ error: "Outlet not found." }, { status: 404 });
+    const taxProfile = outlet.tenant.gstProfile;
+    const taxTemplate = gstProfileDefaults[taxProfile];
+    if (taxTemplate.registered && !outlet.tenant.gstin) return NextResponse.json({ error: "Configure the tenant GSTIN before issuing a GST document." }, { status: 409 });
+    if (taxTemplate.registered && !hasInvoiceAddress(outlet.address)) return NextResponse.json({ error: "Complete the outlet address before issuing a GST document." }, { status: 409 });
+    if (taxTemplate.registered && outlet.tenant.gstin && hasInvoiceAddress(outlet.address) && !gstinStateMatchesAddress(outlet.tenant.gstin, outlet.address.state)) return NextResponse.json({ error: "Outlet state does not match the tenant GSTIN registration state." }, { status: 409 });
     const products = await prisma.menuItem.findMany({ where: { id: { in: uniqueIds }, tenantId: access.tenantId, active: true }, include: { outletPrices: { where: { outletId } } } });
     if (products.length !== uniqueIds.length || products.some((p) => p.outletPrices.some((price) => !price.available))) return NextResponse.json({ error: "An item is unavailable or does not belong to this outlet." }, { status: 409 });
     const items = inputItems.map((input) => {
@@ -86,7 +95,7 @@ async function POSTHandler(request: NextRequest) {
       const quantity = Number(input.quantity);
       const price = product.outletPrices[0]?.pricePaise ?? product.basePricePaise;
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999 || price > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError("Invalid quantity or price");
-      return { product, quantity, pricePaise: Number(price), note: typeof input.note === "string" ? input.note.slice(0, 300) : undefined };
+      return { product, quantity, pricePaise: Number(price), gstBps: gstRateForItem(taxProfile, outlet.tenant.gstRateBps, product.gstBps), note: typeof input.note === "string" ? input.note.slice(0, 300) : undefined };
     });
     const requestedDiscountBps = Number(body.discountBps ?? 0);
     if (!Number.isInteger(requestedDiscountBps) || requestedDiscountBps < 0 || requestedDiscountBps > 10000) return NextResponse.json({ error: "Discount rate must be between 0 and 10000 basis points." }, { status: 400 });
@@ -109,11 +118,12 @@ async function POSTHandler(request: NextRequest) {
       approvalUserId = await verifyManagerApprovalPin({ outletId, pin, actorUserId: access.user.id, permission: "bills.discount.approve" }) ?? undefined;
       if (!approvalUserId) return NextResponse.json({ error: "A manager approval PIN is required for this discount." }, { status: 403 });
     }
-    const saleLines = items.map((i) => ({ quantity: i.quantity, unitPricePaise: i.pricePaise, gstBps: i.product.gstBps }));
+    const saleLines = items.map((i) => ({ quantity: i.quantity, unitPricePaise: i.pricePaise, gstBps: i.gstBps }));
     const undiscounted = calculateSale(saleLines);
     const discountPaise = Number((BigInt(undiscounted.subtotalPaise) * BigInt(requestedDiscountBps) + 5000n) / 10000n);
     const itemDiscounts = allocatePaise(BigInt(discountPaise), items.map((item) => BigInt(item.pricePaise) * BigInt(item.quantity)));
-    const totals = calculateSale(saleLines, { discountPaise, serviceChargeBps: type === OrderType.DINE_IN ? outlet.serviceChargeBps : 0 });
+    const serviceChargeBps = type === OrderType.DINE_IN ? outlet.serviceChargeBps : 0;
+    const totals = calculateSale(saleLines, { discountPaise, serviceChargeBps });
     if (paidPaise > totals.totalPaise) return NextResponse.json({ error: "Payment must be between zero and the bill total." }, { status: 400 });
     const paidStatus = paymentStatus(totals.totalPaise, paidPaise) as PaymentStatus;
     const method = typeof body.paymentMethod === "string" ? methods[body.paymentMethod] : undefined;
@@ -163,7 +173,7 @@ async function POSTHandler(request: NextRequest) {
       const order = await tx.order.create({ data: {
         tenantId: access.tenantId, outletId, orderNumber: sequence.orderNextNumber - 1, type, status: "PREPARING", customerId, tableId, createdById: access.user.id,
         deviceId, idempotencyKey, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxPaise: BigInt(totals.taxPaise), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise),
-        items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.product.gstBps, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
+        items: { create: items.map((i, index) => ({ menuItemId: i.product.id, nameSnapshot: i.product.name, quantity: i.quantity, unitPricePaise: BigInt(i.pricePaise), gstBps: i.gstBps, discountPaise: itemDiscounts[index], totalPaise: BigInt(i.pricePaise * i.quantity) - itemDiscounts[index], notes: i.note })) },
       }, include: { items: true } });
       const tableLabel = tableId ? (await tx.restaurantTable.findUnique({ where: { id: tableId }, select: { label: true } }))?.label ?? null : null;
       const routedItems = order.items.map((orderItem, index) => ({ orderItem, stationId: items[index].product.outletPrices[0]?.stationId ?? defaultStation?.id ?? null }));
@@ -190,7 +200,12 @@ async function POSTHandler(request: NextRequest) {
         groupIndex++;
       }
       const bill = await tx.bill.create({ data: {
-        tenantId: access.tenantId, outletId, orderId: order.id, invoiceNumber, subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxablePaise: BigInt(totals.taxablePaise),
+        tenantId: access.tenantId, outletId, orderId: order.id, invoiceNumber,
+        documentType: taxTemplate.documentType, gstProfile: taxProfile, gstRateBpsSnapshot: outlet.tenant.gstRateBps,
+        gstinSnapshot: outlet.tenant.gstin, supplierNameSnapshot: outlet.tenant.name,
+        supplierAddressSnapshot: outlet.address ? outlet.address as Prisma.InputJsonValue : Prisma.JsonNull,
+        serviceChargeBpsSnapshot: serviceChargeBps,
+        subtotalPaise: BigInt(totals.subtotalPaise), discountPaise: BigInt(totals.discountPaise), taxablePaise: BigInt(totals.taxablePaise),
         cgstPaise: BigInt(Math.floor(totals.taxPaise / 2)), sgstPaise: BigInt(totals.taxPaise - Math.floor(totals.taxPaise / 2)), serviceChargePaise: BigInt(totals.serviceChargePaise), totalPaise: BigInt(totals.totalPaise), paymentStatus: paidStatus,
         payments: paidPaise > 0 ? { create: { method: method!, amountPaise: BigInt(paidPaise), status: PaymentStatus.PAID, shiftId: activeShift?.id } } : undefined,
       }, include: { payments: true } });

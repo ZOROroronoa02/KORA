@@ -22,6 +22,7 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 - POS now treats a successful order API response as the committed sale even if the secondary order-list refresh fails, preventing the still-open cart from encouraging a second order. It inserts the accepted order immediately and surfaces refresh trouble in the sync status. IndexedDB queue-read failures now retain an explicit warning instead of setting the pending count to zero.
 - Client logout now writes a pending-logout latch before attempting the network call. Offline startup checks that latch before restoring the cached outlet; new sign-in and restaurant registration flush the old logout first. Unit tests cover offline restore denial, storage denial, logout persistence, and logout-before-login ordering.
 - Cloud inventory now supports outlet-scoped ingredient creation, integer-milli stock corrections, wastage, and a tenant-shared vendor directory. Mutations require `inventory.adjust`, write stock movements and audit snapshots transactionally, reject underflow and duplicate ingredient names, and use serializable transactions for concurrent changes. Vendor edits are tenant-scoped and audited. The purchase shortcut was removed because the vendor purchase ledger is not implemented yet.
+- GST identity is now tenant-wide (one GSTIN shared by outlets) with `NOT_REGISTERED`, standard restaurant, specified premises, and composition profiles. New tenants default to no GST collection; registered profiles require a GSTIN and an invoice-ready outlet address/state match. Menu tax is inherited or explicitly overridden per item; bills snapshot document/profile/rate/supplier/service-charge data. Composition and unregistered profiles never add GST to the customer bill. See `docs/gst-profiles.md` for the legal assumptions and remaining invoice/return gaps.
 - Inventory cloud UI now shows exact quantity/value formatting and offers ingredient creation, stock corrections, wastage, and vendor management to users with the matching permission. Contract and remaining inventory gaps are documented in `docs/inventory-stock-workflow.md`.
 - SQL migration history includes `20261127153000_invoice_financial_year_sequence` after the tenant ownership guard migration.
 - Production start launches `.next/standalone/server.js`, matching `output: "standalone"`. The build copies `.next/static` and `public` into the standalone runtime; this fixes missing CSS/JavaScript asset 404s that made the local production UI unstyled and noninteractive.
@@ -30,17 +31,13 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 
 ## Latest verification
 
-- Health-contract smoke after rebuild: `/`, `/api/health`, and `/api/health/live` returned 200; all 9 CSS/JS assets linked from the page returned 200. `/api/health/ready` returned 503 because Redis is unavailable, correctly keeping the deployment unready.
-- `npx prisma generate` and `npm run lint` (TypeScript check): passed after a clean `npm ci`.
-- `npx prisma validate`: passed on the current schema.
-- `npx prisma migrate status`: all seven migrations applied locally.
-- `npm run build`: passed on the production configuration; all App Router routes, including the refund route, compiled.
-- `npm test` against the local PostgreSQL-backed development API and development Socket.IO server: 52 passed, 0 failed, 0 skipped. This includes live socket permission-revocation coverage using the in-memory development adapter; production Redis fan-out and multi-instance behavior remain unverified.
-- Latest repeat after the outlet-profile, POS acknowledgement, and offline logout changes: typecheck and production build passed; the full local suite passed 56 tests, 0 failed, 1 skipped because no realtime integration URL was configured. It includes four client-auth logout-latch tests and the live outlet-profile, order, RBAC, and tenant-isolation API tests. Signup on the production server remained unavailable because Redis/trusted-proxy configuration is absent locally.
-- Latest inventory/runtime update: `npm run typecheck`, `npm run lint`, `npm run build`, and the default `npm test` passed (51 passed, 7 DB/realtime integrations skipped without test env vars). The inventory API integration passed against the rebuilt local production server and PostgreSQL with a signed test identity (1 passed, 0 skipped), including vendor CRUD validation/auditing, outlet/tenant denial, role denial, ingredient creation, stock audit, underflow, and concurrent removal. A browser smoke test created a QA ingredient/vendor, recorded 2.500 kg at ₹82.50/kg and saw ₹206.25 estimated stock value; all 9 HTML-linked Next static assets returned 200 after the build fix.
-- `npm audit --omit=dev --audit-level=high`: zero production dependency advisories. `npm run db:audit-tenant-ownership`: zero local mismatches.
-- Rendered desktop demo check: Cashier “New order” opens POS; Masala Dosa at ₹180 calculated ₹9 GST and ₹189 due; a demo UPI payment appeared in Orders as paid. The cloud API integration now verifies GST on service charge and invoice total reconciliation. This did not exercise cloud refund UI or physical printing. A prior dev session showed a transient `unhandledRejection: undefined`; its cause remains unverified.
-- Git commits for the current security work: `c75eb1d`, `90d9842`, `a9abe8b`.
+- Current GST migrations: 9 migrations found; `npx prisma migrate status` reports the local schema up to date. `npx prisma validate` and `npm run typecheck` passed.
+- Full PostgreSQL-backed API/domain/realtime suite: 62 passed, 0 failed, 0 skipped. This run explicitly set both security test URLs and used the local PostgreSQL database, Next.js development API, and Socket.IO development service. It covered GST tenant sharing/state validation, owner-only profile and item-tax controls, tax invoice/Bill of Supply/receipt tax behavior, tenant isolation, concurrent billing, refunds, RBAC, realtime permission revocation, KDS, and inventory. Socket fan-out used the development in-memory adapter; production Redis multi-instance behavior remains unverified.
+- `npm audit --omit=dev --audit-level=high`: zero production dependency advisories.
+- `npm run build`: passed with Next.js 16.4.6; all App Router routes compiled and standalone static assets copied successfully.
+- Production HTTP smoke on `http://localhost:3000`: `/`, `/api/health`, `/api/health/live` returned 200; all 9 HTML-linked JavaScript/CSS assets returned 200. `/api/health/ready` returned 503 because Redis is unavailable locally, correctly keeping the service unready.
+- GST bill creation uses tenant-wide GSTIN/profile and server-derived item tax, snapshots the supplier/document profile, and passed the integration assertions for standard, composition, and unregistered sales. The print renderer and GST reporting/export gaps below are not covered by these API tests.
+- `npm run lint` is configured as the same TypeScript `tsc --noEmit` check as `npm run typecheck`; it passed on the prior inventory/runtime verification. The current run repeated typecheck and the production build's own TypeScript stage.
 
 ## Production blockers
 
@@ -51,13 +48,13 @@ Updated: 2026-11-27. This records locally verified work; it is not a production-
 5. Offline cloud mode queues order creation only. Payment, KOT, conflict recovery, and printer queues are not fully offline-first or validated through browser restart/quota failures.
 6. Recipe-linked inventory, vendor purchasing, reporting/GST exports, subscription plan gating, aggregator operations, and owner multi-outlet analytics are incomplete. No staff invitation/user-creation endpoint exists yet; the stated Free one-user cap has no creation path to enforce, and Plus/Pro limits and feature entitlements are unspecified.
 7. Full browser/accessibility/device QA and physical ESC/POS printer testing remain outstanding; the local demo POS flow was only smoke-tested on desktop Chrome.
-8. Tax prices are intended to be exclusive and built-in GST templates are selected (standard restaurant, specified premises, and composition/Bill of Supply), but the profile model and regime-specific rules are not implemented. The tenant GST registration structure (one PAN/GST registration or multiple registration groups) still needs a decision before a schema migration.
+8. The GST profile model is implemented, but the print action is not yet a verified GST tax invoice/Bill of Supply renderer, GSTIN status/checksum is not verified against GSTN, and there is no GSTR-1 or composition-turnover export. Accountant confirmation is still required before using a registered profile or rate in production. Historical bills backfill current supplier identity and require separate review.
 
 ## Next engineering order
 
 1. Run the historical ownership scan on a production-like data clone and verify the restricted runtime PostgreSQL role.
 2. Run the GitHub CI workflow and build all three Docker targets in a clean Linux environment.
-3. Finish tax-profile rules and document the accounting assumptions before changing invoice calculations.
+3. Implement and verify a full receipt/tax-invoice/Bill-of-Supply print template and the accountant-reviewed GST reporting/export workflow.
 4. Close POS settlement/refund and offline recovery gaps, then continue operations/reporting modules.
 5. Complete staging, browser/accessibility, printer, load, backup/restore and incident rollback acceptance.
 
