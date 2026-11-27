@@ -1,25 +1,39 @@
 # KORA Offline and Sync Design
 
-## Target behavior
+## Current implementation
 
-Dexie/IndexedDB holds a local operational projection and a durable mutation outbox. A supported mutation is committed locally before the UI confirms it. Each outbox record has stable mutation ID, device ID, outlet context, entity, operation, payload, sequence/version, timestamp, retries and status.
+The browser uses Dexie/IndexedDB database `kora-pos-offline-v1` (schema version 3). It stores outlet menu/table snapshots, a minimal offline workspace hint, pending POS order creations, KDS ticket snapshots, and queued KDS actions. Local data is a device cache; it is not an authorization source for server APIs.
 
-## State model
+### POS order outbox
 
-`LOCAL_ONLY → PENDING → SYNCING → SYNCED`, with terminal/operator states `FAILED` and `CONFLICT`. The client retains records until the API returns an acknowledgement. Retry uses exponential backoff with jitter and a bounded dead-letter path; staff can inspect and retry failures.
+- An offline order is written to IndexedDB before the UI clears the cart. The mutation has a stable `clientMutationId`, a device ID, outlet hint, creation time, and a display snapshot. Storage failure keeps the cart open and warns the cashier.
+- On reconnect, the browser submits queued orders in creation order. Transient failures retry with exponential backoff up to five minutes; 4xx failures remain in the outbox with a manual retry action. The queue is retained until the API acknowledges the order.
+- The server scopes the request from the authenticated user, verifies outlet permissions, re-reads menu prices/tax/availability and applies stock policy in the order transaction. The outlet/idempotency unique key prevents duplicate orders on retry. A queued initial payment is recorded in the same transaction as the order; it is a local record, not provider confirmation. Additional payments, refunds, table moves, item additions, and shift close are online-only.
+- Changed prices/tax, unavailable menu items, stock shortages, missing buyer/address data, or a closed cash shift can reject the queued command. The command stays visible for manual retry, but there is no edit/reprice conflict-resolution workflow yet. Do not silently discard or alter a queued payment.
+- While an order is still unsynced, the UI can print a provisional customer receipt and an offline kitchen ticket. The customer receipt is explicitly not a GST tax invoice and carries no server invoice serial. After successful sync, the server-issued bill/invoice becomes available for printing.
 
-## Conflict policy
+### Kitchen outbox
 
-- Orders/payments: append-only idempotent events; never overwrite a successful payment.
-- KOT: conditional state transitions; reject stale transitions and reconcile from server state.
-- Menu: server version wins unless a manager resolves the conflict.
-- Inventory: stock movements are additive, uniquely identified events; negative-stock policy is explicit.
-- Shift close: online-only unless a separately designed signed offline reconciliation policy exists.
+- The KDS stores the latest ticket snapshot for up to 24 hours and optimistically applies queued item/ticket actions while offline or disconnected from Socket.IO.
+- Actions are submitted in creation order with stable mutation IDs and expected item versions. The server checks outlet permission, ticket ownership, request replay, and state transition under a row lock. Stale state conflicts remain in the local queue and appear in the reconnect banner; the operator can discard conflicted actions.
+- Reconnect fetches the current server ticket snapshot. Socket events are hints; the API snapshot is the source of truth.
 
-## Security
+### Authentication boundary
 
-Tenant/outlet IDs in local records are hints only. The server derives and verifies authorization. Offline payment recording means “recorded locally,” never “provider confirmed.” Device IDs are not credentials.
+The offline workspace hint contains user/outlet display metadata and the last server-verified permissions, but no access token. A valid snapshot may drive the local UI for at most 12 hours. At expiry, the UI disables protected actions; it does not invent fallback permissions. Unknown cached permission keys are discarded. This is a usability allowance only: IndexedDB can be edited by the device user, so every protected API request still resolves the current user, outlet, plan, and permissions from the server. On reconnect, pending actions remain provisional until the server re-authorizes and acknowledges them. A revoked user may queue while disconnected, but the server rejects the action during sync and the queue remains for review.
 
-## Current limitations
+## Not implemented or not verified
 
-The current UI stores one aggregate object in localStorage and a separate count. There is no sync API, acknowledgement, conflict handling, or background sync worker. The service worker caches the shell only.
+- The service worker caches the application shell only. There is no Background Sync worker; POS order sync depends on the open page's reconnect event and polling. Initial payment can be recorded with an offline order, but separate payment settlement/refund actions have no offline queue. There is no operator workflow to correct stale-price/payment conflicts.
+- Browser print layouts support a provisional receipt and local KOT preview, but a durable ESC/POS print queue, printer reconnection/retry, printer failure alerting, and physical 58/80 mm hardware are not verified.
+- Menu edits are online-only. There is no offline command batching, sync status history/export, or automated recovery for browser storage eviction, quota exhaustion, device-clock changes, or a long-lived disconnected shift.
+- Offline permissions can become stale after a user is disabled or a role changes. The local allowance is capped at 12 hours, but the device cannot learn a revocation while disconnected. The server rejects unauthorized queued commands on reconnect.
+
+## Target conflict policy
+
+- Order creation: append-only and idempotent; server recalculates price, tax, stock, and payment state. Preserve rejected commands for operator resolution.
+- Payment: append-only and idempotent; never overwrite a captured payment. Provider settlement must be separately represented when a gateway is integrated.
+- KOT: conditional item/ticket state transitions; reject stale transitions and reconcile from the current server snapshot.
+- Menu: server version wins and surfaces a conflict for review.
+- Inventory: uniquely identified stock-movement events; per-outlet negative-stock policy applies on server sync.
+- Shift close: online-only until a signed offline reconciliation policy is designed and tested.

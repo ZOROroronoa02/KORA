@@ -6,6 +6,8 @@ import { ApiError, apiFetch, getAccessToken, readJson, restoreSession, type Auth
 import { connectKoraRealtime } from "@/lib/realtime-client";
 import { aggregateKdsTicketState, nextKdsItemState, slaBand, slaElapsedSeconds, type KdsItemState } from "@/lib/domain/kds";
 import { cacheKdsTickets, cacheOfflineWorkspace, getPendingKdsActions, queueKdsAction, readKdsTickets, readOfflineWorkspace, removeKdsAction, updateKdsActionError, type PendingKdsAction } from "@/lib/pos-offline";
+import { allPermissionKeys } from "@/lib/permissions";
+import { hasFreshOfflinePermissionSnapshot, offlinePermissionsForSnapshot } from "@/lib/offline-permissions";
 import css from "./KdsBoard.module.css";
 
 type KdsItem = { id: string; menuItemId: string | null; name: string; quantity: number; variant: string | null; modifiers: unknown; notes: string | null; state: KdsItemState; updatedAt: string };
@@ -111,6 +113,7 @@ export default function KdsBoard() {
   const [sortWorstFirst, setSortWorstFirst] = useState(false);
   const [search, setSearch] = useState("");
   const [online, setOnline] = useState(true);
+  const [permissionClock, setPermissionClock] = useState(Date.now());
   const [socketConnected, setSocketConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -142,7 +145,13 @@ export default function KdsBoard() {
   const rootRef = useRef<HTMLElement>(null);
 
   const selectedOutlet = session?.outlets.find((outlet) => outlet.id === outletId) ?? null;
-  const permissions = selectedOutlet?.permissions ?? (offlineWorkspace?.outletId === outletId ? offlineWorkspace.permissions ?? [] : []);
+  const offlineWorkspaceMatches = offlineWorkspace?.outletId === outletId;
+  const offlineSnapshotFresh = Boolean(offlineWorkspaceMatches && hasFreshOfflinePermissionSnapshot(offlineWorkspace.savedAt, permissionClock));
+  const permissions = online && selectedOutlet
+    ? selectedOutlet.permissions
+    : offlineWorkspaceMatches
+      ? offlinePermissionsForSnapshot(offlineWorkspace.savedAt, offlineWorkspace.permissions, new Set<string>(allPermissionKeys), permissionClock)
+      : [];
   const hasKdsAccess = permissions.includes("kds.view");
   const outletName = selectedOutlet?.name ?? (offlineWorkspace?.outletId === outletId ? offlineWorkspace.outletName : snapshot?.outlet.name) ?? "Kitchen";
   const allTickets = tickets;
@@ -274,7 +283,7 @@ export default function KdsBoard() {
       setOutletId(fallbackOutlet);
       if (restored) {
         const active = restored.outlets.find((entry) => entry.id === fallbackOutlet);
-        if (active) void cacheOfflineWorkspace({ userId: restored.user.id, userName: restored.user.name, outletId: active.id, outletName: active.name, role: active.role, permissions: active.permissions }).catch(() => undefined);
+        if (active) void cacheOfflineWorkspace({ userId: restored.user.id, userName: restored.user.name, outletId: active.id, outletName: active.name, role: active.role, permissions: active.permissions }).then(() => readOfflineWorkspace()).then((workspace) => { if (!cancelled) setOfflineWorkspace(workspace); }).catch(() => undefined);
       }
     })();
     return () => { cancelled = true; };
@@ -295,6 +304,15 @@ export default function KdsBoard() {
     window.addEventListener("offline", onOffline);
     return () => { window.removeEventListener("online", onOnline); window.removeEventListener("offline", onOffline); };
   }, []);
+
+  useEffect(() => {
+    if (online || !offlineWorkspaceMatches) return;
+    const updatePermissionClock = () => setPermissionClock(Date.now());
+    updatePermissionClock();
+    const timer = window.setInterval(updatePermissionClock, 5000);
+    document.addEventListener("visibilitychange", updatePermissionClock);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", updatePermissionClock); };
+  }, [online, offlineWorkspaceMatches, offlineWorkspace?.savedAt]);
 
   useEffect(() => {
     if (!outletId || !hasKdsAccess || !online || !getAccessToken()) { socketRef.current?.disconnect(); socketRef.current = null; setSocketConnected(false); return; }
@@ -461,7 +479,7 @@ export default function KdsBoard() {
     soundConfigured.current = false;
     setSnapshot(null); setTickets([]); setStationId("all"); setSelectedTicketId("");
     const target = session?.outlets.find((entry) => entry.id === nextOutletId);
-    if (target && session) void cacheOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: target.id, outletName: target.name, role: target.role, permissions: target.permissions }).catch(() => undefined);
+    if (target && session) void cacheOfflineWorkspace({ userId: session.user.id, userName: session.user.name, outletId: target.id, outletName: target.name, role: target.role, permissions: target.permissions }).then(() => readOfflineWorkspace()).then(setOfflineWorkspace).catch(() => undefined);
   }, [session]);
 
   const newTicketCount = tickets.filter((ticket) => !ticket.startedAt && ticketLane(ticket) === "QUEUED").length;
@@ -503,7 +521,7 @@ export default function KdsBoard() {
       </div>
     </section>
     {(!connectionGood || pendingActions.length > 0) && <div className={`${css.statusBanner} ${queueConflicts ? css.conflictBanner : ""}`} role="status">
-      {!connectionGood ? <><WifiOff size={17}/><span>{online ? "Kitchen connection is reconnecting. Cached tickets remain available; actions will sync when the connection returns." : "Offline mode. Cached tickets and kitchen actions are available on this device."}</span></> : <><Wifi size={17}/><span>{pendingActions.length} queued kitchen action{pendingActions.length === 1 ? "" : "s"} awaiting sync.</span></>}
+      {!connectionGood ? <><WifiOff size={17}/><span>{online ? "Kitchen connection is reconnecting. Cached tickets remain available; actions will sync when the connection returns." : offlineSnapshotFresh ? "Offline mode. Cached tickets and kitchen actions are available provisionally; the server rechecks permissions when they sync." : "Offline permission snapshot expired. Kitchen access and actions are disabled until the outlet is revalidated online."}</span></> : <><Wifi size={17}/><span>{pendingActions.length} queued kitchen action{pendingActions.length === 1 ? "" : "s"} awaiting sync.</span></>}
       {queueConflicts > 0 && <span className={css.conflictCount}>{queueConflicts} need review</span>}
       {queueConflicts > 0 && <button className={css.discardButton} onClick={() => void discardConflicts()}>Discard conflicted actions</button>}
     </div>}

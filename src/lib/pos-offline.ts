@@ -24,6 +24,16 @@ export type CachedDisplayOrder = {
   id: string; items: Array<{ id: string; productId: string; name: string; price: number; qty: number; note?: string }>;
   type: string; table: string; total: number; status: string; time: string;
   payment: string; paidAmount?: number; customer: string; syncState?: "queued" | "needs-attention";
+  provisionalEstimate?: {
+    createdAt: string;
+    subtotalPaise: number;
+    discountPaise: number;
+    serviceChargePaise: number;
+    taxPaise: number;
+    totalPaise: number;
+    paidPaise: number;
+    paymentMethod?: string;
+  };
 };
 
 export type PendingOrder = {

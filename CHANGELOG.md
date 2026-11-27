@@ -2,6 +2,7 @@
 
 ## 2026-11-27
 
+- Added provisional receipt/KOT printing for unsynced POS orders, visible pending-sync order state, and a 12-hour server-verified offline permission snapshot that expires to no protected permissions. Reconnect still re-authorizes every queued order server-side; stale/revoked actions remain visible for resolution. Added boundary and permission-filter tests.
 - Tightened the nonce-based Content Security Policy for production, explicitly allowlisted the existing Google Fonts stylesheet/font origins, removed UI chart/KDS inline style attributes, and made `/join` render dynamically so its scripts receive the per-request nonce. Added a production CSP integration regression test.
 - Updated CI to boot the built standalone web server alongside the development API/realtime services, require all readiness probes, and run the production CSP regression test on every workflow run.
 - Enforced approved Free/Plus/Pro outlet and user-seat quotas. Outlet provisioning clones outlet-ready menu/table setup; owner-created staff invitations reserve seats under tenant-row locking, are hash-stored, expire/revoke cleanly, and atomically establish staff accounts, roles, audits, and refresh sessions. Added replay, tenant-boundary, authorization, Free-cap, and last-seat race coverage. Invite links are shared manually until an email delivery and verification provider is selected.
