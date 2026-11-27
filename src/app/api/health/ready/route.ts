@@ -1,20 +1,23 @@
 import { NextResponse } from "next/server";
-import { createClient } from "redis";
 import { prisma } from "@/lib/prisma";
+import { isServiceReady, probeRedis, redisDependencyState } from "@/lib/health/readiness";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export async function GET() {
   const database = await prisma.$queryRaw`SELECT 1`.then(() => true, () => false);
-  let redisReady = process.env.REDIS_URL ? false : process.env.NODE_ENV !== "production";
-  if (process.env.REDIS_URL) {
-    const client = createClient({ url: process.env.REDIS_URL });
-    client.on("error", () => undefined);
-    try { await client.connect(); await client.ping(); redisReady = true; }
-    catch { redisReady = false; }
-    finally { if (client.isOpen) await client.quit().catch(() => undefined); }
+  const redisUrl = process.env.REDIS_URL;
+  const configured = Boolean(redisUrl);
+  let redis = redisDependencyState({ configured, healthy: false, production: process.env.NODE_ENV === "production" });
+  if (redisUrl) {
+    redis = redisDependencyState({ configured: true, healthy: await probeRedis(redisUrl), production: process.env.NODE_ENV === "production" });
   }
-  const ready = database && redisReady;
-  return NextResponse.json({ name: "KORA", status: ready ? "ready" : "not_ready" }, { status: ready ? 200 : 503 });
+  const ready = isServiceReady(database, redis);
+  return NextResponse.json({
+    name: "KORA",
+    status: ready ? "ready" : "not_ready",
+    database: database ? "ready" : "unavailable",
+    redis,
+  }, { status: ready ? 200 : 503, headers: { "cache-control": "no-store" } });
 }
