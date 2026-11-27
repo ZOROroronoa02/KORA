@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent } from "react";
-import { Activity, AlertTriangle, ArrowRight, Box, Clock3, Package, Plus, RefreshCw, Search, ShoppingBag, Users } from "lucide-react";
+import { Activity, AlertTriangle, ArrowRight, Box, Clock3, Package, Plus, RefreshCw, Search, ShoppingBag, Truck, Users } from "lucide-react";
 import { readJson } from "@/lib/client-api";
 
 type CloudOrder = {
@@ -24,6 +24,8 @@ type CloudMaterial = {
   reorderMilli: string;
   costPerUnitPaise: string;
 };
+
+type CloudVendor = { id: string; name: string; phone: string | null; email: string | null; gstin: string | null; active: boolean };
 
 export function CloudOverview({
   outletName,
@@ -126,6 +128,10 @@ function formatStockValue(material: CloudMaterial) {
 
 export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: string; canAdjustStock: boolean }) {
   const [materials, setMaterials] = useState<CloudMaterial[]>([]);
+  const [vendors, setVendors] = useState<CloudVendor[]>([]);
+  const [vendorCursor, setVendorCursor] = useState<string | null>(null);
+  const [vendorLoading, setVendorLoading] = useState(false);
+  const [vendorError, setVendorError] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
@@ -145,6 +151,12 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
   const [newMaterialCost, setNewMaterialCost] = useState("0");
   const [materialError, setMaterialError] = useState("");
   const [savingMaterial, setSavingMaterial] = useState(false);
+  const [vendorFormOpen, setVendorFormOpen] = useState(false);
+  const [vendorName, setVendorName] = useState("");
+  const [vendorPhone, setVendorPhone] = useState("");
+  const [vendorEmail, setVendorEmail] = useState("");
+  const [vendorGstin, setVendorGstin] = useState("");
+  const [savingVendor, setSavingVendor] = useState(false);
 
   useEffect(() => {
     setMovementOpen(false);
@@ -153,21 +165,32 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     setMovementNotice("");
     setMaterialOpen(false);
     setMaterialError("");
+    setVendorFormOpen(false);
+    setVendorError("");
   }, [outletId]);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    setVendorLoading(true);
     setError("");
+    setVendorError("");
+    setVendors([]);
+    setVendorCursor(null);
     if (!outletId) {
       setMaterials([]);
       setLoading(false);
+      setVendorLoading(false);
       return;
     }
     void readJson<CloudMaterial[]>(`/api/inventory?outletId=${encodeURIComponent(outletId)}`)
       .then((result) => { if (!cancelled) setMaterials(result); })
       .catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : "Could not load outlet inventory."); })
       .finally(() => { if (!cancelled) setLoading(false); });
+    void readJson<{ items: CloudVendor[]; nextCursor: string | null }>(`/api/inventory/vendors?outletId=${encodeURIComponent(outletId)}`)
+      .then((result) => { if (!cancelled) { setVendors(result.items); setVendorCursor(result.nextCursor); } })
+      .catch((reason: unknown) => { if (!cancelled) setVendorError(reason instanceof Error ? reason.message : "Could not load outlet vendors."); })
+      .finally(() => { if (!cancelled) setVendorLoading(false); });
     return () => { cancelled = true; };
   }, [outletId, refreshKey]);
 
@@ -242,6 +265,60 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     }
   };
 
+  const submitVendor = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setVendorError("");
+    const name = vendorName.trim();
+    if (name.length < 2 || name.length > 100) {
+      setVendorError("Vendor name must contain 2–100 characters.");
+      return;
+    }
+    setSavingVendor(true);
+    try {
+      await readJson<{ vendor: CloudVendor }>("/api/inventory/vendors", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outletId, name, phone: vendorPhone, email: vendorEmail, gstin: vendorGstin }),
+      });
+      setVendorFormOpen(false);
+      setVendorName(""); setVendorPhone(""); setVendorEmail(""); setVendorGstin("");
+      setRefreshKey((key) => key + 1);
+    } catch (reason) {
+      setVendorError(reason instanceof Error ? reason.message : "Could not save vendor details.");
+    } finally {
+      setSavingVendor(false);
+    }
+  };
+
+  const toggleVendor = async (vendor: CloudVendor) => {
+    setVendorError("");
+    try {
+      const result = await readJson<{ vendor: CloudVendor }>("/api/inventory/vendors", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ outletId, vendorId: vendor.id, active: !vendor.active }),
+      });
+      setVendors((current) => current.map((item) => item.id === result.vendor.id ? result.vendor : item));
+    } catch (reason) {
+      setVendorError(reason instanceof Error ? reason.message : "Could not update vendor status.");
+    }
+  };
+
+  const loadMoreVendors = async () => {
+    if (!vendorCursor || vendorLoading) return;
+    setVendorLoading(true);
+    setVendorError("");
+    try {
+      const result = await readJson<{ items: CloudVendor[]; nextCursor: string | null }>(`/api/inventory/vendors?outletId=${encodeURIComponent(outletId)}&cursor=${encodeURIComponent(vendorCursor)}`);
+      setVendors((current) => [...current, ...result.items]);
+      setVendorCursor(result.nextCursor);
+    } catch (reason) {
+      setVendorError(reason instanceof Error ? reason.message : "Could not load more vendors.");
+    } finally {
+      setVendorLoading(false);
+    }
+  };
+
   return <>
     <div className="page-title-row"><div><p className="eyebrow">BACK OF HOUSE · LIVE DATA</p><h1>Inventory</h1><p className="muted">Current raw-material balances for this outlet.</p></div><div className="title-actions">{canAdjustStock && <button className="primary-button" onClick={() => { setMaterialOpen(true); setMaterialError(""); }}><Plus size={15} /> Add ingredient</button>}{canAdjustStock && materials.length > 0 && <button className="secondary-button" onClick={() => { setSelectedMaterialId(materials[0].id); setMovementOpen(true); setMovementError(""); }}><Package size={15} /> Record stock movement</button>}<button className="secondary-button" onClick={() => setRefreshKey((key) => key + 1)} disabled={loading}><RefreshCw size={15} /> Refresh stock</button></div></div>
     {error && <div className="cloud-data-notice" role="alert"><AlertTriangle size={16} /><span>{error}</span></div>}
@@ -272,7 +349,7 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
     <div className="stats-grid inventory-stats">
       <div className="card cloud-metric"><span>Tracked ingredients</span><b>{loading ? "…" : materials.length}</b><small>Raw materials set up for this outlet</small></div>
       <div className="card cloud-metric"><span>At or below reorder level</span><b>{loading ? "…" : lowStockCount}</b><small>Based on saved reorder quantities</small></div>
-      <div className="card cloud-metric"><span>Inventory workflows</span><b>Phase 2</b><small>Purchases, recipes, and wastage are not enabled yet</small></div>
+      <div className="card cloud-metric"><span>Inventory workflows</span><b>Active</b><small>Stock corrections, wastage, and vendors</small></div>
     </div>
     <div className="card content-card">
       <div className="table-toolbar"><div><h2 className="section-title">Stock levels</h2></div><span className="muted">Values use stored unit cost and on-hand quantity.</span></div>
@@ -288,7 +365,24 @@ export function CloudInventoryPage({ outletId, canAdjustStock }: { outletId: str
         })}
       </div>}
     </div>
-    <div className="cloud-data-notice"><Package size={16} /><span>Recipe-linked deductions, purchase orders, and wastage tracking are planned for Phase 2.</span></div>
+    <section className="card content-card cloud-vendors" aria-labelledby="cloud-vendors-title">
+      <div className="cloud-vendors-heading"><div><h2 id="cloud-vendors-title">Vendors</h2><p className="muted">Vendor directory shared by outlets in this tenant.</p></div>{canAdjustStock && <button className="secondary-button" onClick={() => { setVendorFormOpen(true); setVendorError(""); }}><Plus size={15} /> Add vendor</button>}</div>
+      {vendorError && <div className="cloud-data-notice" role="alert"><AlertTriangle size={15} /><span>{vendorError}</span></div>}
+      {vendorFormOpen && canAdjustStock && <form className="vendor-form" onSubmit={submitVendor} aria-label="Add vendor">
+        <label>Vendor name<input required minLength={2} maxLength={100} value={vendorName} onChange={(event) => setVendorName(event.target.value)} placeholder="e.g. Green Valley Produce" /></label>
+        <label>Phone<input type="tel" maxLength={20} value={vendorPhone} onChange={(event) => setVendorPhone(event.target.value)} placeholder="+91 98765 43210" /></label>
+        <label>Email<input type="email" maxLength={254} value={vendorEmail} onChange={(event) => setVendorEmail(event.target.value)} placeholder="orders@example.in" /></label>
+        <label>GSTIN<input maxLength={15} value={vendorGstin} onChange={(event) => setVendorGstin(event.target.value.toUpperCase())} placeholder="Optional" /></label>
+        <div className="vendor-form-actions"><button type="button" className="secondary-button" onClick={() => setVendorFormOpen(false)} disabled={savingVendor}>Cancel</button><button type="submit" className="primary-button" disabled={savingVendor}>{savingVendor ? "Saving…" : "Save vendor"}</button></div>
+      </form>}
+      {vendorLoading && vendors.length === 0 ? <div className="empty-state"><Truck size={22} /><b>Loading vendors</b><span>Reading the tenant vendor directory.</span></div> : vendors.length === 0 ? <div className="empty-state"><Truck size={22} /><b>No vendors recorded</b><span>{canAdjustStock ? "Add suppliers here; purchase receipts will be linked when that workflow is enabled." : "No tenant vendors are available."}</span></div> : <div className="cloud-vendor-list">
+        {vendors.map((vendor) => <article className={`cloud-vendor-row ${vendor.active ? "" : "inactive"}`} key={vendor.id}>
+          <span className="vendor-icon"><Truck size={16} /></span><span className="vendor-details"><b>{vendor.name}</b><small>{[vendor.phone, vendor.email, vendor.gstin].filter(Boolean).join(" · ") || "No contact details"}</small></span><span className={`role-tag ${vendor.active ? "" : "inactive-tag"}`}>{vendor.active ? "Active" : "Inactive"}</span>{canAdjustStock && <button type="button" className="cloud-stock-action" onClick={() => void toggleVendor(vendor)} aria-label={`${vendor.active ? "Deactivate" : "Activate"} ${vendor.name}`}>{vendor.active ? "Deactivate" : "Activate"}</button>}
+        </article>)}
+      </div>}
+      {vendorCursor && <div className="vendor-load-more"><button type="button" className="secondary-button" onClick={() => void loadMoreVendors()} disabled={vendorLoading}>{vendorLoading ? "Loading…" : "Load more vendors"}</button></div>}
+    </section>
+    <div className="cloud-data-notice"><Package size={16} /><span>Ingredient stock corrections, wastage, and the shared vendor directory are active. Purchase receipts, recipe-linked deductions, and stock-to-sale reconciliation remain open.</span></div>
   </>;
 }
 

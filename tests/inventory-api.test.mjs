@@ -31,6 +31,26 @@ test('inventory API enforces outlet permissions and atomically audits stock corr
     const ownerHeaders = { authorization: `Bearer ${await tokenFor(user.id)}`, 'content-type': 'application/json' };
     const material = await prisma.rawMaterial.create({ data: { tenantId, outletId: outlet.id, name: `Rice ${suffix}`, unit: 'kg', quantityMilli: 2500n, reorderMilli: 1000n, costPerUnitPaise: 8000n } });
 
+    const vendorCreateBody = { outletId: outlet.id, name: `Produce ${suffix}`, phone: '+91 98765 43210', email: `vendor-${suffix}@example.test`, gstin: '29ABCDE1234F1Z5' };
+    const vendorCreateResponse = await fetch(`${api}/api/inventory/vendors`, { method: 'POST', headers: ownerHeaders, body: JSON.stringify(vendorCreateBody) });
+    const vendorCreated = await vendorCreateResponse.json();
+    assert.equal(vendorCreateResponse.status, 201, JSON.stringify(vendorCreated));
+    assert.equal(vendorCreated.vendor.phone, '+919876543210');
+    const vendorCreatedAudit = await prisma.auditLog.findFirst({ where: { tenantId, outletId: outlet.id, action: 'VENDOR_CREATED', entityId: vendorCreated.vendor.id } });
+    assert.equal(vendorCreatedAudit?.after?.name, vendorCreateBody.name);
+    const invalidVendor = await fetch(`${api}/api/inventory/vendors`, { method: 'POST', headers: ownerHeaders, body: JSON.stringify({ ...vendorCreateBody, name: 'Invalid GST vendor', gstin: 'not-valid' }) });
+    assert.equal(invalidVendor.status, 400);
+    const vendorUpdatedResponse = await fetch(`${api}/api/inventory/vendors`, { method: 'PATCH', headers: ownerHeaders, body: JSON.stringify({ outletId: outlet.id, vendorId: vendorCreated.vendor.id, active: false }) });
+    const vendorUpdated = await vendorUpdatedResponse.json();
+    assert.equal(vendorUpdatedResponse.status, 200, JSON.stringify(vendorUpdated));
+    assert.equal(vendorUpdated.vendor.active, false);
+    const vendorReadResponse = await fetch(`${api}/api/inventory/vendors?outletId=${outlet.id}`, { headers: ownerHeaders });
+    const vendorRead = await vendorReadResponse.json();
+    assert.equal(vendorReadResponse.status, 200);
+    assert.equal(vendorRead.items.find(({ id }) => id === vendorCreated.vendor.id)?.active, false);
+    const invalidCursor = await fetch(`${api}/api/inventory/vendors?outletId=${outlet.id}&cursor=unknown-vendor`, { headers: ownerHeaders });
+    assert.equal(invalidCursor.status, 400);
+
     const createBody = { outletId: outlet.id, operation: 'create', name: `Cardamom ${suffix}`, unit: 'g', reorderMilli: '1500', costPerUnitPaise: '12000' };
     const createdResponse = await fetch(`${api}/api/inventory`, { method: 'POST', headers: ownerHeaders, body: JSON.stringify(createBody) });
     const created = await createdResponse.json();
@@ -89,11 +109,15 @@ test('inventory API enforces outlet permissions and atomically audits stock corr
     const viewerHeaders = { authorization: `Bearer ${await tokenFor(viewer.id)}`, 'content-type': 'application/json' };
     const viewerUpdate = await update({ operation: 'adjust', quantityMilli: '1000', reason: 'Attempted unauthorized change' }, viewerHeaders);
     assert.equal(viewerUpdate.status, 403);
+    const viewerVendorUpdate = await fetch(`${api}/api/inventory/vendors`, { method: 'PATCH', headers: viewerHeaders, body: JSON.stringify({ outletId: outlet.id, vendorId: vendorCreated.vendor.id, active: true }) });
+    assert.equal(viewerVendorUpdate.status, 403);
 
     foreignTenantId = (await prisma.tenant.create({ data: { name: `Foreign Inventory ${suffix}`, slug: `foreign-inventory-${suffix}` } })).id;
     const foreignOutlet = await prisma.outlet.create({ data: { tenantId: foreignTenantId, name: 'Foreign outlet', code: `FI-${suffix}` } });
     const crossTenantRead = await fetch(`${api}/api/inventory?outletId=${foreignOutlet.id}`, { headers: ownerHeaders });
     assert.equal(crossTenantRead.status, 403);
+    const crossTenantVendorRead = await fetch(`${api}/api/inventory/vendors?outletId=${foreignOutlet.id}`, { headers: ownerHeaders });
+    assert.equal(crossTenantVendorRead.status, 403);
 
     const [correctionAudit, wastageAudit] = await Promise.all([
       prisma.auditLog.findFirst({ where: { tenantId, outletId: outlet.id, action: 'STOCK_ADJUST', entityId: material.id, reason: 'Verified physical count' } }),
@@ -103,6 +127,9 @@ test('inventory API enforces outlet permissions and atomically audits stock corr
     assert.equal(correctionAudit?.after?.quantityMilli, '3500');
     assert.equal(wastageAudit?.before?.quantityMilli, '3500');
     assert.equal(wastageAudit?.after?.quantityMilli, '3000');
+    const vendorAudit = await prisma.auditLog.findFirst({ where: { tenantId, outletId: outlet.id, action: 'VENDOR_UPDATED', entityId: vendorCreated.vendor.id } });
+    assert.equal(vendorAudit?.before?.active, true);
+    assert.equal(vendorAudit?.after?.active, false);
   } finally {
     if (foreignTenantId) await prisma.tenant.deleteMany({ where: { id: foreignTenantId } }).catch(() => undefined);
     if (tenantId) await prisma.tenant.deleteMany({ where: { id: tenantId } }).catch(() => undefined);
