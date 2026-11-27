@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Activity, AlertTriangle, ArrowRight, Box, CalendarDays, Clock3, Download, Package, Plus, RefreshCw, Search, ShoppingBag, Truck, Users } from "lucide-react";
 import { apiFetch, readJson } from "@/lib/client-api";
@@ -39,6 +39,24 @@ type SalesReport = {
   refundActivity?: Array<{ method: string; amountPaise: string }>;
   gstSummary?: Array<{ documentType: string; gstProfile: string; taxablePaise: string; cgstPaise: string; sgstPaise: string; igstPaise: string }>;
 };
+type ShiftReportRow = {
+  id: string;
+  cashierName: string;
+  status: string;
+  openedAt: string;
+  closedAt: string | null;
+  openingCashPaise: string;
+  cashCapturedPaise: string;
+  cashRefundedPaise: string;
+  expectedCashPaise: string;
+  countedCashPaise: string | null;
+  variancePaise: string | null;
+  ledgerExpectedCashPaise: string;
+  ledgerMatchesClose: boolean;
+  payments: Array<{ method: string; amountPaise: string }>;
+  refunds: Array<{ method: string; amountPaise: string }>;
+};
+type ShiftReport = { rows: ShiftReportRow[]; nextCursor: string | null; pageSize: number; range: { from: string; to: string; timeZone: string } };
 
 function currentIndiaDate() {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
@@ -617,7 +635,7 @@ export function CloudCustomersPage({ customers, onAdd }: { customers: CloudCusto
   </>;
 }
 
-export function CloudReportsPage({ outletId, canViewFinancials, canViewGst }: { outletId: string; canViewFinancials: boolean; canViewGst: boolean }) {
+export function CloudReportsPage({ outletId, canViewFinancials, canViewGst, canViewShiftReports }: { outletId: string; canViewFinancials: boolean; canViewGst: boolean; canViewShiftReports: boolean }) {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [report, setReport] = useState<SalesReport | null>(null);
@@ -697,5 +715,95 @@ export function CloudReportsPage({ outletId, canViewFinancials, canViewGst }: { 
       </div>}
       <p className="report-footnote">Reports aggregate saved bills and payment ledgers on the server. Refunds appear by refund date; voided orders are excluded from bill totals. GST summary is a reconciliation aid and is not filing output.</p>
     </>}
+    {canViewShiftReports && <CloudShiftReports outletId={outletId} from={from} to={to} />}
   </>;
+}
+
+function CloudShiftReports({ outletId, from, to }: { outletId: string; from: string; to: string }) {
+  const requestGeneration = useRef(0);
+  const [report, setReport] = useState<ShiftReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState("");
+  const [exporting, setExporting] = useState(false);
+
+  useEffect(() => {
+    if (!outletId || !from || !to || from > to) return;
+    const generation = ++requestGeneration.current;
+    let active = true;
+    setLoading(true);
+    setLoadingMore(false);
+    setError("");
+    setReport(null);
+    const query = new URLSearchParams({ outletId, from, to, limit: "50" });
+    void readJson<ShiftReport>(`/api/reports/shifts?${query}`)
+      .then((result) => { if (active && generation === requestGeneration.current) setReport(result); })
+      .catch((reason) => { if (active && generation === requestGeneration.current) setError(reason instanceof Error ? reason.message : "Shift reports could not be loaded."); })
+      .finally(() => { if (active && generation === requestGeneration.current) setLoading(false); });
+    return () => { active = false; };
+  }, [outletId, from, to]);
+
+  async function loadMore() {
+    if (!report?.nextCursor || loadingMore) return;
+    const generation = requestGeneration.current;
+    setLoadingMore(true);
+    setError("");
+    const query = new URLSearchParams({ outletId, from, to, limit: "50", cursor: report.nextCursor });
+    try {
+      const next = await readJson<ShiftReport>(`/api/reports/shifts?${query}`);
+      if (generation === requestGeneration.current) {
+        setReport((current) => current ? { ...next, rows: [...current.rows, ...next.rows] } : next);
+      }
+    } catch (reason) {
+      if (generation === requestGeneration.current) setError(reason instanceof Error ? reason.message : "More shifts could not be loaded.");
+    } finally {
+      if (generation === requestGeneration.current) setLoadingMore(false);
+    }
+  }
+
+  async function exportVisibleRows() {
+    if (!report?.rows.length) return;
+    setExporting(true);
+    try {
+      const cell = (value: unknown) => {
+        let text = String(value ?? "");
+        if (/^[\t\r ]*[=+@-]/.test(text)) text = `'${text}`;
+        return `"${text.replaceAll('"', '""')}"`;
+      };
+      const columns = ["shift_id", "cashier", "status", "opened_at", "closed_at", "opening_cash_paise", "cash_captured_paise", "cash_refunded_paise", "expected_cash_paise", "counted_cash_paise", "variance_paise", "payment_totals", "refund_totals", "ledger_matches_close"];
+      const lines = [columns, ...report.rows.map((row) => [row.id, row.cashierName, row.status, row.openedAt, row.closedAt, row.openingCashPaise, row.cashCapturedPaise, row.cashRefundedPaise, row.expectedCashPaise, row.countedCashPaise, row.variancePaise, row.payments.map((entry) => `${entry.method}:${entry.amountPaise}`).join("; "), row.refunds.map((entry) => `${entry.method}:${entry.amountPaise}`).join("; "), row.ledgerMatchesClose])]
+        .map((line) => line.map(cell).join(",")).join("\r\n");
+      const objectUrl = URL.createObjectURL(new Blob([`\uFEFF${lines}`], { type: "text/csv;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = `kora-shifts-visible-${from}-to-${to}.csv`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch {
+      setError("Shift export could not be prepared.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const time = (value: string | null) => value ? new Intl.DateTimeFormat("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "short", timeStyle: "short" }).format(new Date(value)) : "Open";
+  const details = (entries: ShiftReportRow["payments"]) => entries.length ? entries.map((entry) => `${entry.method} ${formatReportPaise(entry.amountPaise)}`).join(" · ") : "—";
+
+  return <section className="card content-card shift-report-card">
+    <div className="card-heading shift-report-heading"><div><h2>Shift reconciliation</h2><p>Outlet shifts opened during {from}–{to} · values are server ledger totals</p></div><button className="secondary-button" disabled={exporting || !report?.rows.length} onClick={() => void exportVisibleRows()}><Download size={14} />{exporting ? "Preparing…" : "Export visible CSV"}</button></div>
+    {error && <div className="cloud-data-notice" role="alert"><AlertTriangle size={16} /><span>{error}</span></div>}
+    {loading && <div className="report-loading" role="status"><RefreshCw size={17} className="spinning" /> Loading shift reconciliation…</div>}
+    {!loading && report?.rows.length === 0 && <div className="empty-state report-empty"><Clock3 size={22} /><b>No shifts in this period</b><span>Shift history appears after a cashier opens or closes a shift.</span></div>}
+    {!loading && report && report.rows.length > 0 && <div className="wide-table shift-report-table" role="table" aria-label="Shift reconciliation report">
+      <div className="table-head" role="row"><span role="columnheader">SHIFT / CASHIER</span><span role="columnheader">OPENING</span><span role="columnheader">CASH IN</span><span role="columnheader">CASH REFUNDED</span><span role="columnheader">EXPECTED CASH</span><span role="columnheader">COUNTED</span><span role="columnheader">VARIANCE</span><span role="columnheader">PAYMENTS</span><span role="columnheader">STATUS</span></div>
+      {report.rows.map((row) => <div className="table-row" role="row" key={row.id}>
+        <span role="cell"><b>{row.cashierName}</b><small>{time(row.openedAt)} · {row.closedAt ? time(row.closedAt) : "still open"}</small>{!row.ledgerMatchesClose && <em className="shift-ledger-warning">Ledger differs from saved close</em>}</span>
+        <span role="cell">{formatReportPaise(row.openingCashPaise)}</span><span role="cell">{formatReportPaise(row.cashCapturedPaise)}</span><span role="cell">{formatReportPaise(row.cashRefundedPaise)}</span><span role="cell">{formatReportPaise(row.expectedCashPaise)}</span>
+        <span role="cell">{row.countedCashPaise === null ? "—" : formatReportPaise(row.countedCashPaise)}</span><span role="cell" className={row.variancePaise && BigInt(row.variancePaise) < 0n ? "shift-variance-negative" : ""}>{row.variancePaise === null ? "—" : formatReportPaise(row.variancePaise)}</span>
+        <span role="cell" className="shift-payment-breakdown"><small>{details(row.payments)}</small>{row.refunds.length > 0 && <small>Refunds: {details(row.refunds)}</small>}</span><span role="cell"><i className={`shift-status ${row.status.toLowerCase()}`}>{row.status}</i></span>
+      </div>)}
+      <div className="shift-report-footer"><span>Showing {report.rows.length.toLocaleString("en-IN")} shift{report.rows.length === 1 ? "" : "s"}. Export includes visible rows only.</span>{report.nextCursor && <button className="secondary-button" disabled={loadingMore} onClick={() => void loadMore()}>{loadingMore ? "Loading…" : "Load more shifts"}</button>}</div>
+    </div>}
+    <p className="report-footnote">Expected cash = opening float + recorded cash payments − recorded cash refunds. Open-shift expected cash is live; completed shifts retain the amount recorded at close. Refund totals include refunds explicitly linked to that shift; non-cash refunds without a shift link appear in outlet-level payment activity instead. The warning indicates later ledger activity differs from the close snapshot.</p>
+  </section>;
 }

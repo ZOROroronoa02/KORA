@@ -2,13 +2,11 @@ import { OrderStatus, PaymentStatus, Prisma } from "@prisma/client";
 import { NextRequest, NextResponse } from "next/server";
 import { authorizeAnyOutletPermission, withTenantScope } from "@/lib/server-auth";
 import { prisma } from "@/lib/prisma";
+import { indiaDateString, MAX_REPORT_RANGE_DAYS, parseIndiaReportRange } from "@/lib/domain/report-dates";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-const INDIA_OFFSET_MS = 330 * 60 * 1000;
-const MAX_RANGE_DAYS = 93;
 const reportPermissions = ["reports.view.sales", "reports.view.financial", "reports.view.gst"];
 
 type SalesReportPayload = {
@@ -20,22 +18,6 @@ type SalesReportPayload = {
   refundActivity?: Array<{ method: string; amountPaise: string }>;
   gstSummary?: Array<{ documentType: string; gstProfile: string; taxablePaise: string; cgstPaise: string; sgstPaise: string; igstPaise: string }>;
 };
-
-function indiaToday() {
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
-  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
-  return `${values.year}-${values.month}-${values.day}`;
-}
-
-function dateBoundary(value: string, nextDay = false) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
-  const [year, month, day] = value.split("-").map(Number);
-  if (year < 2000 || month < 1 || month > 12 || day < 1 || day > 31) return null;
-  const utcDay = Date.UTC(year, month - 1, day);
-  const checked = new Date(utcDay);
-  if (checked.getUTCFullYear() !== year || checked.getUTCMonth() !== month - 1 || checked.getUTCDate() !== day) return null;
-  return new Date(utcDay + (nextDay ? DAY_MS : 0) - INDIA_OFFSET_MS);
-}
 
 function toCsvText(value: unknown) {
   let text = String(value ?? "");
@@ -73,12 +55,11 @@ async function GETHandler(request: NextRequest) {
   const access = await authorizeAnyOutletPermission(request, outletId, reportPermissions);
   if ("error" in access) return NextResponse.json({ error: access.error }, { status: access.error === "Unauthenticated" ? 401 : 403 });
 
-  const from = request.nextUrl.searchParams.get("from") ?? indiaToday();
+  const from = request.nextUrl.searchParams.get("from") ?? indiaDateString();
   const to = request.nextUrl.searchParams.get("to") ?? from;
-  const startsAt = dateBoundary(from);
-  const endsAt = dateBoundary(to, true);
-  if (!startsAt || !endsAt || endsAt <= startsAt) return NextResponse.json({ error: "Use valid inclusive from/to dates in YYYY-MM-DD format." }, { status: 400 });
-  if (endsAt.getTime() - startsAt.getTime() > MAX_RANGE_DAYS * DAY_MS) return NextResponse.json({ error: `Report date range cannot exceed ${MAX_RANGE_DAYS} days.` }, { status: 400 });
+  const range = parseIndiaReportRange(from, to);
+  if (!range.ok) return NextResponse.json({ error: range.reason === "too-long" ? `Report date range cannot exceed ${MAX_REPORT_RANGE_DAYS} days.` : "Use valid inclusive from/to dates in YYYY-MM-DD format." }, { status: 400 });
+  const { startsAt, endsAt } = range;
 
   const canViewSales = access.permissions.includes("reports.view.sales");
   const canViewFinancials = access.permissions.includes("reports.view.financial");
@@ -127,7 +108,7 @@ async function GETHandler(request: NextRequest) {
 
   const sum = aggregate._sum;
   const report = {
-    range: { from, to, timeZone: "Asia/Kolkata", maxDays: MAX_RANGE_DAYS },
+    range: { from, to, timeZone: "Asia/Kolkata", maxDays: MAX_REPORT_RANGE_DAYS },
     summary: { billCount: aggregate._count._all },
     ...(canViewFinancials ? { financials: {
       subtotalPaise: (sum.subtotalPaise ?? 0n).toString(), discountPaise: (sum.discountPaise ?? 0n).toString(),
