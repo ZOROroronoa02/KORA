@@ -5,7 +5,8 @@
 - Full-screen, touch-first `/kds` board with FIFO and longest-wait sorting, station/order filters, search, keyboard shortcuts, elapsed/SLA states, rush/hold indicators, sound gating, and a 100-ticket initial render with progressive loading.
 - Outlet-scoped KOT numbering and station routing. Existing tickets keep their station; new order lines create a follow-up KOT, including when added from an existing order.
 - Item transitions, ticket start/hold/resume/bump/undo/recall, 86-item availability updates, audit events, and per-station/item prep, SLA, handoff, and hourly metrics.
-- Dexie-backed ticket snapshots and an offline mutation queue. Mutations include a client idempotency key and expected item timestamp; reconnect replay stops on conflicts for operator review.
+- Dexie-backed ticket snapshots and an offline mutation queue. Mutations include a client idempotency key and expected item timestamp; reconnect replay stops on conflicts for operator review. Per-outlet enqueue timestamps are serialized transactionally to keep FIFO order under same-millisecond clicks and device-clock rollback. Dependent expected versions are persisted before sending, and committed predecessors stay queued until the dependent sequence resolves so a lost response can be replayed with the exact same idempotent request after restart.
+- Queue/snapshot read and write failures stay visible to kitchen staff; failed enqueue does not optimistically change a ticket. Replay stops in FIFO order at the first unresolved action, and outlet refresh responses cannot overwrite the board after switching outlets.
 - Per-station KDS lane visibility and order in `OutletSettings.kdsColumnsByStation`. The `all` key is the fallback; an explicit station key overrides it. Only `QUEUED`, `PREPARING`, and `READY` lanes can be configured, with at least one lane visible.
 - No new dependencies were added.
 
@@ -55,7 +56,7 @@ The browser reloads the outlet-scoped snapshot on a KOT event. When the socket i
 - Change a menu item's station; verify existing KOT station snapshots remain unchanged and future lines route to the new station.
 - Configure and reorder lanes for `All stations` and one station; verify the station override and fallback after reload. Invalid, duplicate, empty, and cross-outlet station configuration must be rejected.
 - Exercise item states, start, hold/resume, bump, five-second undo, recall within 30 minutes, and 86. Confirm audit records and order state only advances after all station tickets finish.
-- Disconnect the socket/network, make an offline action, reconnect, and verify idempotent replay. Change the item on another client before replay and confirm the conflict remains visible for review.
+- Disconnect the socket/network, make dependent offline actions, simulate a server commit with a lost response, restart, and verify the exact same request replays idempotently. Change the item on another client before replay and confirm the conflict remains visible for review; verify a failed IndexedDB status write blocks the queue rather than skipping the action.
 - Verify cashier/waiter denial, chef/manager KDS access, outlet boundary denial, reprint permission, and metrics permission.
 - Check the screen on a kitchen tablet and desktop, with keyboard navigation, reduced motion, muted/hidden-tab sound behavior, and narrow viewport.
 
